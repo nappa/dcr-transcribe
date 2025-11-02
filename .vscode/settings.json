@@ -1,0 +1,16 @@
+{
+  "editor.formatOnSave": true,
+  // rustfmt を使う
+  "[rust]": {
+    "editor.defaultFormatter": "rust-lang.rust-analyzer"
+  },
+  // 保存時に自動で use を整理
+  "editor.codeActionsOnSave": {
+    "source.organizeImports": "explicit"
+  },
+  // use の並び・グループ設定
+  "rust-analyzer.imports.granularity.group": "module",
+  "rust-analyzer.imports.group.enable": true,
+  "rust-analyzer.imports.sort.enable": true,
+  "rust-analyzer.imports.prefix": "crate"
+}

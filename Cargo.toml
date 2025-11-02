@@ -1,0 +1,14 @@
+[package]
+name = "dcr-transcribe"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "dcr-transcribe"
+
+[dependencies]
+cpal = "*"
+hound = "*"
+ctrlc = "*"
+anyhow = "*"
+crossbeam-channel = "*"
