@@ -1,118 +1,192 @@
-use std::{
-    env::args,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-        mpsc,
-    },
-    thread,
-    time::Duration,
+mod audio_input;
+mod buffer;
+mod channel_processor;
+mod config;
+mod flac_encoder;
+mod transcribe;
+mod types;
+mod vad;
+mod wav_writer;
+
+use anyhow::{Context, Result};
+use audio_input::AudioInput;
+use channel_processor::ChannelProcessor;
+use config::Config;
+use env_logger::Env;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
 };
+use tokio::sync::mpsc;
 
-use cpal::{
-    self, Sample, SizedSample,
-    traits::{DeviceTrait, HostTrait, StreamTrait},
-};
+#[tokio::main]
+async fn main() -> Result<()> {
+    // ロガーを初期化
+    env_logger::Builder::from_env(Env::default().default_filter_or("info"))
+        .format_timestamp(None)
+        .filter_module("flacenc", log::LevelFilter::Off)
+        .init();
 
-use crossbeam_channel as channel;
+    // コマンドライン引数をパース
+    let args: Vec<String> = std::env::args().collect();
 
-fn build_stream<T>(
-    device: &cpal::Device,
-    cfg: &cpal::StreamConfig,
-    tx: mpsc::SyncSender<Vec<i16>>,
-) -> cpal::Stream
-where
-    T: SizedSample + Sample + 'static,
-    <T as Sample>::Float: Into<f32>,
-{
-    let channels = cfg.channels;
+    // デバイス一覧表示モード
+    if args.len() > 1 && args[1] == "--show-interfaces" {
+        AudioInput::list_devices()?;
+        return Ok(());
+    }
 
-    let data_callback: Box<dyn FnMut(&[T], &cpal::InputCallbackInfo) + Send + 'static> =
-        Box::new(move |data: &[T], _info: &cpal::InputCallbackInfo| {
-            let mut buf = Vec::with_capacity(data.len());
-            for &s in data {
-                let f = s.to_float_sample().into();
-                let clamped = f.clamp(-1.0, 1.0);
-                let i = (clamped * i16::MAX as f32) as i16;
-                buf.push(i);
-            }
-            let _ = tx.send(buf);
-        });
+    // 設定ファイル生成モード
+    if args.len() > 1 && args[1] == "--generate-config" {
+        let config_path = if args.len() > 2 {
+            &args[2]
+        } else {
+            "config.toml"
+        };
+        Config::write_default(config_path)?;
+        println!("設定ファイルを生成しました: {}", config_path);
+        return Ok(());
+    }
 
-    let error_callback: Box<dyn FnMut(cpal::StreamError) + Send + 'static> =
-        Box::new(move |_err| {
-            eprintln!("Stream error");
-        });
-
-    device
-        .build_input_stream(cfg, data_callback, error_callback, None)
-        .expect("Failed to build input stream")
-}
-
-fn main() -> () {
-    println!("Hello, world!");
-    let default_output_path = "output.wav";
-    let out_path = args().nth(1).unwrap_or(default_output_path.into());
-    eprintln!("output path: {}", out_path);
-    let host = cpal::default_host();
-    let device = host.default_input_device().expect("No input device found");
-    eprintln!("input device: {:?}", device.name());
-    let config = device
-        .default_input_config()
-        .expect("No default input config");
-    eprintln!(
-        "input config: {:?}, {}Hz, {}ch",
-        config.sample_format(),
-        config.sample_rate().0,
-        config.channels()
-    );
-    let wav_spec = hound::WavSpec {
-        channels: config.channels(),
-        sample_rate: config.sample_rate().0,
-        bits_per_sample: 16,
-        sample_format: hound::SampleFormat::Int,
+    // 設定ファイルのパス
+    let config_path = if args.len() > 1 && !args[1].starts_with("--") {
+        &args[1]
+    } else {
+        "config.toml"
     };
-    let (tx, rx) = mpsc::sync_channel::<Vec<i16>>(8);
-    let writer_handle = thread::spawn({
-        let out_path = out_path.clone();
-        move || {
-            let mut writer = hound::WavWriter::create(out_path, wav_spec)
-                .expect("Cannot open output file for write out");
-            while let Ok(buf) = rx.recv() {
-                for s in buf {
-                    writer.write_sample(s).expect("wav write failed");
+
+    // 設定を読み込み
+    let config = Config::load_or_default(config_path)?;
+
+    log::info!("dcr-transcribe を起動します");
+    log::info!("設定: {:?}", config);
+
+    // Ctrl+C ハンドラを設定
+    let running = Arc::new(AtomicBool::new(true));
+    let running_clone = running.clone();
+    ctrlc::set_handler(move || {
+        log::info!("停止シグナルを受信しました...");
+        running_clone.store(false, Ordering::SeqCst);
+    })?;
+
+    // チャンネルプロセッサを作成
+    let mut processors = Vec::new();
+    let mut channel_senders = Vec::new();
+
+    for channel_config in &config.channels {
+        if !channel_config.enabled {
+            log::info!("チャンネル {} は無効です", channel_config.id);
+            continue;
+        }
+
+        let (tx, rx) = mpsc::channel(1024 * 1024);
+        channel_senders.push(tx);
+
+        let processor = ChannelProcessor::new(
+            channel_config,
+            &config.vad,
+            &config.buffer,
+            &config.transcribe,
+            &config.output,
+            config.audio.sample_rate,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "チャンネル {} ({}) の初期化に失敗",
+                channel_config.id, channel_config.name
+            )
+        })?;
+
+        processors.push((rx, processor));
+    }
+
+    // 各チャンネルプロセッサを開始
+    for (_, processor) in &mut processors {
+        processor.start().await?;
+    }
+
+    // AudioInputを作成して開始
+    let mut audio_input = AudioInput::new(&config.audio)?;
+    audio_input.start(channel_senders)?;
+
+    log::info!("録音を開始しました (Ctrl+C で停止)");
+
+    // 各チャンネルの処理タスクを起動
+    let mut tasks = Vec::new();
+
+    for (mut rx, processor) in processors {
+        // processorを共有するためにArcでラップ
+        let processor = Arc::new(tokio::sync::Mutex::new(processor));
+
+        // タスク1: 音声チャンク処理スレッド
+        let processor_clone = processor.clone();
+        let running_clone = running.clone();
+        let chunk_task = tokio::spawn(async move {
+            while running_clone.load(Ordering::SeqCst) {
+                tokio::select! {
+                    Some(chunk) = rx.recv() => {
+                        let mut proc = processor_clone.lock().await;
+                        if let Err(e) = proc.process_chunk(chunk).await {
+                            log::error!("チャンク処理エラー: {}", e);
+                        }
+                    }
+                    _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {
+                        // タイムアウト: ループを継続して running をチェック
+                    }
                 }
             }
-        }
-    });
-    let running = Arc::new(AtomicBool::new(true));
-    {
-        let running = running.clone();
-        ctrlc::set_handler(move || {
-            eprintln!("Stopping...");
-            running.store(false, Ordering::SeqCst);
-        })
-        .expect("cannot set ctrl+c handler");
+        });
+        tasks.push(chunk_task);
+
+        // タスク2: 文字起こし結果取得スレッド
+        let processor_clone = processor.clone();
+        let running_clone = running.clone();
+        let transcript_task = tokio::spawn(async move {
+            while running_clone.load(Ordering::SeqCst) {
+                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+                let mut proc = processor_clone.lock().await;
+                let channel_id = proc.channel_id();
+
+                // 文字起こし結果をポーリング
+                let results = proc.poll_transcripts().await;
+                if !results.is_empty() {
+                    log::debug!("チャンネル {}: 文字起こし結果取得 {} 件", channel_id, results.len());
+                    for result in results {
+                        // JSON形式で出力
+                        if let Ok(json) = serde_json::to_string(&result) {
+                            println!("{}", json);
+                        }
+                    }
+                }
+            }
+
+            // 停止処理
+            let mut proc = processor_clone.lock().await;
+            if let Err(e) = proc.stop().await {
+                log::error!("プロセッサ停止エラー: {}", e);
+            }
+        });
+        tasks.push(transcript_task);
     }
-    let cfg = cpal::StreamConfig {
-        channels: config.channels(),
-        sample_rate: config.sample_rate(),
-        buffer_size: cpal::BufferSize::Default,
-    };
-    let stream = match config.sample_format() {
-        cpal::SampleFormat::F32 => build_stream::<f32>(&device, &cfg, tx.clone()),
-        cpal::SampleFormat::I32 => build_stream::<i32>(&device, &cfg, tx.clone()),
-        cpal::SampleFormat::U16 => build_stream::<u16>(&device, &cfg, tx.clone()),
-        cpal::SampleFormat::I16 => build_stream::<i16>(&device, &cfg, tx.clone()),
-        _ => todo!(),
-    };
-    stream.play().expect("Failed to play stream");
-    eprintln!("Recording... (press Ctrl+C to stop)");
+
+    // メインループ: 停止を待つ
     while running.load(Ordering::SeqCst) {
-        thread::sleep(Duration::from_millis(100));
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
-    drop(stream);
-    drop(tx);
-    writer_handle.join().ok();
-    eprintln!("Done");
+
+    // クリーンアップ
+    log::info!("停止処理を開始します...");
+
+    audio_input.stop();
+
+    // タスクの完了を待つ
+    for task in tasks {
+        let _ = task.await;
+    }
+
+    log::info!("dcr-transcribe を終了しました");
+
+    Ok(())
 }
