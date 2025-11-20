@@ -137,6 +137,18 @@ pub enum VadState {
     },
 }
 
+/// PartialResultsの安定性レベル
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "lowercase")]
+pub enum Stability {
+    /// 低安定性（変更される可能性が高い）
+    Low,
+    /// 中安定性
+    Medium,
+    /// 高安定性（ほぼ確定）
+    High,
+}
+
 /// 文字起こし結果
 ///
 /// AWS Transcribeからの文字起こし結果を表現する。
@@ -150,7 +162,8 @@ pub enum VadState {
 ///   "timestamp": "2025-01-02T14:30:15.234Z",
 ///   "timestamp_seconds": 15.234,
 ///   "text": "こちら本部、応答願います",
-///   "is_partial": false
+///   "is_partial": false,
+///   "stability": null
 /// }
 /// ```
 #[derive(Clone, Debug, Serialize)]
@@ -169,8 +182,12 @@ pub struct TranscriptResult {
 
     /// 部分結果かどうか
     ///
-    /// true: 確定結果, false: 暫定結果
+    /// true: 部分結果, false: 確定結果
     pub is_partial: bool,
+
+    /// 部分結果の安定性（部分結果の場合のみ有効）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stability: Option<Stability>,
 }
 
 impl TranscriptResult {
@@ -181,6 +198,7 @@ impl TranscriptResult {
     /// * `channel` - チャンネルID
     /// * `text` - 文字起こしテキスト
     /// * `is_partial` - 部分結果かどうか
+    /// * `stability` - 部分結果の安定性（部分結果の場合のみ）
     /// * `start_time` - 処理開始時刻（タイムスタンプ計算の基準）
     ///
     /// # Examples
@@ -192,12 +210,19 @@ impl TranscriptResult {
     ///     0,
     ///     "こんにちは".to_string(),
     ///     false,
+    ///     None,
     ///     SystemTime::now(),
     /// );
     /// assert_eq!(result.channel, 0);
     /// assert_eq!(result.text, "こんにちは");
     /// ```
-    pub fn new(channel: usize, text: String, is_partial: bool, start_time: SystemTime) -> Self {
+    pub fn new(
+        channel: usize,
+        text: String,
+        is_partial: bool,
+        stability: Option<Stability>,
+        start_time: SystemTime,
+    ) -> Self {
         let now = SystemTime::now();
 
         // 開始時刻からの経過時間を計算
@@ -220,6 +245,7 @@ impl TranscriptResult {
             timestamp_seconds,
             text,
             is_partial,
+            stability,
         }
     }
 }

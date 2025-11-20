@@ -29,6 +29,8 @@ pub struct ChannelProcessor {
     transcribe_client: Option<TranscribeClient>,
     sample_rate: u32,
     tui_state: Option<TuiState>,
+    /// 音声出力用Sender (オプション)
+    audio_output_tx: Option<mpsc::Sender<Vec<i16>>>,
 }
 
 impl ChannelProcessor {
@@ -94,6 +96,7 @@ impl ChannelProcessor {
             transcribe_client: None,
             sample_rate,
             tui_state: None,
+            audio_output_tx: None,
         })
     }
 
@@ -104,6 +107,16 @@ impl ChannelProcessor {
             channel.set_vad_threshold(self.vad_threshold_db);
         });
         self.tui_state = Some(tui_state);
+    }
+
+    /// 音声出力用Senderを設定
+    pub fn set_audio_output(&mut self, tx: mpsc::Sender<Vec<i16>>) {
+        self.audio_output_tx = Some(tx);
+    }
+
+    /// 音声出力用Senderをクリア
+    pub fn clear_audio_output(&mut self) {
+        self.audio_output_tx = None;
     }
 
     /// 処理を開始
@@ -180,6 +193,17 @@ impl ChannelProcessor {
                 tui_state.update_channel(self.channel_id, |channel| {
                     channel.update_transcribe_status(TranscribeStatus::Connected);
                 });
+            }
+        }
+
+        // 6. 音声出力デバイスに送信（設定されている場合）
+        if let Some(tx) = &self.audio_output_tx {
+            if let Err(e) = tx.send(samples.clone()).await {
+                log::warn!(
+                    "チャンネル {}: 音声出力への送信に失敗: {}",
+                    self.channel_id,
+                    e
+                );
             }
         }
 
@@ -308,25 +332,29 @@ impl ChannelProcessor {
 
     /// TUI状態にTranscribe結果を追加
     pub fn add_transcript_to_tui(&self, result: &TranscriptResult) {
-        // 途中状態（partial）の文字起こしは表示しない
-        if result.is_partial {
-            return;
-        }
-
-        // フィラーワードを削除
-        let cleaned_text = Self::remove_filler_words(&result.text);
-
-        // 空文字列または句読点のみの場合は追加しない
-        if cleaned_text.is_empty() || Self::is_punctuation_only(&cleaned_text) {
-            return;
-        }
-
         if let Some(tui_state) = &self.tui_state {
+            let text_to_display = if result.is_partial {
+                // 部分結果はフィラーワード削除しない（リアルタイム性を優先）
+                result.text.clone()
+            } else {
+                // 確定結果のみフィラーワードを削除
+                let cleaned_text = Self::remove_filler_words(&result.text);
+
+                // 空文字列または句読点のみの場合は追加しない
+                if cleaned_text.is_empty() || Self::is_punctuation_only(&cleaned_text) {
+                    return;
+                }
+
+                cleaned_text
+            };
+
             tui_state.update_channel(self.channel_id, |channel| {
                 channel.add_transcript(
-                    cleaned_text,
+                    text_to_display,
                     result.timestamp.clone(),
                     result.timestamp_seconds,
+                    result.is_partial,
+                    result.stability,
                 );
             });
         }

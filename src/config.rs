@@ -32,6 +32,7 @@ pub struct Config {
 /// - `device_id`: "default" (システムのデフォルトデバイス)
 /// - `sample_rate`: 16000 Hz (16kHz - AWS Transcribeの推奨値)
 /// - `channels`: 4 (4チャンネル入力)
+/// - `output_device_id`: "default" (システムのデフォルト出力デバイス)
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AudioConfig {
     #[serde(default = "default_device_id")]
@@ -40,6 +41,9 @@ pub struct AudioConfig {
     pub sample_rate: u32,
     #[serde(default = "default_channels")]
     pub channels: u16,
+    /// 音声出力デバイスID（TUIでチャンネル選択時に使用）
+    #[serde(default = "default_device_id")]
+    pub output_device_id: String,
 }
 
 /// VAD (Voice Activity Detection) 設定
@@ -292,6 +296,7 @@ impl Default for AudioConfig {
             device_id: default_device_id(),
             sample_rate: default_sample_rate(),
             channels: default_channels(),
+            output_device_id: default_device_id(),
         }
     }
 }

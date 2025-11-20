@@ -167,8 +167,34 @@ impl TranscribeClient {
                                         for alt in result.alternatives.unwrap_or_default() {
                                             let text = alt.transcript.unwrap_or_default();
                                             let is_partial = result.is_partial;
+
+                                            // stabilityを計算（stableフラグから推測）
+                                            let stability = if is_partial {
+                                                alt.items.as_ref().map(|items| {
+                                                    let total = items.len();
+                                                    if total == 0 {
+                                                        return crate::types::Stability::Low;
+                                                    }
+
+                                                    let stable_count = items.iter()
+                                                        .filter(|item| item.stable.unwrap_or(false))
+                                                        .count();
+                                                    let stable_ratio = stable_count as f64 / total as f64;
+
+                                                    if stable_ratio >= 0.8 {
+                                                        crate::types::Stability::High
+                                                    } else if stable_ratio >= 0.4 {
+                                                        crate::types::Stability::Medium
+                                                    } else {
+                                                        crate::types::Stability::Low
+                                                    }
+                                                })
+                                            } else {
+                                                None
+                                            };
+
                                             let transcript = TranscriptResult::new(
-                                                channel_id, text, is_partial, start_time,
+                                                channel_id, text, is_partial, stability, start_time,
                                             );
                                             if let Err(e) = result_tx.try_send(transcript) {
                                                 log::warn!("Transcribe結果送信失敗: {}", e);

@@ -40,6 +40,7 @@
 //! ```
 
 pub mod audio_input;
+pub mod audio_output;
 pub mod aws_transcribe;
 pub mod buffer;
 pub mod channel_processor;

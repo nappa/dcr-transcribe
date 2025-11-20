@@ -170,6 +170,7 @@ impl TranscribeBackend for WhisperBackend {
                                                     channel_id,
                                                     text,
                                                     false, // Whisper APIは常に最終結果
+                                                    None,  // Whisperはstabilityなし
                                                     start_time,
                                                 );
                                                 if let Err(e) = result_tx.try_send(transcript) {
@@ -211,6 +212,7 @@ impl TranscribeBackend for WhisperBackend {
                                                     channel_id,
                                                     text,
                                                     false,
+                                                    None,
                                                     start_time,
                                                 );
                                                 let _ = result_tx.try_send(transcript);

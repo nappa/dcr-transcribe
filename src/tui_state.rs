@@ -1,4 +1,4 @@
-use crate::types::VadState;
+use crate::types::{Stability, VadState};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -19,10 +19,14 @@ pub enum TranscribeStatus {
 pub struct TranscriptEntry {
     /// 文字起こしテキスト
     pub text: String,
-    /// 時刻（時:分）
+    /// 時刻（ISO 8601形式）
     pub time: String,
     /// 秒
     pub seconds: f64,
+    /// 部分結果かどうか
+    pub is_partial: bool,
+    /// 部分結果の安定性
+    pub stability: Option<Stability>,
 }
 
 /// チャンネル状態（TUI表示用）
@@ -42,8 +46,10 @@ pub struct ChannelState {
     silence_start: Option<Instant>,
     /// Transcribe接続状態
     pub transcribe_status: TranscribeStatus,
-    /// 最新の文字起こし結果（最大10件）
+    /// 最新の文字起こし結果（確定結果のみ、表示可能な分だけTUIで表示）
     pub transcripts: VecDeque<TranscriptEntry>,
+    /// 現在表示中の部分結果（partial）
+    pub partial_transcript: Option<TranscriptEntry>,
 }
 
 impl ChannelState {
@@ -57,6 +63,7 @@ impl ChannelState {
             silence_start: Some(Instant::now()),
             transcribe_status: TranscribeStatus::Disconnected,
             transcripts: VecDeque::new(),
+            partial_transcript: None,
         }
     }
 
@@ -111,16 +118,35 @@ impl ChannelState {
     }
 
     /// 文字起こし結果を追加
-    pub fn add_transcript(&mut self, text: String, time: String, seconds: f64) {
-        self.transcripts.push_back(TranscriptEntry {
+    pub fn add_transcript(
+        &mut self,
+        text: String,
+        time: String,
+        seconds: f64,
+        is_partial: bool,
+        stability: Option<Stability>,
+    ) {
+        let entry = TranscriptEntry {
             text,
             time,
             seconds,
-        });
+            is_partial,
+            stability,
+        };
 
-        // 最大10件まで保持
-        while self.transcripts.len() > 10 {
-            self.transcripts.pop_front();
+        if is_partial {
+            // 部分結果は上書き
+            self.partial_transcript = Some(entry);
+        } else {
+            // 確定結果は履歴に追加
+            self.partial_transcript = None; // 部分結果をクリア
+            self.transcripts.push_back(entry);
+
+            // 最大100件まで保持（メモリ節約のため）
+            // 実際の表示件数は画面サイズによって動的に決定される
+            while self.transcripts.len() > 100 {
+                self.transcripts.pop_front();
+            }
         }
     }
 }
@@ -129,12 +155,15 @@ impl ChannelState {
 #[derive(Clone)]
 pub struct TuiState {
     channels: Arc<Mutex<Vec<ChannelState>>>,
+    /// 音声出力用に選択されているチャンネルID (None = 選択なし)
+    selected_channel_for_output: Arc<Mutex<Option<usize>>>,
 }
 
 impl TuiState {
     pub fn new() -> Self {
         Self {
             channels: Arc::new(Mutex::new(Vec::new())),
+            selected_channel_for_output: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -165,6 +194,18 @@ impl TuiState {
         if let Some(channel) = channels.iter_mut().find(|c| c.channel_id == channel_id) {
             f(channel);
         }
+    }
+
+    /// 音声出力用のチャンネルを選択
+    pub fn set_selected_channel_for_output(&self, channel_id: Option<usize>) {
+        let mut selected = self.selected_channel_for_output.lock().unwrap();
+        *selected = channel_id;
+    }
+
+    /// 音声出力用に選択されているチャンネルIDを取得
+    pub fn get_selected_channel_for_output(&self) -> Option<usize> {
+        let selected = self.selected_channel_for_output.lock().unwrap();
+        *selected
     }
 }
 

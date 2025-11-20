@@ -1,6 +1,6 @@
 use crate::config::TranscribeConfig;
 use crate::transcribe_backend::TranscribeBackend;
-use crate::types::TranscriptResult;
+use crate::types::{Stability, TranscriptResult};
 use anyhow::Result;
 use async_trait::async_trait;
 use aws_config;
@@ -162,8 +162,36 @@ impl TranscribeBackend for AwsTranscribeBackend {
                                         for alt in result.alternatives.unwrap_or_default() {
                                             let text = alt.transcript.unwrap_or_default();
                                             let is_partial = result.is_partial;
+
+                                            // stabilityを計算（stableフラグから推測）
+                                            let stability = if is_partial {
+                                                alt.items.as_ref().map(|items| {
+                                                    let total = items.len();
+                                                    if total == 0 {
+                                                        return Stability::Low;
+                                                    }
+
+                                                    // stableなitemの割合を計算
+                                                    let stable_count = items.iter()
+                                                        .filter(|item| item.stable.unwrap_or(false))
+                                                        .count();
+                                                    let stable_ratio = stable_count as f64 / total as f64;
+
+                                                    // 安定性を判定
+                                                    if stable_ratio >= 0.8 {
+                                                        Stability::High
+                                                    } else if stable_ratio >= 0.4 {
+                                                        Stability::Medium
+                                                    } else {
+                                                        Stability::Low
+                                                    }
+                                                })
+                                            } else {
+                                                None
+                                            };
+
                                             let transcript = TranscriptResult::new(
-                                                channel_id, text, is_partial, start_time,
+                                                channel_id, text, is_partial, stability, start_time,
                                             );
                                             if let Err(e) = result_tx.try_send(transcript) {
                                                 log::warn!("Amazon Transcribe 結果送信失敗: {}", e);

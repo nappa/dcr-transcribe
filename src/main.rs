@@ -1,4 +1,5 @@
 mod audio_input;
+mod audio_output;
 mod aws_transcribe;
 mod buffer;
 mod channel_processor;
@@ -15,6 +16,7 @@ mod whisper_api;
 
 use anyhow::{Context, Result};
 use audio_input::AudioInput;
+use audio_output::AudioOutput;
 use channel_processor::ChannelProcessor;
 use config::Config;
 use env_logger::Env;
@@ -64,7 +66,11 @@ async fn main() -> Result<()> {
 
     // デバイス一覧表示モード
     if args.len() > 1 && args[1] == "--show-interfaces" {
+        println!("=== 入力デバイス ===");
         AudioInput::list_devices()?;
+        println!();
+        println!("=== 出力デバイス ===");
+        AudioOutput::list_devices()?;
         return Ok(());
     }
 
@@ -152,6 +158,15 @@ async fn main() -> Result<()> {
     let mut audio_input = AudioInput::new(&config.audio)?;
     audio_input.start(channel_senders)?;
 
+    // AudioOutputを作成して開始
+    let output_device = if config.audio.output_device_id == "default" {
+        None
+    } else {
+        Some(config.audio.output_device_id.as_str())
+    };
+    let mut audio_output = AudioOutput::new(output_device, config.audio.sample_rate)?;
+    let audio_output_tx = audio_output.start()?;
+
     log::info!("録音を開始しました (Ctrl+C または 'q' で停止)");
 
     // TUIタスクを起動
@@ -167,9 +182,22 @@ async fn main() -> Result<()> {
     // 各チャンネルの処理タスクを起動
     let mut tasks = Vec::new();
 
+    // プロセッサをマップに格納（channel_id -> processor）
+    let processors_map = Arc::new(tokio::sync::Mutex::new(
+        std::collections::HashMap::<usize, Arc<tokio::sync::Mutex<ChannelProcessor>>>::new(),
+    ));
+
     for (mut rx, processor) in processors {
+        let channel_id = processor.channel_id();
+
         // processorを共有するためにArcでラップ
         let processor = Arc::new(tokio::sync::Mutex::new(processor));
+
+        // マップに登録
+        {
+            let mut map = processors_map.lock().await;
+            map.insert(channel_id, processor.clone());
+        }
 
         // タスク1: 音声チャンク処理スレッド
         let processor_clone = processor.clone();
@@ -233,6 +261,47 @@ async fn main() -> Result<()> {
         tasks.push(transcript_task);
     }
 
+    // タスク3: 選択チャンネルを監視して音声出力を切り替え
+    let processors_map_clone = processors_map.clone();
+    let tui_state_clone = tui_state.clone();
+    let running_clone = running.clone();
+    let audio_output_tx_clone = audio_output_tx.clone();
+    let output_monitor_task = tokio::spawn(async move {
+        let mut last_selected: Option<usize> = None;
+
+        while running_clone.load(Ordering::SeqCst) {
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+            let current_selected = tui_state_clone.get_selected_channel_for_output();
+
+            // 選択が変更された場合
+            if current_selected != last_selected {
+                log::info!("音声出力チャンネル変更: {:?} -> {:?}", last_selected, current_selected);
+
+                let map = processors_map_clone.lock().await;
+
+                // 前のチャンネルから音声出力を解除
+                if let Some(old_id) = last_selected {
+                    if let Some(processor) = map.get(&old_id) {
+                        let mut proc = processor.lock().await;
+                        proc.clear_audio_output();
+                    }
+                }
+
+                // 新しいチャンネルに音声出力を設定
+                if let Some(new_id) = current_selected {
+                    if let Some(processor) = map.get(&new_id) {
+                        let mut proc = processor.lock().await;
+                        proc.set_audio_output(audio_output_tx_clone.clone());
+                    }
+                }
+
+                last_selected = current_selected;
+            }
+        }
+    });
+    tasks.push(output_monitor_task);
+
     // メインループ: 停止を待つ
     while running.load(Ordering::SeqCst) {
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -242,6 +311,7 @@ async fn main() -> Result<()> {
     log::info!("停止処理を開始します...");
 
     audio_input.stop();
+    audio_output.stop();
 
     // TUIタスクの完了を待つ
     let _ = tui_task.await;
