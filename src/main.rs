@@ -1,30 +1,62 @@
 mod audio_input;
+mod aws_transcribe;
 mod buffer;
 mod channel_processor;
 mod config;
 mod flac_encoder;
 mod transcribe;
+mod transcribe_backend;
+mod tui;
+mod tui_state;
 mod types;
 mod vad;
 mod wav_writer;
+mod whisper_api;
 
 use anyhow::{Context, Result};
 use audio_input::AudioInput;
 use channel_processor::ChannelProcessor;
 use config::Config;
 use env_logger::Env;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 use tokio::sync::mpsc;
+use tui::TuiApp;
+use tui_state::TuiState;
+
+/// ログファイルに書き込むためのWriter
+struct LogWriter(Arc<Mutex<std::fs::File>>);
+
+impl Write for LogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.lock().unwrap().flush()
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // ロガーを初期化
+    // ログファイルを開く
+    let log_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("dcr-transcribe.log")
+        .context("ログファイルを開けませんでした")?;
+
+    let log_writer = LogWriter(Arc::new(Mutex::new(log_file)));
+
+    // ロガーを初期化（ファイルに出力）
     env_logger::Builder::from_env(Env::default().default_filter_or("info"))
-        .format_timestamp(None)
+        .format_timestamp_millis()
         .filter_module("flacenc", log::LevelFilter::Off)
+        .target(env_logger::Target::Pipe(Box::new(log_writer)))
         .init();
 
     // コマンドライン引数をパース
@@ -69,6 +101,9 @@ async fn main() -> Result<()> {
         running_clone.store(false, Ordering::SeqCst);
     })?;
 
+    // TUI状態を作成
+    let tui_state = TuiState::new();
+
     // チャンネルプロセッサを作成
     let mut processors = Vec::new();
     let mut channel_senders = Vec::new();
@@ -79,14 +114,18 @@ async fn main() -> Result<()> {
             continue;
         }
 
+        // TUI状態にチャンネルを追加
+        tui_state.add_channel(channel_config.id, channel_config.name.clone());
+
         let (tx, rx) = mpsc::channel(1024 * 1024);
         channel_senders.push(tx);
 
-        let processor = ChannelProcessor::new(
+        let mut processor = ChannelProcessor::new(
             channel_config,
             &config.vad,
             &config.buffer,
             &config.transcribe,
+            config.whisper.as_ref(),
             &config.output,
             config.audio.sample_rate,
         )
@@ -97,6 +136,9 @@ async fn main() -> Result<()> {
                 channel_config.id, channel_config.name
             )
         })?;
+
+        // TUI状態を設定
+        processor.set_tui_state(tui_state.clone());
 
         processors.push((rx, processor));
     }
@@ -110,7 +152,17 @@ async fn main() -> Result<()> {
     let mut audio_input = AudioInput::new(&config.audio)?;
     audio_input.start(channel_senders)?;
 
-    log::info!("録音を開始しました (Ctrl+C で停止)");
+    log::info!("録音を開始しました (Ctrl+C または 'q' で停止)");
+
+    // TUIタスクを起動
+    let tui_state_clone = tui_state.clone();
+    let running_clone = running.clone();
+    let tui_task = tokio::spawn(async move {
+        let mut tui_app = TuiApp::new(tui_state_clone, running_clone);
+        if let Err(e) = tui_app.run().await {
+            log::error!("TUIエラー: {}", e);
+        }
+    });
 
     // 各チャンネルの処理タスクを起動
     let mut tasks = Vec::new();
@@ -153,10 +205,20 @@ async fn main() -> Result<()> {
                 let results = proc.poll_transcripts().await;
                 if !results.is_empty() {
                     log::debug!("チャンネル {}: 文字起こし結果取得 {} 件", channel_id, results.len());
-                    for result in results {
-                        // JSON形式で出力
-                        if let Ok(json) = serde_json::to_string(&result) {
-                            println!("{}", json);
+                    for mut result in results {
+                        // TUI状態に追加（フィラーワード削除は内部で実行）
+                        proc.add_transcript_to_tui(&result);
+
+                        // 途中状態でなく、かつフィラーワード削除後に内容がある場合のみログ出力
+                        if !result.is_partial {
+                            let cleaned_text = ChannelProcessor::remove_filler_words(&result.text);
+                            if !cleaned_text.is_empty() && !ChannelProcessor::is_punctuation_only(&cleaned_text) {
+                                // クリーニング後のテキストでログ出力
+                                result.text = cleaned_text;
+                                if let Ok(json) = serde_json::to_string(&result) {
+                                    log::info!("{}", json);
+                                }
+                            }
                         }
                     }
                 }
@@ -181,7 +243,10 @@ async fn main() -> Result<()> {
 
     audio_input.stop();
 
-    // タスクの完了を待つ
+    // TUIタスクの完了を待つ
+    let _ = tui_task.await;
+
+    // 他のタスクの完了を待つ
     for task in tasks {
         let _ = task.await;
     }

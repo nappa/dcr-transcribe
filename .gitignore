@@ -9,6 +9,7 @@ target
 # local config
 /config.toml
 /secrets/*
+/.env
 
 # Claude Code
 .claude/settings.local.json
@@ -16,6 +17,9 @@ target
 # Tmp output
 *.wav
 tmp/*
+
+# Log files
+*.log
 
 # MSVC Windows builds of rustc generate these, which store debugging information
 *.pdb

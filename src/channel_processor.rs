@@ -1,10 +1,14 @@
+use crate::aws_transcribe::AwsTranscribeBackend;
 use crate::buffer::AudioBuffer;
-use crate::config::{BufferConfig, ChannelConfig, OutputConfig, TranscribeConfig, VadConfig};
+use crate::config::{BufferConfig, ChannelConfig, OutputConfig, TranscribeBackendType, TranscribeConfig, VadConfig, WhisperConfig};
 use crate::transcribe::TranscribeClient;
-use crate::types::{AudioChunk, BufferedChunk, TranscriptResult};
+use crate::transcribe_backend::TranscribeBackend;
+use crate::tui_state::{TranscribeStatus, TuiState};
+use crate::types::{AudioChunk, BufferedChunk, TranscriptResult, VadState};
 use crate::vad::VoiceActivityDetector;
 use crate::wav_writer::WavWriter;
-use anyhow::Result;
+use crate::whisper_api::WhisperBackend;
+use anyhow::{Context, Result};
 use tokio::sync::mpsc;
 
 /// 1つのチャンネルの完全な処理パイプライン
@@ -14,12 +18,17 @@ pub struct ChannelProcessor {
     channel_id: usize,
     channel_name: String,
     vad: VoiceActivityDetector,
+    vad_threshold_db: f32,
     buffer: AudioBuffer,
     wav_writer: WavWriter,
     transcribe_tx: Option<mpsc::Sender<Vec<i16>>>,
     transcribe_rx: Option<mpsc::Receiver<TranscriptResult>>,
+    transcribe_backend: Option<Box<dyn TranscribeBackend>>,
+    // 後方互換性のため残す（削除予定）
+    #[allow(dead_code)]
     transcribe_client: Option<TranscribeClient>,
     sample_rate: u32,
+    tui_state: Option<TuiState>,
 }
 
 impl ChannelProcessor {
@@ -28,6 +37,7 @@ impl ChannelProcessor {
         vad_config: &VadConfig,
         buffer_config: &BufferConfig,
         transcribe_config: &TranscribeConfig,
+        whisper_config: Option<&WhisperConfig>,
         output_config: &OutputConfig,
         sample_rate: u32,
     ) -> Result<Self> {
@@ -39,21 +49,61 @@ impl ChannelProcessor {
             sample_rate,
         )?;
 
-        // Transcribeクライアントを作成
-        let transcribe_client =
-            TranscribeClient::new(transcribe_config.clone(), channel_config.id).await?;
+        // バックエンドを選択して作成
+        let transcribe_backend: Box<dyn TranscribeBackend> = match transcribe_config.backend {
+            TranscribeBackendType::Aws => {
+                log::info!("チャンネル {}: Amazon Transcribe バックエンドを使用", channel_config.id);
+                Box::new(
+                    AwsTranscribeBackend::new(transcribe_config.clone(), channel_config.id)
+                        .await
+                        .context("Amazon Transcribe バックエンド作成失敗")?,
+                )
+            }
+            TranscribeBackendType::Whisper => {
+                log::info!("チャンネル {}: OpenAI Whisper API バックエンドを使用", channel_config.id);
+                let whisper_cfg = whisper_config
+                    .ok_or_else(|| anyhow::anyhow!("Whisper設定が見つかりません"))?;
+
+                // WhisperConfig を作成
+                let whisper_backend_config = crate::whisper_api::WhisperConfig {
+                    api_key: whisper_cfg.api_key.clone(),
+                    model: whisper_cfg.model.clone(),
+                    language: whisper_cfg.language.clone(),
+                    sample_rate: whisper_cfg.sample_rate,
+                    chunk_duration_secs: whisper_cfg.chunk_duration_secs,
+                };
+
+                Box::new(
+                    WhisperBackend::new(whisper_backend_config, channel_config.id)
+                        .await
+                        .context("Whisper API バックエンド作成失敗")?,
+                )
+            }
+        };
 
         Ok(Self {
             channel_id: channel_config.id,
             channel_name: channel_config.name.clone(),
             vad,
+            vad_threshold_db: vad_config.threshold_db,
             buffer,
             wav_writer,
             transcribe_tx: None,
             transcribe_rx: None,
-            transcribe_client: Some(transcribe_client),
+            transcribe_backend: Some(transcribe_backend),
+            transcribe_client: None,
             sample_rate,
+            tui_state: None,
         })
+    }
+
+    /// TUI状態を設定
+    pub fn set_tui_state(&mut self, tui_state: TuiState) {
+        // VAD閾値をTUI状態に設定
+        tui_state.update_channel(self.channel_id, |channel| {
+            channel.set_vad_threshold(self.vad_threshold_db);
+        });
+        self.tui_state = Some(tui_state);
     }
 
     /// 処理を開始
@@ -68,11 +118,11 @@ impl ChannelProcessor {
         self.wav_writer.start()?;
 
         // Transcribeストリームを開始
-        if let Some(mut client) = self.transcribe_client.take() {
-            let (tx, rx) = client.start_stream().await?;
+        if let Some(mut backend) = self.transcribe_backend.take() {
+            let (tx, rx) = backend.start_stream().await?;
             self.transcribe_tx = Some(tx);
             self.transcribe_rx = Some(rx);
-            self.transcribe_client = Some(client);
+            self.transcribe_backend = Some(backend);
         }
 
         Ok(())
@@ -94,7 +144,17 @@ impl ChannelProcessor {
         // 3. VADで音声区間を判定
         let is_voice = self.vad.process(samples);
 
-        // 4. PCMサンプルをTranscribeに送信
+        // 4. TUI状態を更新
+        if let Some(tui_state) = &self.tui_state {
+            let volume_db = self.vad.get_last_volume_db();
+            let vad_state = self.vad.get_state();
+            tui_state.update_channel(self.channel_id, |channel| {
+                channel.update_volume(volume_db);
+                channel.update_vad_state(vad_state);
+            });
+        }
+
+        // 5. PCMサンプルをTranscribeに送信
         if let Some(tx) = &self.transcribe_tx {
             let samples_to_send = if is_voice {
                 samples.clone()
@@ -109,6 +169,17 @@ impl ChannelProcessor {
                     self.channel_id,
                     e
                 );
+                // エラー時はTUI状態を更新
+                if let Some(tui_state) = &self.tui_state {
+                    tui_state.update_channel(self.channel_id, |channel| {
+                        channel.update_transcribe_status(TranscribeStatus::Error);
+                    });
+                }
+            } else if let Some(tui_state) = &self.tui_state {
+                // 正常送信時
+                tui_state.update_channel(self.channel_id, |channel| {
+                    channel.update_transcribe_status(TranscribeStatus::Connected);
+                });
             }
         }
 
@@ -164,6 +235,101 @@ impl ChannelProcessor {
     /// バッファサイズを取得
     pub fn buffer_duration_seconds(&self) -> f64 {
         self.buffer.duration_seconds()
+    }
+
+    /// VAD状態を取得
+    pub fn vad_state(&self) -> VadState {
+        self.vad.get_state()
+    }
+
+    /// 最新のボリューム（dB）を取得
+    pub fn current_volume_db(&self) -> f32 {
+        self.vad.get_last_volume_db()
+    }
+
+    /// フィラーワード（言い淀み）を削除
+    pub fn remove_filler_words(text: &str) -> String {
+        // 削除対象のフィラーワードリスト
+        let filler_words = [
+            "えっと",
+            "あの",
+            "ええと",
+            "ええ",
+            "えー",
+            "えーと",
+            "あのー",
+            "っと",
+            "っとー",
+        ];
+
+        let mut result = text.to_string();
+
+        // 各フィラーワードを削除
+        for filler in &filler_words {
+            // 完全一致する単語を削除（前後に空白がある場合）
+            result = result.replace(&format!("{} ", filler), "");
+            result = result.replace(&format!(" {}", filler), "");
+            // 文頭・文末の場合
+            if result.starts_with(filler) {
+                result = result[filler.len()..].to_string();
+            }
+            if result.ends_with(filler) {
+                result = result[..result.len() - filler.len()].to_string();
+            }
+        }
+
+        // 連続する空白を1つにまとめる
+        while result.contains("  ") {
+            result = result.replace("  ", " ");
+        }
+
+        // 前後の空白を削除
+        result.trim().to_string()
+    }
+
+    /// 句読点のみの行かどうかをチェック
+    pub fn is_punctuation_only(text: &str) -> bool {
+        let trimmed = text.trim();
+
+        // 空文字列の場合はtrue
+        if trimmed.is_empty() {
+            return true;
+        }
+
+        // 句読点のみで構成されているかチェック
+        // 「、」「。」「と。」のような組み合わせ
+        let allowed_chars = ['、', '。', 'と'];
+
+        // すべての文字が許可された文字かチェック
+        let all_punctuation = trimmed.chars().all(|c| allowed_chars.contains(&c));
+
+        all_punctuation
+    }
+
+    /// TUI状態にTranscribe結果を追加
+    pub fn add_transcript_to_tui(&self, result: &TranscriptResult) {
+        // 途中状態（partial）の文字起こしは表示しない
+        if result.is_partial {
+            return;
+        }
+
+        // フィラーワードを削除
+        let cleaned_text = Self::remove_filler_words(&result.text);
+
+        // 空文字列または句読点のみの場合は追加しない
+        if cleaned_text.is_empty() || Self::is_punctuation_only(&cleaned_text) {
+            return;
+        }
+
+        if let Some(tui_state) = &self.tui_state {
+            tui_state.update_channel(self.channel_id, |channel| {
+                channel.add_transcript(
+                    cleaned_text,
+                    result.timestamp.clone(),
+                    result.timestamp_seconds,
+                );
+            });
+        }
     }
 }
 

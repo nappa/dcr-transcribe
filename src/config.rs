@@ -14,6 +14,7 @@ pub struct Config {
     pub buffer: BufferConfig,
     #[serde(default)]
     pub transcribe: TranscribeConfig,
+    pub whisper: Option<WhisperConfig>,
     #[serde(default)]
     pub output: OutputConfig,
     #[serde(default)]
@@ -73,12 +74,23 @@ pub struct BufferConfig {
     pub drop_policy: DropPolicy,
 }
 
+/// 文字起こしバックエンドの種類
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TranscribeBackendType {
+    /// Amazon Transcribe
+    Aws,
+    /// OpenAI Whisper API
+    Whisper,
+}
+
 /// AWS Transcribe 設定
 ///
 /// AWS Transcribe Streaming APIに関する設定。
 ///
 /// # デフォルト値
 ///
+/// - `backend`: "aws" (Amazon Transcribe)
 /// - `region`: "ap-northeast-1" (東京リージョン)
 /// - `language_code`: "ja-JP" (日本語)
 /// - `sample_rate`: 16000 Hz (16kHz)
@@ -86,6 +98,8 @@ pub struct BufferConfig {
 /// - `timeout_seconds`: 10 秒
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TranscribeConfig {
+    #[serde(default = "default_backend")]
+    pub backend: TranscribeBackendType,
     #[serde(default = "default_region")]
     pub region: String,
     #[serde(default = "default_language_code")]
@@ -96,6 +110,24 @@ pub struct TranscribeConfig {
     pub max_retries: u32,
     #[serde(default = "default_timeout_seconds")]
     pub timeout_seconds: u64,
+}
+
+/// OpenAI Whisper API 設定
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct WhisperConfig {
+    /// OpenAI API Key
+    pub api_key: String,
+    /// Whisper モデル名（通常 "whisper-1"）
+    #[serde(default = "default_whisper_model")]
+    pub model: String,
+    /// 言語コード（"ja", "en" など）。省略可能
+    pub language: Option<String>,
+    /// サンプルレート
+    #[serde(default = "default_transcribe_sample_rate")]
+    pub sample_rate: u32,
+    /// 音声チャンクをためる時間（秒）
+    #[serde(default = "default_chunk_duration_secs")]
+    pub chunk_duration_secs: u64,
 }
 
 /// 出力設定
@@ -216,6 +248,18 @@ fn default_flac_enabled() -> bool {
     true // デフォルトでFLAC圧縮を使用
 }
 
+fn default_backend() -> TranscribeBackendType {
+    TranscribeBackendType::Aws
+}
+
+fn default_whisper_model() -> String {
+    "whisper-1".to_string()
+}
+
+fn default_chunk_duration_secs() -> u64 {
+    5 // 5秒ごとにWhisper APIに送信
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -223,6 +267,7 @@ impl Default for Config {
             vad: VadConfig::default(),
             buffer: BufferConfig::default(),
             transcribe: TranscribeConfig::default(),
+            whisper: None, // デフォルトではWhisper設定なし
             output: OutputConfig::default(),
             flac: FlacConfig::default(),
             channels: vec![
@@ -272,6 +317,7 @@ impl Default for BufferConfig {
 impl Default for TranscribeConfig {
     fn default() -> Self {
         Self {
+            backend: default_backend(),
             region: default_region(),
             language_code: default_language_code(),
             sample_rate: default_transcribe_sample_rate(),

@@ -59,6 +59,9 @@ pub struct VoiceActivityDetector {
     ///
     /// 時間計算に使用
     sample_rate: u32,
+
+    /// 最後に計算したボリューム (dB)
+    last_volume_db: f32,
 }
 
 impl VoiceActivityDetector {
@@ -68,6 +71,7 @@ impl VoiceActivityDetector {
             hangover_duration_ms: config.hangover_duration_ms,
             state: VadState::Silence,
             sample_rate,
+            last_volume_db: -100.0,
         }
     }
 
@@ -86,6 +90,9 @@ impl VoiceActivityDetector {
 
         let rms = self.calculate_rms(samples);
         let db = self.rms_to_db(rms);
+
+        // 最後のボリュームを記録
+        self.last_volume_db = db;
 
         // サンプル数から経過時間を計算（ミリ秒）
         let duration_ms = (samples.len() as f64 / self.sample_rate as f64 * 1000.0) as u32;
@@ -163,6 +170,13 @@ impl VoiceActivityDetector {
     /// 音声区間中かどうか
     pub fn is_voice(&self) -> bool {
         matches!(self.state, VadState::Voice { .. })
+    }
+
+    /// 最新のボリューム（dB）を取得
+    ///
+    /// この値は最後にprocess()を呼び出したときの計算結果
+    pub fn get_last_volume_db(&self) -> f32 {
+        self.last_volume_db
     }
 }
 
