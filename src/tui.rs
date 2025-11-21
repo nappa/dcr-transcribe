@@ -100,19 +100,21 @@ impl TuiApp {
                                 execute!(io::stdout(), EnterAlternateScreen)?;
                             }
                             KeyCode::Char(c) if c.is_ascii_digit() => {
-                                // 数字キーでチャンネルを選択（1-9）
+                                // 数字キーでチャンネルを選択（1キー→Ch0, 2キー→Ch1, 3キー→Ch2, 4キー→Ch3）
                                 if let Some(digit) = c.to_digit(10) {
-                                    let channel_id = digit as usize;
-                                    let channels = self.tui_state.get_all_channels();
+                                    if digit >= 1 && digit <= 9 {
+                                        let channel_id = (digit - 1) as usize;  // 1→0, 2→1, 3→2, 4→3
+                                        let channels = self.tui_state.get_all_channels();
 
-                                    // 該当するチャンネルが存在するか確認
-                                    if channels.iter().any(|ch| ch.channel_id == channel_id) {
-                                        // 現在の選択と同じなら選択解除、異なるなら選択
-                                        let current_selection = self.tui_state.get_selected_channel_for_output();
-                                        if current_selection == Some(channel_id) {
-                                            self.tui_state.set_selected_channel_for_output(None);
-                                        } else {
-                                            self.tui_state.set_selected_channel_for_output(Some(channel_id));
+                                        // 該当するチャンネルが存在するか確認
+                                        if channels.iter().any(|ch| ch.channel_id == channel_id) {
+                                            // 現在の選択と同じなら選択解除、異なるなら選択
+                                            let current_selection = self.tui_state.get_selected_channel_for_output();
+                                            if current_selection == Some(channel_id) {
+                                                self.tui_state.set_selected_channel_for_output(None);
+                                            } else {
+                                                self.tui_state.set_selected_channel_for_output(Some(channel_id));
+                                            }
                                         }
                                     }
                                 }
@@ -183,13 +185,13 @@ impl TuiApp {
         // 選択されている場合はタイトルに [出力中] を追加し、色を変更
         let title = if is_selected {
             format!(
-                "Channel {} - {} [出力中]",
-                channel.channel_id, channel.channel_name
+                "{}: {} [出力中]",
+                channel.channel_id + 1, channel.channel_name
             )
         } else {
             format!(
-                "Channel {} - {}",
-                channel.channel_id, channel.channel_name
+                "{}: {}",
+                channel.channel_id + 1, channel.channel_name
             )
         };
 
@@ -275,15 +277,9 @@ impl TuiApp {
 
     /// ステータス表示を描画
     fn draw_status(&self, f: &mut Frame, area: Rect, channel: &ChannelState) {
-        // VAD状態と無音持続時間
+        // VAD状態
         let (vad_color, vad_text) = match channel.vad_state {
-            VadState::Silence => {
-                if let Some(duration) = channel.silence_duration_secs() {
-                    (Color::Gray, format!("無音 ({:.1}秒)", duration))
-                } else {
-                    (Color::Gray, "無音".to_string())
-                }
-            }
+            VadState::Silence => (Color::Gray, "無音".to_string()),
             VadState::Voice { .. } => (Color::Blue, "音声".to_string()),
         };
 
@@ -327,7 +323,6 @@ impl TuiApp {
 
         // まず全結果の必要行数を計算（古い順）
         let mut entries_with_lines: Vec<Vec<Line>> = Vec::new();
-        let mut total_lines = 0;
 
         // 確定結果を古い順に処理
         for entry in channel.transcripts.iter() {
@@ -366,37 +361,21 @@ impl TuiApp {
             entries_with_lines.push(wrapped_lines);
         }
 
-        // 必要な総行数を計算
-        for lines in &entries_with_lines {
-            total_lines += lines.len();
-        }
-
-        // 表示可能な行数を超えている場合、古い結果をスキップ
-        let mut skip_count = 0;
-        if total_lines > available_height {
-            let mut excess = total_lines - available_height;
-            for (i, lines) in entries_with_lines.iter().enumerate() {
-                if excess == 0 {
-                    break;
-                }
-                if lines.len() <= excess {
-                    excess -= lines.len();
-                    skip_count = i + 1;
-                } else {
-                    break;
-                }
-            }
-        }
-
-        // スキップ後の結果を結合
+        // 全ての行を結合（スキップは後で行単位で行う）
         let mut all_lines: Vec<Line> = Vec::new();
-        for (i, lines) in entries_with_lines.into_iter().enumerate() {
-            if i >= skip_count {
-                all_lines.extend(lines);
-            }
+        for lines in entries_with_lines.into_iter() {
+            all_lines.extend(lines);
         }
 
-        let text = Text::from(all_lines);
+        // 表示可能な行数を超えている場合、最新の行が見えるように古い行をスキップ
+        let lines_to_display = if all_lines.len() > available_height {
+            // 最新のavailable_height行のみを表示（最後の部分が常に表示される）
+            all_lines.split_off(all_lines.len() - available_height)
+        } else {
+            all_lines
+        };
+
+        let text = Text::from(lines_to_display);
         let paragraph = Paragraph::new(text)
             .block(Block::default().borders(Borders::NONE));
         f.render_widget(paragraph, area);

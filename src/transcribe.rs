@@ -79,19 +79,31 @@ impl TranscribeClient {
 
                     let input_stream = stream! {
                         let mut pcm_buffer: Vec<i16> = Vec::new();
-                        let max_samples = 8000; // 約0.5秒分のサンプル（16kHzの場合）
+                        let max_samples = 4800; // 約0.3秒分のサンプル（16kHzの場合）
+                        let initial_min_samples = 3200; // 再接続直後は約0.2秒分で送信
+                        let mut chunk_count = 0; // 送信チャンク数をカウント
 
                         loop {
                             let mut rx = audio_rx_for_stream.lock().await;
 
-                            // データを待機（最大1秒）
-                            match timeout(Duration::from_secs(1), rx.recv()).await {
+                            // データを待機（最大200ms）- AWS Transcribe安定性を優先
+                            match timeout(Duration::from_millis(200), rx.recv()).await {
                                 Ok(Some(samples)) => {
                                     pcm_buffer.extend_from_slice(&samples);
 
+                                    // 適応的バッファリング戦略
+                                    // - 最初の3チャンク: 3200サンプル(0.2秒)で高速送信
+                                    // - それ以降: 4800サンプル(0.3秒)で通常送信
+                                    let min_samples = if chunk_count < 3 {
+                                        initial_min_samples
+                                    } else {
+                                        max_samples
+                                    };
+
                                     // バッファが一定サイズに達したらFLACエンコードして送信
-                                    if pcm_buffer.len() >= max_samples {
-                                        let to_encode: Vec<i16> = pcm_buffer.drain(..max_samples).collect();
+                                    if pcm_buffer.len() >= min_samples {
+                                        let to_encode: Vec<i16> = pcm_buffer.drain(..min_samples.min(pcm_buffer.len())).collect();
+                                        chunk_count += 1;
 
                                         match flac_encoder.encode(&to_encode) {
                                             Ok(flac_data) => {
@@ -230,15 +242,19 @@ impl TranscribeClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::TranscribeBackendType;
 
     #[tokio::test]
     async fn test_transcribe_client_creation() {
         let config = TranscribeConfig {
+            backend: TranscribeBackendType::Aws,
             region: "ap-northeast-1".to_string(),
             language_code: "ja-JP".to_string(),
             sample_rate: 16000,
             max_retries: 3,
             timeout_seconds: 10,
+            connect_on_startup: false,
+            send_buffered_on_reconnect: true,
         };
 
         let result = TranscribeClient::new(config, 0).await;

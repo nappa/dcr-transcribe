@@ -311,7 +311,7 @@ mod tests {
     #[test]
     fn test_transcript_result_creation() {
         let start_time = SystemTime::now();
-        let result = TranscriptResult::new(0, "テストメッセージ".to_string(), false, start_time);
+        let result = TranscriptResult::new(0, "テストメッセージ".to_string(), false, None, start_time);
 
         assert_eq!(result.channel, 0);
         assert_eq!(result.text, "テストメッセージ");
@@ -323,7 +323,7 @@ mod tests {
     #[test]
     fn test_transcript_result_json_serialization() {
         let start_time = SystemTime::now();
-        let result = TranscriptResult::new(1, "こんにちは".to_string(), true, start_time);
+        let result = TranscriptResult::new(1, "こんにちは".to_string(), true, Some(Stability::High), start_time);
 
         let json = serde_json::to_string(&result).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();

@@ -54,12 +54,16 @@ pub struct AudioConfig {
 ///
 /// - `threshold_db`: -40.0 dB
 /// - `hangover_duration_ms`: 500 ms
+/// - `silence_disconnect_threshold_ms`: 10000 ms (10秒)
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct VadConfig {
     #[serde(default = "default_threshold_db")]
     pub threshold_db: f32,
     #[serde(default = "default_hangover_duration_ms")]
     pub hangover_duration_ms: u32,
+    /// 無音が何ミリ秒継続したらTranscribe APIへの接続を切断するか
+    #[serde(default = "default_silence_disconnect_threshold_ms")]
+    pub silence_disconnect_threshold_ms: u32,
 }
 
 /// オーディオバッファ設定
@@ -100,6 +104,8 @@ pub enum TranscribeBackendType {
 /// - `sample_rate`: 16000 Hz (16kHz)
 /// - `max_retries`: 5 回
 /// - `timeout_seconds`: 10 秒
+/// - `connect_on_startup`: false (音声検出まで接続しない)
+/// - `send_buffered_on_reconnect`: true (再接続時にバッファを送信)
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TranscribeConfig {
     #[serde(default = "default_backend")]
@@ -114,6 +120,12 @@ pub struct TranscribeConfig {
     pub max_retries: u32,
     #[serde(default = "default_timeout_seconds")]
     pub timeout_seconds: u64,
+    /// 起動時に即座にTranscribe APIに接続するか（false=音声検出まで待機）
+    #[serde(default = "default_connect_on_startup")]
+    pub connect_on_startup: bool,
+    /// 再接続時に切断中に蓄積されたバッファの音声を送信するか
+    #[serde(default = "default_send_buffered_on_reconnect")]
+    pub send_buffered_on_reconnect: bool,
 }
 
 /// OpenAI Whisper API 設定
@@ -204,6 +216,10 @@ fn default_hangover_duration_ms() -> u32 {
     500
 }
 
+fn default_silence_disconnect_threshold_ms() -> u32 {
+    10000 // 10秒
+}
+
 fn default_capacity_seconds() -> u32 {
     300
 }
@@ -264,6 +280,14 @@ fn default_chunk_duration_secs() -> u64 {
     5 // 5秒ごとにWhisper APIに送信
 }
 
+fn default_connect_on_startup() -> bool {
+    false // デフォルトでは音声検出まで接続しない
+}
+
+fn default_send_buffered_on_reconnect() -> bool {
+    true // デフォルトでは再接続時にバッファを送信
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -306,6 +330,7 @@ impl Default for VadConfig {
         Self {
             threshold_db: default_threshold_db(),
             hangover_duration_ms: default_hangover_duration_ms(),
+            silence_disconnect_threshold_ms: default_silence_disconnect_threshold_ms(),
         }
     }
 }
@@ -328,6 +353,8 @@ impl Default for TranscribeConfig {
             sample_rate: default_transcribe_sample_rate(),
             max_retries: default_max_retries(),
             timeout_seconds: default_timeout_seconds(),
+            connect_on_startup: default_connect_on_startup(),
+            send_buffered_on_reconnect: default_send_buffered_on_reconnect(),
         }
     }
 }
@@ -450,9 +477,12 @@ mod tests {
         assert_eq!(config.audio.sample_rate, 16000);
         assert_eq!(config.audio.channels, 4);
         assert_eq!(config.vad.threshold_db, -40.0);
-        assert_eq!(config.buffer.capacity_seconds, 30);
+        assert_eq!(config.vad.silence_disconnect_threshold_ms, 10000);
+        assert_eq!(config.buffer.capacity_seconds, 300);
         assert_eq!(config.transcribe.language_code, "ja-JP");
         assert_eq!(config.transcribe.region, "ap-northeast-1");
+        assert_eq!(config.transcribe.connect_on_startup, false);
+        assert_eq!(config.transcribe.send_buffered_on_reconnect, true);
         assert_eq!(config.channels.len(), 2);
     }
 

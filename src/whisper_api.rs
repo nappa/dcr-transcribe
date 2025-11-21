@@ -32,6 +32,10 @@ pub struct WhisperBackend {
     channel_id: usize,
     start_time: SystemTime,
     client: reqwest::Client,
+    /// 再接続回数（メトリクス収集用）
+    reconnection_count: u32,
+    /// 現在実行中のタスクハンドル（リソースリーク防止用）
+    task_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl WhisperBackend {
@@ -46,6 +50,8 @@ impl WhisperBackend {
             channel_id,
             start_time: SystemTime::now(),
             client,
+            reconnection_count: 0,
+            task_handle: None,
         })
     }
 
@@ -127,7 +133,14 @@ impl TranscribeBackend for WhisperBackend {
         let config = self.config.clone();
         let client = self.client.clone();
 
-        tokio::spawn(async move {
+        // 古いタスクがあれば破棄（チャンネルクローズにより自動終了）
+        if let Some(old_handle) = self.task_handle.take() {
+            log::debug!("チャンネル {}: 古いWhisperタスクを破棄", channel_id);
+            // タスクハンドルをドロップすることで、バックグラウンドで終了させる
+            drop(old_handle);
+        }
+
+        let handle = tokio::spawn(async move {
             use tokio::time::{Duration, timeout};
 
             let mut pcm_buffer: Vec<i16> = Vec::new();
@@ -155,6 +168,8 @@ impl TranscribeBackend for WhisperBackend {
                                 channel_id,
                                 start_time,
                                 client: client.clone(),
+                                reconnection_count: 0,
+                                task_handle: None,
                             };
 
                             match backend.pcm_to_wav(&to_transcribe) {
@@ -201,6 +216,8 @@ impl TranscribeBackend for WhisperBackend {
                                 channel_id,
                                 start_time,
                                 client: client.clone(),
+                                reconnection_count: 0,
+                                task_handle: None,
                             };
 
                             match backend.pcm_to_wav(&pcm_buffer) {
@@ -238,10 +255,23 @@ impl TranscribeBackend for WhisperBackend {
             }
         });
 
+        // タスクハンドルを保存（リソースリーク防止）
+        self.task_handle = Some(handle);
+
         Ok((audio_tx, result_rx))
     }
 
     fn channel_id(&self) -> usize {
         self.channel_id
+    }
+
+    fn reset_start_time(&mut self) {
+        self.start_time = SystemTime::now();
+        self.reconnection_count += 1;
+        log::info!(
+            "チャンネル {}: start_timeをリセット（再接続 #{}）",
+            self.channel_id,
+            self.reconnection_count
+        );
     }
 }

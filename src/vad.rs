@@ -28,6 +28,7 @@ use crate::types::{SampleI16, VadState};
 /// let config = VadConfig {
 ///     threshold_db: -40.0,
 ///     hangover_duration_ms: 500,
+///     silence_disconnect_threshold_ms: 10000,
 /// };
 /// let mut vad = VoiceActivityDetector::new(&config, 16000);
 ///
@@ -103,7 +104,7 @@ impl VoiceActivityDetector {
         self.state = match self.state {
             VadState::Silence => {
                 if is_voice_detected {
-                    log::debug!("VAD: 音声開始検出 (RMS: {:.2} dB)", db);
+                    log::info!("VAD: 音声開始検出 (音量: {:.2} dB > 閾値: {:.2} dB)", db, self.threshold_db);
                     VadState::Voice {
                         hangover_remaining_ms: self.hangover_duration_ms,
                     }
@@ -126,7 +127,7 @@ impl VoiceActivityDetector {
                             hangover_remaining_ms: hangover_remaining_ms - duration_ms,
                         }
                     } else {
-                        log::debug!("VAD: 音声終了検出 (RMS: {:.2} dB)", db);
+                        log::info!("VAD: 音声終了検出 (音量: {:.2} dB <= 閾値: {:.2} dB, ハングオーバー終了)", db, self.threshold_db);
                         VadState::Silence
                     }
                 }
@@ -189,6 +190,7 @@ mod tests {
         let config = VadConfig {
             threshold_db: -40.0,
             hangover_duration_ms: 500,
+            silence_disconnect_threshold_ms: 10000,
         };
         let mut vad = VoiceActivityDetector::new(&config, 16000);
 
@@ -203,6 +205,7 @@ mod tests {
         let config = VadConfig {
             threshold_db: -40.0,
             hangover_duration_ms: 500,
+            silence_disconnect_threshold_ms: 10000,
         };
         let mut vad = VoiceActivityDetector::new(&config, 16000);
 
@@ -220,6 +223,7 @@ mod tests {
         let config = VadConfig {
             threshold_db: -40.0,
             hangover_duration_ms: 500,
+            silence_disconnect_threshold_ms: 10000,
         };
         let mut vad = VoiceActivityDetector::new(&config, 16000);
 
@@ -247,6 +251,7 @@ mod tests {
         let config = VadConfig {
             threshold_db: -40.0,
             hangover_duration_ms: 500,
+            silence_disconnect_threshold_ms: 10000,
         };
         let mut vad = VoiceActivityDetector::new(&config, 16000);
 
@@ -264,6 +269,7 @@ mod tests {
         let config = VadConfig {
             threshold_db: -40.0,
             hangover_duration_ms: 500,
+            silence_disconnect_threshold_ms: 10000,
         };
         let vad = VoiceActivityDetector::new(&config, 16000);
 
@@ -281,6 +287,7 @@ mod tests {
         let config = VadConfig {
             threshold_db: -40.0,
             hangover_duration_ms: 500,
+            silence_disconnect_threshold_ms: 10000,
         };
         let vad = VoiceActivityDetector::new(&config, 16000);
 
@@ -299,6 +306,7 @@ mod tests {
         let config = VadConfig {
             threshold_db: -40.0,
             hangover_duration_ms: 500,
+            silence_disconnect_threshold_ms: 10000,
         };
         let mut vad = VoiceActivityDetector::new(&config, 16000);
 
@@ -312,6 +320,7 @@ mod tests {
         let config = VadConfig {
             threshold_db: -40.0,
             hangover_duration_ms: 500,
+            silence_disconnect_threshold_ms: 10000,
         };
         let mut vad = VoiceActivityDetector::new(&config, 16000);
 
@@ -346,6 +355,7 @@ mod tests {
         let strict_config = VadConfig {
             threshold_db: -20.0,
             hangover_duration_ms: 500,
+            silence_disconnect_threshold_ms: 10000,
         };
         let mut strict_vad = VoiceActivityDetector::new(&strict_config, 16000);
 
@@ -353,6 +363,7 @@ mod tests {
         let loose_config = VadConfig {
             threshold_db: -60.0,
             hangover_duration_ms: 500,
+            silence_disconnect_threshold_ms: 10000,
         };
         let mut loose_vad = VoiceActivityDetector::new(&loose_config, 16000);
 
@@ -371,6 +382,7 @@ mod tests {
         let config = VadConfig {
             threshold_db: -40.0,
             hangover_duration_ms: 500,
+            silence_disconnect_threshold_ms: 10000,
         };
         let mut vad = VoiceActivityDetector::new(&config, 16000);
 

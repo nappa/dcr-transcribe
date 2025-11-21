@@ -43,7 +43,7 @@ impl Write for LogWriter {
     }
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 8)]
 async fn main() -> Result<()> {
     // ログファイルを開く
     let log_file = OpenOptions::new()
@@ -224,7 +224,7 @@ async fn main() -> Result<()> {
         let running_clone = running.clone();
         let transcript_task = tokio::spawn(async move {
             while running_clone.load(Ordering::SeqCst) {
-                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
                 let mut proc = processor_clone.lock().await;
                 let channel_id = proc.channel_id();

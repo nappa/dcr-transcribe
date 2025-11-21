@@ -11,6 +11,15 @@ use crate::whisper_api::WhisperBackend;
 use anyhow::{Context, Result};
 use tokio::sync::mpsc;
 
+/// Transcribe API接続状態
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TranscribeConnectionState {
+    /// 未接続
+    Disconnected,
+    /// 接続中
+    Connected,
+}
+
 /// 1つのチャンネルの完全な処理パイプライン
 ///
 /// VAD、バッファリング、WAV書き出し、Transcribe送信を統合
@@ -31,6 +40,18 @@ pub struct ChannelProcessor {
     tui_state: Option<TuiState>,
     /// 音声出力用Sender (オプション)
     audio_output_tx: Option<mpsc::Sender<Vec<i16>>>,
+    /// Transcribe接続状態
+    connection_state: TranscribeConnectionState,
+    /// 無音継続時間（ミリ秒）
+    silence_duration_ms: u32,
+    /// 接続切断の無音閾値（ミリ秒）
+    silence_threshold_ms: u32,
+    /// 切断中に蓄積された音声サンプル
+    buffered_samples_during_disconnect: Vec<Vec<i16>>,
+    /// 起動時に接続するか
+    connect_on_startup: bool,
+    /// 再接続時にバッファを送信するか
+    send_buffered_on_reconnect: bool,
 }
 
 impl ChannelProcessor {
@@ -97,6 +118,12 @@ impl ChannelProcessor {
             sample_rate,
             tui_state: None,
             audio_output_tx: None,
+            connection_state: TranscribeConnectionState::Disconnected,
+            silence_duration_ms: 0,
+            silence_threshold_ms: vad_config.silence_disconnect_threshold_ms,
+            buffered_samples_during_disconnect: Vec::new(),
+            connect_on_startup: transcribe_config.connect_on_startup,
+            send_buffered_on_reconnect: transcribe_config.send_buffered_on_reconnect,
         })
     }
 
@@ -130,12 +157,24 @@ impl ChannelProcessor {
         // WAVファイル書き込みを開始
         self.wav_writer.start()?;
 
-        // Transcribeストリームを開始
-        if let Some(mut backend) = self.transcribe_backend.take() {
-            let (tx, rx) = backend.start_stream().await?;
-            self.transcribe_tx = Some(tx);
-            self.transcribe_rx = Some(rx);
-            self.transcribe_backend = Some(backend);
+        // connect_on_startupがtrueの場合のみ起動時に接続
+        if self.connect_on_startup {
+            log::info!(
+                "チャンネル {}: 起動時にTranscribe接続を開始",
+                self.channel_id
+            );
+            self.reconnect_transcribe().await?;
+        } else {
+            log::info!(
+                "チャンネル {}: 音声検出まで接続を待機",
+                self.channel_id
+            );
+            // TUI状態を未接続に設定
+            if let Some(tui_state) = &self.tui_state {
+                tui_state.update_channel(self.channel_id, |channel| {
+                    channel.update_transcribe_status(TranscribeStatus::Disconnected);
+                });
+            }
         }
 
         Ok(())
@@ -156,6 +195,7 @@ impl ChannelProcessor {
 
         // 3. VADで音声区間を判定
         let is_voice = self.vad.process(samples);
+        let volume_db = self.vad.get_last_volume_db();
 
         // 4. TUI状態を更新
         if let Some(tui_state) = &self.tui_state {
@@ -167,36 +207,153 @@ impl ChannelProcessor {
             });
         }
 
-        // 5. PCMサンプルをTranscribeに送信
-        if let Some(tx) = &self.transcribe_tx {
-            let samples_to_send = if is_voice {
-                samples.clone()
-            } else {
-                // 無音部分はゼロサンプルに置換
-                vec![0i16; samples.len()]
-            };
+        // 5. チャンク時間を計算（ミリ秒）
+        let chunk_duration_ms = (samples.len() as f64 / self.sample_rate as f64 * 1000.0) as u32;
 
-            if let Err(e) = tx.send(samples_to_send).await {
-                log::error!(
-                    "チャンネル {}: Transcribeへの送信に失敗: {}",
+        // 6. 接続状態に応じた処理
+        match (is_voice, &self.connection_state) {
+            // 音声検出 + 未接続 → 再接続 + バッファ送信
+            (true, TranscribeConnectionState::Disconnected) => {
+                // バッファサイズを計算（メトリクス収集）
+                let total_buffered_samples: usize = self.buffered_samples_during_disconnect
+                    .iter()
+                    .map(|chunk| chunk.len())
+                    .sum();
+                let buffered_duration_ms = (total_buffered_samples as f64 / self.sample_rate as f64 * 1000.0) as u32;
+
+                log::info!(
+                    "チャンネル {}: ★音声検出★ Transcribe再接続を開始 (音量: {:.2} dB, バッファ: {}チャンク, {}ms相当)",
                     self.channel_id,
-                    e
+                    volume_db,
+                    self.buffered_samples_during_disconnect.len(),
+                    buffered_duration_ms
                 );
-                // エラー時はTUI状態を更新
-                if let Some(tui_state) = &self.tui_state {
-                    tui_state.update_channel(self.channel_id, |channel| {
-                        channel.update_transcribe_status(TranscribeStatus::Error);
-                    });
+                self.reconnect_transcribe().await?;
+
+                // 再接続時にバッファ送信が有効な場合
+                if self.send_buffered_on_reconnect && !self.buffered_samples_during_disconnect.is_empty() {
+                    log::info!(
+                        "チャンネル {}: 切断中の音声バッファを送信（{}チャンク, {}ms相当）",
+                        self.channel_id,
+                        self.buffered_samples_during_disconnect.len(),
+                        buffered_duration_ms
+                    );
+
+                    // バッファを送信
+                    if let Some(tx) = &self.transcribe_tx {
+                        for buffered in &self.buffered_samples_during_disconnect {
+                            if let Err(e) = tx.send(buffered.clone()).await {
+                                log::error!(
+                                    "チャンネル {}: バッファ送信に失敗: {}",
+                                    self.channel_id,
+                                    e
+                                );
+                                break;
+                            }
+                        }
+                    }
                 }
-            } else if let Some(tui_state) = &self.tui_state {
-                // 正常送信時
-                tui_state.update_channel(self.channel_id, |channel| {
-                    channel.update_transcribe_status(TranscribeStatus::Connected);
-                });
+
+                // バッファをクリア
+                self.buffered_samples_during_disconnect.clear();
+
+                // 現在のチャンクを送信
+                if let Some(tx) = &self.transcribe_tx {
+                    if let Err(e) = tx.send(samples.clone()).await {
+                        log::error!(
+                            "チャンネル {}: Transcribeへの送信に失敗: {} - 切断して次回再接続します",
+                            self.channel_id,
+                            e
+                        );
+                        // チャンネルが閉じられた場合は切断状態に移行
+                        self.transcribe_tx = None;
+                        self.connection_state = TranscribeConnectionState::Disconnected;
+
+                        if let Some(tui_state) = &self.tui_state {
+                            tui_state.update_channel(self.channel_id, |channel| {
+                                channel.update_transcribe_status(TranscribeStatus::Disconnected);
+                            });
+                        }
+                    }
+                }
+
+                self.silence_duration_ms = 0;
+            }
+
+            // 音声検出 + 接続中 → 通常送信
+            (true, TranscribeConnectionState::Connected) => {
+                self.silence_duration_ms = 0;
+
+                if let Some(tx) = &self.transcribe_tx {
+                    if let Err(e) = tx.send(samples.clone()).await {
+                        log::error!(
+                            "チャンネル {}: Transcribeへの送信に失敗: {} - 切断して次回再接続します",
+                            self.channel_id,
+                            e
+                        );
+                        // チャンネルが閉じられた場合は切断状態に移行
+                        self.transcribe_tx = None;
+                        self.connection_state = TranscribeConnectionState::Disconnected;
+
+                        // エラー時はTUI状態を切断に更新
+                        if let Some(tui_state) = &self.tui_state {
+                            tui_state.update_channel(self.channel_id, |channel| {
+                                channel.update_transcribe_status(TranscribeStatus::Disconnected);
+                            });
+                        }
+                    } else if let Some(tui_state) = &self.tui_state {
+                        // 正常送信時
+                        tui_state.update_channel(self.channel_id, |channel| {
+                            channel.update_transcribe_status(TranscribeStatus::Connected);
+                        });
+                    }
+                }
+            }
+
+            // 無音 + 接続中 → カウント増加、閾値超過で切断
+            (false, TranscribeConnectionState::Connected) => {
+                self.silence_duration_ms += chunk_duration_ms;
+
+                if self.silence_duration_ms >= self.silence_threshold_ms {
+                    log::info!(
+                        "チャンネル {}: 無音が{}ms継続、Transcribe接続を停止 (閾値: {}ms)",
+                        self.channel_id,
+                        self.silence_duration_ms,
+                        self.silence_threshold_ms
+                    );
+                    self.disconnect_transcribe().await?;
+                } else {
+                    // 閾値未満の場合はゼロサンプル送信（既存の挙動）
+                    if let Some(tx) = &self.transcribe_tx {
+                        let zero_samples = vec![0i16; samples.len()];
+                        if let Err(e) = tx.send(zero_samples).await {
+                            log::error!(
+                                "チャンネル {}: ゼロサンプル送信に失敗: {} - 切断して次回再接続します",
+                                self.channel_id,
+                                e
+                            );
+                            // チャンネルが閉じられた場合は切断状態に移行
+                            self.transcribe_tx = None;
+                            self.connection_state = TranscribeConnectionState::Disconnected;
+
+                            if let Some(tui_state) = &self.tui_state {
+                                tui_state.update_channel(self.channel_id, |channel| {
+                                    channel.update_transcribe_status(TranscribeStatus::Disconnected);
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 無音 + 未接続 → 何もしない（バッファに蓄積しない）
+            (false, TranscribeConnectionState::Disconnected) => {
+                // 切断中の無音はバッファに蓄積しない
+                // これにより、再接続時の遅延を防ぐ
             }
         }
 
-        // 6. 音声出力デバイスに送信（設定されている場合）
+        // 7. 音声出力デバイスに送信（設定されている場合）
         if let Some(tx) = &self.audio_output_tx {
             if let Err(e) = tx.send(samples.clone()).await {
                 log::warn!(
@@ -210,6 +367,79 @@ impl ChannelProcessor {
         Ok(())
     }
 
+    /// Transcribe APIに再接続
+    async fn reconnect_transcribe(&mut self) -> Result<()> {
+        // 既に接続中の場合は何もしない
+        if self.connection_state == TranscribeConnectionState::Connected {
+            return Ok(());
+        }
+
+        log::info!("チャンネル {}: Transcribe再接続開始", self.channel_id);
+
+        // バックエンドから新しいストリームを開始
+        if let Some(mut backend) = self.transcribe_backend.take() {
+            // start_timeをリセット（タイムスタンプドリフト防止）
+            backend.reset_start_time();
+            match backend.start_stream().await {
+                Ok((tx, rx)) => {
+                    self.transcribe_tx = Some(tx);
+                    self.transcribe_rx = Some(rx);
+                    self.transcribe_backend = Some(backend);
+                    self.connection_state = TranscribeConnectionState::Connected;
+
+                    // TUI状態を接続中に更新
+                    if let Some(tui_state) = &self.tui_state {
+                        tui_state.update_channel(self.channel_id, |channel| {
+                            channel.update_transcribe_status(TranscribeStatus::Connected);
+                        });
+                    }
+
+                    log::info!(
+                        "チャンネル {}: Transcribe再接続成功 (無音閾値: {}ms)",
+                        self.channel_id,
+                        self.silence_threshold_ms
+                    );
+                    Ok(())
+                }
+                Err(e) => {
+                    // エラー時もバックエンドを戻す
+                    self.transcribe_backend = Some(backend);
+
+                    // TUI状態をエラーに更新
+                    if let Some(tui_state) = &self.tui_state {
+                        tui_state.update_channel(self.channel_id, |channel| {
+                            channel.update_transcribe_status(TranscribeStatus::Error);
+                        });
+                    }
+
+                    log::error!("チャンネル {}: Transcribe再接続失敗: {}", self.channel_id, e);
+                    Err(e)
+                }
+            }
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Transcribe API接続を切断
+    async fn disconnect_transcribe(&mut self) -> Result<()> {
+        log::info!("チャンネル {}: Transcribe接続を停止", self.channel_id);
+
+        // 送信チャンネルをドロップすることで接続終了
+        self.transcribe_tx = None;
+        self.connection_state = TranscribeConnectionState::Disconnected;
+        self.silence_duration_ms = 0;
+
+        // TUI状態を未接続に更新
+        if let Some(tui_state) = &self.tui_state {
+            tui_state.update_channel(self.channel_id, |channel| {
+                channel.update_transcribe_status(TranscribeStatus::Disconnected);
+            });
+        }
+
+        Ok(())
+    }
+
     /// 文字起こし結果を取得（non-blocking）
     pub async fn poll_transcripts(&mut self) -> Vec<TranscriptResult> {
         let mut results = Vec::new();
@@ -217,7 +447,18 @@ impl ChannelProcessor {
         if let Some(rx) = &mut self.transcribe_rx {
             // 利用可能な全ての結果を取得
             while let Ok(result) = rx.try_recv() {
+                log::debug!(
+                    "チャンネル {}: 文字起こし結果受信 - テキスト: '{}', 部分結果: {}",
+                    self.channel_id,
+                    result.text,
+                    result.is_partial
+                );
                 results.push(result);
+            }
+        } else {
+            // transcribe_rxがNoneの場合（未接続または切断中）
+            if self.connection_state == TranscribeConnectionState::Disconnected {
+                log::trace!("チャンネル {}: Transcribe未接続のため結果なし", self.channel_id);
             }
         }
 
@@ -378,6 +619,7 @@ mod tests {
         let vad_config = VadConfig {
             threshold_db: -40.0,
             hangover_duration_ms: 500,
+            silence_disconnect_threshold_ms: 10000,
         };
 
         let buffer_config = BufferConfig {
@@ -386,11 +628,14 @@ mod tests {
         };
 
         let transcribe_config = TranscribeConfig {
+            backend: TranscribeBackendType::Aws,
             region: "ap-northeast-1".to_string(),
             language_code: "ja-JP".to_string(),
             sample_rate: 16000,
             max_retries: 3,
             timeout_seconds: 10,
+            connect_on_startup: false,
+            send_buffered_on_reconnect: true,
         };
 
         let output_config = OutputConfig {
@@ -403,6 +648,7 @@ mod tests {
             &vad_config,
             &buffer_config,
             &transcribe_config,
+            None, // whisper_config
             &output_config,
             16000,
         )

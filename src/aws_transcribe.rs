@@ -16,6 +16,10 @@ pub struct AwsTranscribeBackend {
     config: TranscribeConfig,
     channel_id: usize,
     start_time: SystemTime,
+    /// 再接続回数（メトリクス収集用）
+    reconnection_count: u32,
+    /// 現在実行中のタスクハンドル（リソースリーク防止用）
+    task_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl AwsTranscribeBackend {
@@ -24,6 +28,8 @@ impl AwsTranscribeBackend {
             config,
             channel_id,
             start_time: SystemTime::now(),
+            reconnection_count: 0,
+            task_handle: None,
         })
     }
 }
@@ -54,7 +60,14 @@ impl TranscribeBackend for AwsTranscribeBackend {
         let channel_id = self.channel_id;
         let start_time = self.start_time;
 
-        tokio::spawn({
+        // 古いタスクがあれば破棄（チャンネルクローズにより自動終了）
+        if let Some(old_handle) = self.task_handle.take() {
+            log::debug!("チャンネル {}: 古いTranscribeタスクを破棄", channel_id);
+            // タスクハンドルをドロップすることで、バックグラウンドで終了させる
+            drop(old_handle);
+        }
+
+        let handle = tokio::spawn({
             let language_code = language_code.clone();
             let sample_rate = sample_rate;
             let channel_id = channel_id;
@@ -67,32 +80,54 @@ impl TranscribeBackend for AwsTranscribeBackend {
                 'outer: loop {
                     let audio_rx_for_stream = Arc::clone(&audio_rx);
 
-                    // FLACエンコーダーを作成（圧縮レベル5）
-                    let mut flac_encoder = FlacEncoder::new(sample_rate, 5);
-
                     let input_stream = stream! {
                         let mut pcm_buffer: Vec<i16> = Vec::new();
-                        let max_samples = 8000; // 約0.5秒分のサンプル（16kHzの場合）
+                        // サンプルレートに応じた適切なバッファサイズを計算
+                        let max_samples = (sample_rate as f64 * 0.2) as usize; // 0.2秒分
+                        let initial_min_samples = (sample_rate as f64 * 0.15) as usize; // 0.15秒分（再接続直後）
+                        let mut chunk_count = 0; // 送信チャンク数をカウント
+
+                        log::info!("チャンネル {}: バッファサイズ設定 - 初期: {}サンプル({:.2}秒), 通常: {}サンプル({:.2}秒) @ {}Hz",
+                                   channel_id, initial_min_samples, initial_min_samples as f64 / sample_rate as f64,
+                                   max_samples, max_samples as f64 / sample_rate as f64, sample_rate);
 
                         loop {
                             let mut rx = audio_rx_for_stream.lock().await;
 
-                            // データを待機（最大1秒）
-                            match timeout(Duration::from_secs(1), rx.recv()).await {
+                            // データを待機（最大100ms）- AWS Transcribeへの迅速なデータ送信を優先
+                            match timeout(Duration::from_millis(100), rx.recv()).await {
                                 Ok(Some(samples)) => {
                                     pcm_buffer.extend_from_slice(&samples);
 
-                                    // バッファが一定サイズに達したらFLACエンコードして送信
-                                    if pcm_buffer.len() >= max_samples {
-                                        let to_encode: Vec<i16> = pcm_buffer.drain(..max_samples).collect();
+                                    // 適応的バッファリング戦略
+                                    // - 最初の5チャンク: より小さいバッファで高速送信（AWS 20秒タイムアウト対策）
+                                    // - それ以降: 通常バッファサイズで安定送信
+                                    let min_samples = if chunk_count < 5 {
+                                        initial_min_samples
+                                    } else {
+                                        max_samples
+                                    };
 
-                                        match flac_encoder.encode(&to_encode) {
-                                            Ok(flac_data) => {
+                                    // バッファが一定サイズに達したらFLACエンコードして送信
+                                    if pcm_buffer.len() >= min_samples {
+                                        let to_encode: Vec<i16> = pcm_buffer.drain(..min_samples.min(pcm_buffer.len())).collect();
+                                        chunk_count += 1;
+
+                                        // FLACエンコードを非ブロッキングで実行（CPU集約型処理）
+                                        let sample_rate_for_encode = sample_rate;
+                                        match tokio::task::spawn_blocking(move || {
+                                            let mut encoder = FlacEncoder::new(sample_rate_for_encode, 5);
+                                            encoder.encode(&to_encode)
+                                        }).await {
+                                            Ok(Ok(flac_data)) => {
                                                 let blob = Blob::new(flac_data);
                                                 yield Ok(AudioStream::AudioEvent(AudioEvent::builder().audio_chunk(blob).build()));
                                             }
-                                            Err(e) => {
+                                            Ok(Err(e)) => {
                                                 log::error!("FLACエンコードエラー: {:?}", e);
+                                            }
+                                            Err(e) => {
+                                                log::error!("FLACエンコードタスク実行エラー: {:?}", e);
                                             }
                                         }
                                     }
@@ -101,14 +136,24 @@ impl TranscribeBackend for AwsTranscribeBackend {
                                     log::debug!("AwsTranscribeBackend: チャンネルクローズ");
                                     // チャンネルがクローズされた場合、残りのバッファを送信
                                     if !pcm_buffer.is_empty() {
-                                        match flac_encoder.encode(&pcm_buffer) {
-                                            Ok(flac_data) => {
+                                        let final_buffer = pcm_buffer.clone();
+                                        let final_buffer_len = final_buffer.len();
+                                        let sample_rate_for_encode = sample_rate;
+
+                                        match tokio::task::spawn_blocking(move || {
+                                            let mut encoder = FlacEncoder::new(sample_rate_for_encode, 5);
+                                            encoder.encode(&final_buffer)
+                                        }).await {
+                                            Ok(Ok(flac_data)) => {
                                                 let blob = Blob::new(flac_data);
-                                                log::debug!("Amazon Transcribe 最終送信: {} サンプル → {} バイト", pcm_buffer.len(), blob.as_ref().len());
+                                                log::debug!("Amazon Transcribe 最終送信: {} サンプル → {} バイト", final_buffer_len, blob.as_ref().len());
                                                 yield Ok(AudioStream::AudioEvent(AudioEvent::builder().audio_chunk(blob).build()));
                                             }
-                                            Err(e) => {
+                                            Ok(Err(e)) => {
                                                 log::error!("FLACエンコードエラー: {:?}", e);
+                                            }
+                                            Err(e) => {
+                                                log::error!("FLACエンコードタスク実行エラー: {:?}", e);
                                             }
                                         }
                                     }
@@ -119,14 +164,23 @@ impl TranscribeBackend for AwsTranscribeBackend {
                                     // タイムアウトした場合、バッファに残っているデータを送信
                                     if !pcm_buffer.is_empty() {
                                         let to_encode = pcm_buffer.split_off(0);
-                                        match flac_encoder.encode(&to_encode) {
-                                            Ok(flac_data) => {
+                                        let to_encode_len = to_encode.len();
+                                        let sample_rate_for_encode = sample_rate;
+
+                                        match tokio::task::spawn_blocking(move || {
+                                            let mut encoder = FlacEncoder::new(sample_rate_for_encode, 5);
+                                            encoder.encode(&to_encode)
+                                        }).await {
+                                            Ok(Ok(flac_data)) => {
                                                 let blob = Blob::new(flac_data);
-                                                log::debug!("Amazon Transcribe タイムアウト送信: {} サンプル → {} バイト", to_encode.len(), blob.as_ref().len());
+                                                log::debug!("Amazon Transcribe タイムアウト送信: {} サンプル → {} バイト", to_encode_len, blob.as_ref().len());
                                                 yield Ok(AudioStream::AudioEvent(AudioEvent::builder().audio_chunk(blob).build()));
                                             }
-                                            Err(e) => {
+                                            Ok(Err(e)) => {
                                                 log::error!("FLACエンコードエラー: {:?}", e);
+                                            }
+                                            Err(e) => {
+                                                log::error!("FLACエンコードタスク実行エラー: {:?}", e);
                                             }
                                         }
                                     }
@@ -135,6 +189,7 @@ impl TranscribeBackend for AwsTranscribeBackend {
                         }
                     };
 
+                    log::info!("チャンネル {}: Amazon Transcribe ストリーム開始...", channel_id);
                     let mut resp = match client
                         .start_stream_transcription()
                         .language_code(language_code.clone())
@@ -145,18 +200,23 @@ impl TranscribeBackend for AwsTranscribeBackend {
                         .await
                     {
                         Ok(r) => {
-                            log::debug!("Amazon Transcribe Output: {:?}", r);
+                            log::info!("チャンネル {}: Amazon Transcribe ストリーム開始成功", channel_id);
                             r
                         }
                         Err(e) => {
-                            log::error!("Amazon Transcribe API開始失敗: {:?}", e);
+                            log::error!("チャンネル {}: Amazon Transcribe API開始失敗: {:?}", channel_id, e);
+                            // エラーの詳細情報をログ出力
+                            if let Some(service_err) = e.as_service_error() {
+                                log::error!("チャンネル {}: サービスエラー詳細: {:?}", channel_id, service_err);
+                            }
                             return;
                         }
                     };
 
-                    while let Ok(Some(event)) = resp.transcript_result_stream.recv().await {
-                        match event {
-                            aws_sdk_transcribestreaming::types::TranscriptResultStream::TranscriptEvent(transcript_event) => {
+                    loop {
+                        match resp.transcript_result_stream.recv().await {
+                            Ok(Some(event)) => match event {
+                                aws_sdk_transcribestreaming::types::TranscriptResultStream::TranscriptEvent(transcript_event) => {
                                 if let Some(transcript) = transcript_event.transcript {
                                     for result in transcript.results.unwrap_or_default() {
                                         for alt in result.alternatives.unwrap_or_default() {
@@ -199,16 +259,29 @@ impl TranscribeBackend for AwsTranscribeBackend {
                                         }
                                     }
                                 }
-                            }
-                            other => {
-                                log::debug!("Amazon Transcribe イベント: {:?}", other);
+                                },
+                                other => {
+                                    log::warn!("チャンネル {}: Amazon Transcribe 未処理イベント: {:?}", channel_id, other);
+                                }
+                            },
+                            Ok(None) => {
+                                log::warn!("チャンネル {}: Amazon Transcribeストリームが予期せず終了（Ok(None)）", channel_id);
+                                break 'outer;
+                            },
+                            Err(e) => {
+                                log::error!("チャンネル {}: Amazon Transcribeストリーム受信エラー: {:?}", channel_id, e);
+                                // エラーの詳細をログ出力
+                                log::error!("チャンネル {}: エラー種別: {}", channel_id, std::any::type_name_of_val(&e));
+                                break 'outer;
                             }
                         }
                     }
-                    break 'outer;
                 }
             }
         });
+
+        // タスクハンドルを保存（リソースリーク防止）
+        self.task_handle = Some(handle);
 
         Ok((audio_tx, result_rx))
     }
@@ -216,20 +289,34 @@ impl TranscribeBackend for AwsTranscribeBackend {
     fn channel_id(&self) -> usize {
         self.channel_id
     }
+
+    fn reset_start_time(&mut self) {
+        self.start_time = SystemTime::now();
+        self.reconnection_count += 1;
+        log::info!(
+            "チャンネル {}: start_timeをリセット（再接続 #{}）",
+            self.channel_id,
+            self.reconnection_count
+        );
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::TranscribeBackendType;
 
     #[tokio::test]
     async fn test_aws_transcribe_backend_creation() {
         let config = TranscribeConfig {
+            backend: TranscribeBackendType::Aws,
             region: "ap-northeast-1".to_string(),
             language_code: "ja-JP".to_string(),
             sample_rate: 16000,
             max_retries: 3,
             timeout_seconds: 10,
+            connect_on_startup: false,
+            send_buffered_on_reconnect: true,
         };
 
         let result = AwsTranscribeBackend::new(config, 0).await;

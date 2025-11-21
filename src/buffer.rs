@@ -38,19 +38,11 @@ impl AudioBuffer {
                 DropPolicy::DropOldest => {
                     if let Some(dropped) = self.chunks.pop_front() {
                         self.total_samples -= dropped.samples.len();
-                        log::warn!(
-                            "バッファ容量オーバー: 最古のチャンク({:.2}秒分)を破棄",
-                            dropped.samples.len() as f64 / self.sample_rate as f64
-                        );
                     }
                 }
                 DropPolicy::DropNewest => {
                     if let Some(dropped) = self.chunks.pop_back() {
                         self.total_samples -= dropped.samples.len();
-                        log::warn!(
-                            "バッファ容量オーバー: 最新のチャンク({:.2}秒分)を破棄",
-                            dropped.samples.len() as f64 / self.sample_rate as f64
-                        );
                     }
                 }
                 DropPolicy::Block => {
