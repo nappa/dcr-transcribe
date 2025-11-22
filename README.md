@@ -1,7 +1,11 @@
 # DCR Transcriber (dcr-transcribe)
 
 デジタル簡易無線機(DCR)・IP無線機からの音声から無音信号を除いて Amazon Transcribe に送り、
-結果を標準出力に出力する
+結果を TUI に表示するシステム
+
+## 人間様向けの説明
+
+主に Claude Code にコード書いてもらいました
 
 ## 主な機能
 
@@ -46,7 +50,7 @@ export AWS_REGION="ap-northeast-1"
 ### 3. オーディオインターフェースの確認
 
 ```bash
-cargo run -- --show-interfaces
+cargo run --release -- --show-interfaces
 ```
 
 利用可能な入力デバイスと出力デバイスの一覧が表示されます。
@@ -55,7 +59,7 @@ cargo run -- --show-interfaces
 ### 4. 実行
 
 ```bash
-cargo run
+cargo run --release
 ```
 
 または設定ファイルを指定：
@@ -113,7 +117,7 @@ TUI画面で `q` または `Esc` キーを押すと確認ダイアログが表�
   - `Y`: 終了を確定
   - `N` または `Esc`: キャンセル
 - `Ctrl+C`: 確認なしで即座に終了
-- `0`～`9`: 対応するチャンネルの音声を出力デバイスに送る（トグル）
+- `1`～`0`: 対応するチャンネルの音声を出力デバイスに送る（トグル）
   - 選択されたチャンネルは黄色の枠で表示され、タイトルに `[出力中]` が表示されます
   - 同じ数字キーを再度押すと選択解除されます
   - 1つのチャンネルのみ選択可能です
@@ -125,7 +129,7 @@ TUI画面で `q` または `Esc` キーを押すと確認ダイアログが表�
 [audio]
 device_id = "default"           # 入力デバイス（"default" または --show-interfaces で表示されたデバイス名）
 output_device_id = "default"    # 出力デバイス（"default" または --show-interfaces で表示されたデバイス名）
-sample_rate = 16000             # 16kHz
+sample_rate = 48000             # 48kHz
 channels = 4                    # 入力チャンネル数
 
 [vad]
@@ -136,7 +140,7 @@ hangover_duration_ms = 500
 backend = "aws"                 # "aws" または "whisper"
 region = "ap-northeast-1"       # 東京リージョン
 language_code = "ja-JP"
-sample_rate = 16000
+sample_rate = 48000
 
 [output]
 wav_output_dir = "./recordings"
