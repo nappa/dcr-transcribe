@@ -253,9 +253,22 @@ impl TuiApp {
             channel.vad_threshold_db
         );
 
+        // 音量バーの色を決定
+        use crate::types::VadState;
+        let gauge_color = match channel.vad_state {
+            VadState::Silence => Color::Gray,  // 無音検出時は灰色
+            VadState::Voice { .. } => {
+                if channel.current_volume_db >= -30.0 {
+                    Color::Red  // -30dB以上は赤色
+                } else {
+                    Color::Cyan  // それ以外はシアン
+                }
+            }
+        };
+
         let current_gauge = Gauge::default()
             .label(label)
-            .gauge_style(Style::default().fg(Color::Cyan))
+            .gauge_style(Style::default().fg(gauge_color))
             .ratio(current_ratio);
         f.render_widget(current_gauge, area);
 

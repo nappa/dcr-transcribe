@@ -18,7 +18,4 @@ pub trait TranscribeBackend: Send {
 
     /// チャンネルIDを取得
     fn channel_id(&self) -> usize;
-
-    /// start_timeをリセット（再接続時のタイムスタンプドリフト防止）
-    fn reset_start_time(&mut self);
 }

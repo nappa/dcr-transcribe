@@ -63,6 +63,7 @@ impl ChannelProcessor {
         whisper_config: Option<&WhisperConfig>,
         output_config: &OutputConfig,
         sample_rate: u32,
+        start_time: std::time::SystemTime,
     ) -> Result<Self> {
         let vad = VoiceActivityDetector::new(vad_config, sample_rate);
         let buffer = AudioBuffer::new(buffer_config, sample_rate);
@@ -77,7 +78,7 @@ impl ChannelProcessor {
             TranscribeBackendType::Aws => {
                 log::info!("チャンネル {}: Amazon Transcribe バックエンドを使用", channel_config.id);
                 Box::new(
-                    AwsTranscribeBackend::new(transcribe_config.clone(), channel_config.id)
+                    AwsTranscribeBackend::new(transcribe_config.clone(), channel_config.id, start_time)
                         .await
                         .context("Amazon Transcribe バックエンド作成失敗")?,
                 )
@@ -97,7 +98,7 @@ impl ChannelProcessor {
                 };
 
                 Box::new(
-                    WhisperBackend::new(whisper_backend_config, channel_config.id)
+                    WhisperBackend::new(whisper_backend_config, channel_config.id, start_time)
                         .await
                         .context("Whisper API バックエンド作成失敗")?,
                 )
@@ -182,6 +183,9 @@ impl ChannelProcessor {
 
     /// 音声チャンクを処理
     pub async fn process_chunk(&mut self, chunk: AudioChunk) -> Result<()> {
+        use std::time::Instant;
+        let start_instant = Instant::now();
+
         let samples = &chunk.samples;
 
         // 1. WAVファイルに書き込み（無音含む全データ）
@@ -239,16 +243,24 @@ impl ChannelProcessor {
                         buffered_duration_ms
                     );
 
-                    // バッファを送信
+                    // バッファを送信（非ブロッキング）
                     if let Some(tx) = &self.transcribe_tx {
                         for buffered in &self.buffered_samples_during_disconnect {
-                            if let Err(e) = tx.send(buffered.clone()).await {
-                                log::error!(
-                                    "チャンネル {}: バッファ送信に失敗: {}",
-                                    self.channel_id,
-                                    e
-                                );
-                                break;
+                            match tx.try_send(buffered.clone()) {
+                                Ok(_) => {}
+                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                    log::warn!(
+                                        "チャンネル {}: バッファ送信失敗（AWS Transcribe送信バッファ満杯） - データドロップ",
+                                        self.channel_id
+                                    );
+                                }
+                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                    log::error!(
+                                        "チャンネル {}: バッファ送信失敗（チャンネルクローズ）",
+                                        self.channel_id
+                                    );
+                                    break;
+                                }
                             }
                         }
                     }
@@ -257,22 +269,30 @@ impl ChannelProcessor {
                 // バッファをクリア
                 self.buffered_samples_during_disconnect.clear();
 
-                // 現在のチャンクを送信
+                // 現在のチャンクを送信（非ブロッキング）
                 if let Some(tx) = &self.transcribe_tx {
-                    if let Err(e) = tx.send(samples.clone()).await {
-                        log::error!(
-                            "チャンネル {}: Transcribeへの送信に失敗: {} - 切断して次回再接続します",
-                            self.channel_id,
-                            e
-                        );
-                        // チャンネルが閉じられた場合は切断状態に移行
-                        self.transcribe_tx = None;
-                        self.connection_state = TranscribeConnectionState::Disconnected;
+                    match tx.try_send(samples.clone()) {
+                        Ok(_) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            log::warn!(
+                                "チャンネル {}: AWS Transcribe送信バッファ満杯 - データドロップ",
+                                self.channel_id
+                            );
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            log::error!(
+                                "チャンネル {}: Transcribeへの送信に失敗: チャンネルクローズ - 切断して次回再接続します",
+                                self.channel_id
+                            );
+                            // チャンネルが閉じられた場合は切断状態に移行
+                            self.transcribe_tx = None;
+                            self.connection_state = TranscribeConnectionState::Disconnected;
 
-                        if let Some(tui_state) = &self.tui_state {
-                            tui_state.update_channel(self.channel_id, |channel| {
-                                channel.update_transcribe_status(TranscribeStatus::Disconnected);
-                            });
+                            if let Some(tui_state) = &self.tui_state {
+                                tui_state.update_channel(self.channel_id, |channel| {
+                                    channel.update_transcribe_status(TranscribeStatus::Disconnected);
+                                });
+                            }
                         }
                     }
                 }
@@ -285,27 +305,37 @@ impl ChannelProcessor {
                 self.silence_duration_ms = 0;
 
                 if let Some(tx) = &self.transcribe_tx {
-                    if let Err(e) = tx.send(samples.clone()).await {
-                        log::error!(
-                            "チャンネル {}: Transcribeへの送信に失敗: {} - 切断して次回再接続します",
-                            self.channel_id,
-                            e
-                        );
-                        // チャンネルが閉じられた場合は切断状態に移行
-                        self.transcribe_tx = None;
-                        self.connection_state = TranscribeConnectionState::Disconnected;
-
-                        // エラー時はTUI状態を切断に更新
-                        if let Some(tui_state) = &self.tui_state {
-                            tui_state.update_channel(self.channel_id, |channel| {
-                                channel.update_transcribe_status(TranscribeStatus::Disconnected);
-                            });
+                    match tx.try_send(samples.clone()) {
+                        Ok(_) => {
+                            // 正常送信時はTUI状態を更新
+                            if let Some(tui_state) = &self.tui_state {
+                                tui_state.update_channel(self.channel_id, |channel| {
+                                    channel.update_transcribe_status(TranscribeStatus::Connected);
+                                });
+                            }
                         }
-                    } else if let Some(tui_state) = &self.tui_state {
-                        // 正常送信時
-                        tui_state.update_channel(self.channel_id, |channel| {
-                            channel.update_transcribe_status(TranscribeStatus::Connected);
-                        });
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            log::warn!(
+                                "チャンネル {}: AWS Transcribe送信バッファ満杯 - データドロップ",
+                                self.channel_id
+                            );
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            log::error!(
+                                "チャンネル {}: Transcribeへの送信に失敗: チャンネルクローズ - 切断して次回再接続します",
+                                self.channel_id
+                            );
+                            // チャンネルが閉じられた場合は切断状態に移行
+                            self.transcribe_tx = None;
+                            self.connection_state = TranscribeConnectionState::Disconnected;
+
+                            // エラー時はTUI状態を切断に更新
+                            if let Some(tui_state) = &self.tui_state {
+                                tui_state.update_channel(self.channel_id, |channel| {
+                                    channel.update_transcribe_status(TranscribeStatus::Disconnected);
+                                });
+                            }
+                        }
                     }
                 }
             }
@@ -326,20 +356,28 @@ impl ChannelProcessor {
                     // 閾値未満の場合はゼロサンプル送信（既存の挙動）
                     if let Some(tx) = &self.transcribe_tx {
                         let zero_samples = vec![0i16; samples.len()];
-                        if let Err(e) = tx.send(zero_samples).await {
-                            log::error!(
-                                "チャンネル {}: ゼロサンプル送信に失敗: {} - 切断して次回再接続します",
-                                self.channel_id,
-                                e
-                            );
-                            // チャンネルが閉じられた場合は切断状態に移行
-                            self.transcribe_tx = None;
-                            self.connection_state = TranscribeConnectionState::Disconnected;
+                        match tx.try_send(zero_samples) {
+                            Ok(_) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                log::warn!(
+                                    "チャンネル {}: ゼロサンプル送信失敗（バッファ満杯） - データドロップ",
+                                    self.channel_id
+                                );
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                log::error!(
+                                    "チャンネル {}: ゼロサンプル送信に失敗: チャンネルクローズ - 切断して次回再接続します",
+                                    self.channel_id
+                                );
+                                // チャンネルが閉じられた場合は切断状態に移行
+                                self.transcribe_tx = None;
+                                self.connection_state = TranscribeConnectionState::Disconnected;
 
-                            if let Some(tui_state) = &self.tui_state {
-                                tui_state.update_channel(self.channel_id, |channel| {
-                                    channel.update_transcribe_status(TranscribeStatus::Disconnected);
-                                });
+                                if let Some(tui_state) = &self.tui_state {
+                                    tui_state.update_channel(self.channel_id, |channel| {
+                                        channel.update_transcribe_status(TranscribeStatus::Disconnected);
+                                    });
+                                }
                             }
                         }
                     }
@@ -355,13 +393,31 @@ impl ChannelProcessor {
 
         // 7. 音声出力デバイスに送信（設定されている場合）
         if let Some(tx) = &self.audio_output_tx {
-            if let Err(e) = tx.send(samples.clone()).await {
-                log::warn!(
-                    "チャンネル {}: 音声出力への送信に失敗: {}",
-                    self.channel_id,
-                    e
-                );
+            match tx.try_send(samples.clone()) {
+                Ok(_) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    log::warn!(
+                        "チャンネル {}: 音声出力バッファ満杯 - データドロップ",
+                        self.channel_id
+                    );
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    log::warn!(
+                        "チャンネル {}: 音声出力への送信失敗: チャンネルクローズ",
+                        self.channel_id
+                    );
+                }
             }
+        }
+
+        // 処理時間をログに記録（10ms以上かかった場合のみ）
+        let elapsed = start_instant.elapsed();
+        if elapsed.as_millis() >= 10 {
+            log::warn!(
+                "チャンネル {}: process_chunk処理時間が {}ms（閾値10ms超過）",
+                self.channel_id,
+                elapsed.as_millis()
+            );
         }
 
         Ok(())
@@ -378,8 +434,6 @@ impl ChannelProcessor {
 
         // バックエンドから新しいストリームを開始
         if let Some(mut backend) = self.transcribe_backend.take() {
-            // start_timeをリセット（タイムスタンプドリフト防止）
-            backend.reset_start_time();
             match backend.start_stream().await {
                 Ok((tx, rx)) => {
                     self.transcribe_tx = Some(tx);
@@ -569,6 +623,75 @@ impl ChannelProcessor {
         let all_punctuation = trimmed.chars().all(|c| allowed_chars.contains(&c));
 
         all_punctuation
+    }
+
+    /// サンプルのRMS（二乗平均平方根）を計算
+    ///
+    /// RMSは音声の平均的な大きさを表す指標
+    fn calculate_rms(samples: &[i16]) -> f32 {
+        if samples.is_empty() {
+            return 0.0;
+        }
+
+        let sum_of_squares: f64 = samples
+            .iter()
+            .map(|&s| {
+                let normalized = s as f64 / i16::MAX as f64;
+                normalized * normalized
+            })
+            .sum();
+
+        let mean_square = sum_of_squares / samples.len() as f64;
+        mean_square.sqrt() as f32
+    }
+
+    /// 音声サンプルを正規化
+    ///
+    /// 目標RMSレベルに調整することで、チャンネル間の音量を統一
+    /// クリッピングを避けるため、ピーク値も考慮
+    fn normalize_samples(samples: &mut [i16]) {
+        if samples.is_empty() {
+            return;
+        }
+
+        // 目標RMS（0.0 ~ 1.0）
+        // 0.1 = 約 -20dB（会話音声として適度なレベル）
+        const TARGET_RMS: f32 = 0.1;
+
+        // 現在のRMSを計算
+        let current_rms = Self::calculate_rms(samples);
+
+        // RMSがほぼゼロ（無音）の場合は正規化しない
+        if current_rms < 0.001 {
+            return;
+        }
+
+        // 必要なゲインを計算
+        let gain = TARGET_RMS / current_rms;
+
+        // クリッピング防止: ピーク値を確認
+        let peak = samples
+            .iter()
+            .map(|&s| s.abs())
+            .max()
+            .unwrap_or(0) as f32
+            / i16::MAX as f32;
+
+        // ゲイン適用後にクリッピングする場合は、ゲインを制限
+        let safe_gain = if peak * gain > 0.95 {
+            0.95 / peak
+        } else {
+            gain
+        };
+
+        // ゲインを適用（1.5倍以上のゲインは避ける = 音質劣化防止）
+        let final_gain = safe_gain.min(1.5);
+
+        // サンプルに適用
+        for sample in samples.iter_mut() {
+            let normalized = (*sample as f32 * final_gain).clamp(i16::MIN as f32, i16::MAX as f32);
+            *sample = normalized as i16;
+        }
     }
 
     /// TUI状態にTranscribe結果を追加

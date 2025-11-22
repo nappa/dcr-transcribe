@@ -39,7 +39,7 @@ pub struct WhisperBackend {
 }
 
 impl WhisperBackend {
-    pub async fn new(config: WhisperConfig, channel_id: usize) -> Result<Self> {
+    pub async fn new(config: WhisperConfig, channel_id: usize, start_time: SystemTime) -> Result<Self> {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
@@ -48,7 +48,7 @@ impl WhisperBackend {
         Ok(Self {
             config,
             channel_id,
-            start_time: SystemTime::now(),
+            start_time,
             client,
             reconnection_count: 0,
             task_handle: None,
@@ -263,15 +263,5 @@ impl TranscribeBackend for WhisperBackend {
 
     fn channel_id(&self) -> usize {
         self.channel_id
-    }
-
-    fn reset_start_time(&mut self) {
-        self.start_time = SystemTime::now();
-        self.reconnection_count += 1;
-        log::info!(
-            "チャンネル {}: start_timeをリセット（再接続 #{}）",
-            self.channel_id,
-            self.reconnection_count
-        );
     }
 }

@@ -3,7 +3,6 @@ use crate::types::{AudioChunk, AudioFormat};
 use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Sample, SizedSample};
-use rayon::prelude::*;
 use regex_lite::Regex;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -111,62 +110,65 @@ impl AudioInput {
         sample_rate: u32,
     ) -> Result<cpal::Stream>
     where
-        T: SizedSample + Sample + Send + Sync + 'static,
+        T: SizedSample + Sample + Send + 'static,
         <T as Sample>::Float: Into<f32>,
     {
         let channel_senders = Arc::new(channel_senders);
 
         let data_callback = move |data: &[T], _info: &cpal::InputCallbackInfo| {
-            // インターリーブされたデータを各チャンネルに分離（並列処理）
+            // タイムスタンプを取得（全チャンネルで共有）
+            let timestamp_ns = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+
+            // インターリーブされたデータを各チャンネルに分離
             let samples_per_channel = data.len() / num_channels as usize;
 
-            // dataを事前にi16のVecに変換（並列処理のため）
-            let data_vec: Vec<i16> = data
-                .iter()
-                .map(|&sample| {
-                    let f = sample.to_float_sample().into();
-                    let clamped = f.clamp(-1.0, 1.0);
-                    (clamped * i16::MAX as f32) as i16
-                })
-                .collect();
+            // 各チャンネルを順次処理
+            for ch in 0..num_channels as usize {
+                if ch >= channel_senders.len() {
+                    break;
+                }
 
-            // 各チャンネルを並列処理で分離・送信
-            (0..num_channels as usize)
-                .into_par_iter()
-                .filter(|&ch| ch < channel_senders.len())
-                .for_each(|ch| {
-                    // 各チャンネルのタイムスタンプを取得（並列処理のため個別に取得）
-                    let timestamp_ns = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_nanos();
+                // このチャンネルのサンプルを抽出
+                let mut channel_samples = Vec::with_capacity(samples_per_channel);
+                for frame in 0..samples_per_channel {
+                    let idx = frame * num_channels as usize + ch;
+                    if idx < data.len() {
+                        let sample = data[idx];
+                        let f = sample.to_float_sample().into();
+                        let clamped = f.clamp(-1.0, 1.0);
+                        let i16_sample = (clamped * i16::MAX as f32) as i16;
+                        channel_samples.push(i16_sample);
+                    }
+                }
 
-                    // このチャンネルのサンプルを抽出
-                    let mut channel_samples = Vec::with_capacity(samples_per_channel);
-                    for frame in 0..samples_per_channel {
-                        let idx = frame * num_channels as usize + ch;
-                        if idx < data_vec.len() {
-                            channel_samples.push(data_vec[idx]);
+                // チャンクを作成
+                let chunk = AudioChunk {
+                    samples: channel_samples,
+                    format: AudioFormat {
+                        sample_rate,
+                        channels: 1, // モノラル
+                    },
+                    timestamp_ns,
+                };
+
+                // 非同期送信（ブロッキングしない）
+                if let Some(sender) = channel_senders.get(ch) {
+                    match sender.try_send(chunk) {
+                        Ok(_) => {
+                            // 成功時はログ出力しない（パフォーマンス重視）
+                        }
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            log::warn!("チャンネル {} への送信失敗: バッファ満杯", ch);
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            log::warn!("チャンネル {} への送信失敗: チャンネルクローズ", ch);
                         }
                     }
-
-                    // チャンクを作成
-                    let chunk = AudioChunk {
-                        samples: channel_samples,
-                        format: AudioFormat {
-                            sample_rate,
-                            channels: 1, // モノラル
-                        },
-                        timestamp_ns,
-                    };
-
-                    // 非同期送信（ブロッキングしない）
-                    if let Some(sender) = channel_senders.get(ch) {
-                        if let Err(e) = sender.try_send(chunk) {
-                            log::warn!("チャンネル {} への送信に失敗: {}", ch, e);
-                        }
-                    }
-                });
+                }
+            }
         };
 
         let error_callback = move |err| {

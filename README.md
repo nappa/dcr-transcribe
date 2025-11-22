@@ -129,7 +129,7 @@ sample_rate = 16000             # 16kHz
 channels = 4                    # 入力チャンネル数
 
 [vad]
-threshold_db = -40.0
+threshold_db = -50.0
 hangover_duration_ms = 500
 
 [transcribe]

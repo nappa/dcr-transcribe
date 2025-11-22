@@ -43,7 +43,7 @@ impl Write for LogWriter {
     }
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 8)]
+#[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     // ログファイルを開く
     let log_file = OpenOptions::new()
@@ -110,6 +110,9 @@ async fn main() -> Result<()> {
     // TUI状態を作成
     let tui_state = TuiState::new();
 
+    // 全チャンネル共通の start_time を作成
+    let start_time = std::time::SystemTime::now();
+
     // チャンネルプロセッサを作成
     let mut processors = Vec::new();
     let mut channel_senders = Vec::new();
@@ -123,7 +126,7 @@ async fn main() -> Result<()> {
         // TUI状態にチャンネルを追加
         tui_state.add_channel(channel_config.id, channel_config.name.clone());
 
-        let (tx, rx) = mpsc::channel(1024 * 1024);
+        let (tx, rx) = mpsc::channel(128);
         channel_senders.push(tx);
 
         let mut processor = ChannelProcessor::new(
@@ -134,6 +137,7 @@ async fn main() -> Result<()> {
             config.whisper.as_ref(),
             &config.output,
             config.audio.sample_rate,
+            start_time,
         )
         .await
         .with_context(|| {
@@ -203,10 +207,22 @@ async fn main() -> Result<()> {
         let processor_clone = processor.clone();
         let running_clone = running.clone();
         let chunk_task = tokio::spawn(async move {
+            use std::time::Instant;
             while running_clone.load(Ordering::SeqCst) {
                 tokio::select! {
                     Some(chunk) = rx.recv() => {
+                        let lock_start = Instant::now();
                         let mut proc = processor_clone.lock().await;
+                        let lock_elapsed = lock_start.elapsed();
+
+                        if lock_elapsed.as_millis() >= 10 {
+                            log::warn!(
+                                "チャンネル {}: ロック取得に {}ms（閾値10ms超過）",
+                                proc.channel_id(),
+                                lock_elapsed.as_millis()
+                            );
+                        }
+
                         if let Err(e) = proc.process_chunk(chunk).await {
                             log::error!("チャンク処理エラー: {}", e);
                         }

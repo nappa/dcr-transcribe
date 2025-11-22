@@ -248,6 +248,46 @@ impl TranscriptResult {
             stability,
         }
     }
+
+    /// 音声の実際の開始時刻を使用して文字起こし結果を作成
+    ///
+    /// AWS Transcribe の item.start_time を使用する場合に使用
+    ///
+    /// # Arguments
+    ///
+    /// * `channel` - チャンネルID
+    /// * `text` - 文字起こしテキスト
+    /// * `is_partial` - 部分結果かどうか
+    /// * `stability` - 部分結果の安定性（部分結果の場合のみ）
+    /// * `audio_start_seconds` - 音声の実際の開始時刻（秒）
+    pub fn new_with_audio_time(
+        channel: usize,
+        text: String,
+        is_partial: bool,
+        stability: Option<Stability>,
+        audio_start_seconds: f64,
+    ) -> Self {
+        let now = SystemTime::now();
+
+        // ISO 8601形式のタイムスタンプを生成
+        let timestamp = chrono::DateTime::from_timestamp(
+            now.duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64,
+            0,
+        )
+        .map(|dt| dt.to_rfc3339())
+        .unwrap_or_default();
+
+        Self {
+            channel,
+            timestamp,
+            timestamp_seconds: audio_start_seconds,
+            text,
+            is_partial,
+            stability,
+        }
+    }
 }
 
 #[cfg(test)]
