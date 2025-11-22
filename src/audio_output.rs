@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{Device, Stream, StreamConfig};
+use cpal::{Device, FromSample, Sample, SampleFormat, SizedSample, Stream, StreamConfig};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
@@ -70,6 +70,19 @@ impl AudioOutput {
 
     /// 音声ストリームを開始
     pub fn start(&mut self) -> Result<mpsc::Sender<Vec<i16>>> {
+        // デバイスのデフォルト設定を取得してサンプルフォーマットを確認
+        let default_config = self
+            .device
+            .default_output_config()
+            .context("デフォルト出力設定が取得できません")?;
+
+        log::info!(
+            "出力デバイス設定: {:?}, {}Hz, {}ch",
+            default_config.sample_format(),
+            default_config.sample_rate().0,
+            default_config.channels()
+        );
+
         let config = StreamConfig {
             channels: 1,
             sample_rate: cpal::SampleRate(self.sample_rate),
@@ -83,8 +96,37 @@ impl AudioOutput {
         );
 
         // チャンネルを作成（大きめのバッファ）
-        let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<i16>>(1024);
+        let (audio_tx, audio_rx) = mpsc::channel::<Vec<i16>>(1024);
 
+        // デバイスのサンプルフォーマットに応じてストリームを構築
+        let stream = match default_config.sample_format() {
+            SampleFormat::F32 => self.build_stream::<f32>(config, audio_rx)?,
+            SampleFormat::I16 => self.build_stream::<i16>(config, audio_rx)?,
+            SampleFormat::U16 => self.build_stream::<u16>(config, audio_rx)?,
+            _ => anyhow::bail!(
+                "サポートされていないサンプルフォーマット: {:?}",
+                default_config.sample_format()
+            ),
+        };
+
+        // ストリームを再生開始
+        stream.play().context("ストリームの再生開始に失敗")?;
+
+        self.stream = Some(stream);
+        self.audio_tx = Some(audio_tx.clone());
+
+        Ok(audio_tx)
+    }
+
+    /// 指定されたサンプルフォーマットで出力ストリームを構築
+    fn build_stream<T>(
+        &self,
+        config: StreamConfig,
+        mut audio_rx: mpsc::Receiver<Vec<i16>>,
+    ) -> Result<Stream>
+    where
+        T: SizedSample + Sample + FromSample<f32> + Send + 'static,
+    {
         // サンプルバッファを共有
         let sample_buffer: Arc<Mutex<Vec<i16>>> = Arc::new(Mutex::new(Vec::new()));
         let sample_buffer_clone = sample_buffer.clone();
@@ -102,22 +144,28 @@ impl AudioOutput {
             .device
             .build_output_stream(
                 &config,
-                move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
+                move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
                     let mut buffer = sample_buffer.lock().unwrap();
 
                     if buffer.len() >= data.len() {
                         // バッファから必要なサンプル数を取り出し
-                        data.copy_from_slice(&buffer[..data.len()]);
+                        for (i, sample) in data.iter_mut().enumerate() {
+                            *sample = Self::convert_sample::<T>(buffer[i]);
+                        }
                         buffer.drain(..data.len());
                     } else {
                         // バッファが不足している場合、利用可能な分だけコピーして残りは無音
                         let available = buffer.len();
+                        for i in 0..data.len() {
+                            if i < available {
+                                data[i] = Self::convert_sample::<T>(buffer[i]);
+                            } else {
+                                data[i] = Sample::EQUILIBRIUM;
+                            }
+                        }
                         if available > 0 {
-                            data[..available].copy_from_slice(&buffer[..]);
                             buffer.clear();
                         }
-                        // 残りは無音で埋める
-                        data[available..].fill(0);
                     }
                 },
                 move |err| {
@@ -127,13 +175,14 @@ impl AudioOutput {
             )
             .context("出力ストリームの構築に失敗")?;
 
-        // ストリームを再生開始
-        stream.play().context("ストリームの再生開始に失敗")?;
+        Ok(stream)
+    }
 
-        self.stream = Some(stream);
-        self.audio_tx = Some(audio_tx.clone());
-
-        Ok(audio_tx)
+    /// i16サンプルを指定されたフォーマットに変換
+    fn convert_sample<T: Sample + FromSample<f32>>(sample: i16) -> T {
+        // i16を-1.0~1.0の範囲に正規化してから対象フォーマットに変換
+        let normalized = sample as f32 / i16::MAX as f32;
+        T::from_sample(normalized)
     }
 
     /// 音声ストリームを停止
