@@ -177,3 +177,7 @@ enabled = true
 - `enabled`: チャンネルの有効/無効
 
 詳細は [ARCHITECTURE.md](ARCHITECTURE.md) を参照してください。
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.

@@ -1,0 +1,72 @@
+# dcr-transcribe Configuration Example
+# Copy this file to config.toml and modify as needed
+
+[audio]
+# Audio device ID (use --show-interfaces to list available devices)
+device_id = "default"
+# Sample rate in Hz (8000, 16000, 44100, 48000)
+sample_rate = 48000
+# Number of input channels (2 for stereo)
+channels = 2
+# Output device ID for audio playback
+output_device_id = "default"
+
+[vad]
+# Voice Activity Detection threshold in dB
+threshold_db = -40.0
+# Hangover duration in milliseconds (how long to keep detecting voice after it stops)
+hangover_duration_ms = 500
+# Silence duration threshold in milliseconds (disconnect after this much silence)
+silence_disconnect_threshold_ms = 3000
+
+[buffer]
+# Buffer capacity in seconds
+capacity_seconds = 10.0
+# Drop policy when buffer is full: "drop_oldest", "drop_newest", or "block"
+drop_policy = "drop_oldest"
+
+[transcribe]
+# Backend type: "aws" or "whisper"
+backend = "aws"
+# AWS region (only for AWS backend)
+region = "ap-northeast-1"
+# Language code: "ja-JP", "en-US", etc.
+language_code = "ja-JP"
+# Sample rate for transcription (should match audio.sample_rate)
+sample_rate = 48000
+# Maximum retry attempts
+max_retries = 5
+# Timeout in seconds
+timeout_seconds = 10
+# Connect to transcription service on startup (false = wait for voice detection)
+connect_on_startup = false
+# Send buffered audio on reconnection
+send_buffered_on_reconnect = true
+
+# Whisper API configuration (only needed if backend = "whisper")
+# [whisper]
+# api_key = "YOUR_OPENAI_API_KEY_HERE"
+# model = "whisper-1"
+# language = "ja"
+# chunk_duration_secs = 5
+
+[output]
+# Directory for WAV file output
+wav_output_dir = "./recordings"
+
+[flac]
+# Enable FLAC compression for AWS Transcribe
+enabled = true
+# Compression level (0-8, higher = better compression but slower)
+compression_level = 8
+
+# Channel configuration
+[[channels]]
+id = 0
+name = "Channel 1"
+enabled = true
+
+[[channels]]
+id = 1
+name = "Channel 2"
+enabled = true
