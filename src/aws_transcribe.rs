@@ -1,15 +1,57 @@
-use crate::config::TranscribeConfig;
+use crate::config::{AudioFormat, TranscribeConfig};
+use crate::flac_encoder::FlacEncoder;
+use crate::opus_encoder::OpusEncoder;
 use crate::transcribe_backend::TranscribeBackend;
 use crate::types::{Stability, TranscriptResult};
 use anyhow::Result;
+use async_stream::stream;
 use async_trait::async_trait;
 use aws_config;
-use aws_sdk_transcribestreaming::Client as AwsTranscribeClient;
 use aws_sdk_transcribestreaming::types::{AudioEvent, AudioStream, LanguageCode, MediaEncoding};
+use aws_sdk_transcribestreaming::Client as AwsTranscribeClient;
 use aws_smithy_types::Blob;
 use std::time::SystemTime;
 use tokio::sync::mpsc;
-use async_stream::stream;
+
+/// 音声エンコーダーの統一インターフェース
+enum AudioEncoder {
+    Flac(FlacEncoder),
+    Opus(OpusEncoder),
+}
+
+impl AudioEncoder {
+    /// 設定に基づいてエンコーダーを作成
+    fn new(audio_format: AudioFormat, sample_rate: u32, opus_bitrate: i32) -> Result<Self> {
+        match audio_format {
+            AudioFormat::Flac => Ok(AudioEncoder::Flac(FlacEncoder::new(sample_rate, 8))),
+            AudioFormat::Opus => Ok(AudioEncoder::Opus(OpusEncoder::new(sample_rate, opus_bitrate)?)),
+        }
+    }
+
+    /// PCMサンプルをエンコード
+    fn encode(&mut self, samples: &[i16]) -> Result<Vec<u8>> {
+        match self {
+            AudioEncoder::Flac(encoder) => encoder.encode(samples),
+            AudioEncoder::Opus(encoder) => encoder.encode(samples),
+        }
+    }
+
+    /// エンコード形式名を取得（ログ用）
+    fn format_name(&self) -> &'static str {
+        match self {
+            AudioEncoder::Flac(_) => "FLAC",
+            AudioEncoder::Opus(_) => "OGG-Opus",
+        }
+    }
+}
+
+/// AudioFormatに対応するMediaEncodingを取得
+fn get_media_encoding(audio_format: AudioFormat) -> MediaEncoding {
+    match audio_format {
+        AudioFormat::Flac => MediaEncoding::Flac,
+        AudioFormat::Opus => MediaEncoding::OggOpus,
+    }
+}
 
 /// AWS Transcribe Streaming API クライアント
 pub struct AwsTranscribeBackend {
@@ -47,7 +89,6 @@ impl TranscribeBackend for AwsTranscribeBackend {
     ) -> Result<(mpsc::Sender<Vec<i16>>, mpsc::Receiver<TranscriptResult>)> {
         use std::sync::Arc;
         use tokio::sync::Mutex;
-        use crate::flac_encoder::FlacEncoder;
 
         let (audio_tx, audio_rx) = mpsc::channel::<Vec<i16>>(4096);
         let audio_rx = Arc::new(Mutex::new(audio_rx));
@@ -57,9 +98,13 @@ impl TranscribeBackend for AwsTranscribeBackend {
         let sdk_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
         let client = AwsTranscribeClient::new(&sdk_config);
 
+        let audio_format = self.config.audio_format;
+        let opus_bitrate = self.config.opus_bitrate;
         log::info!(
-            "チャンネル {}: AWS Transcribe クライアントを作成",
-            self.channel_id
+            "チャンネル {}: AWS Transcribe クライアントを作成 (audio_format: {:?}, opus_bitrate: {})",
+            self.channel_id,
+            audio_format,
+            opus_bitrate
         );
 
         let language_code = match self.config.language_code.as_str() {
@@ -86,13 +131,27 @@ impl TranscribeBackend for AwsTranscribeBackend {
             let audio_rx = Arc::clone(&audio_rx);
             let client = client.clone();
             let result_tx = result_tx.clone();
+            let media_encoding = get_media_encoding(audio_format);
+            let opus_bitrate = opus_bitrate;
             async move {
                 use tokio::time::{Duration, timeout};
                 'outer: loop {
                     let audio_rx_for_stream = Arc::clone(&audio_rx);
 
-                    // FLACエンコーダーを作成（圧縮レベル8 = 最高圧縮）
-                    let mut flac_encoder = FlacEncoder::new(sample_rate, 8);
+                    // エンコード形式名を取得（ログ用）
+                    let encoder_name = match audio_format {
+                        AudioFormat::Flac => "FLAC",
+                        AudioFormat::Opus => "OGG-Opus",
+                    };
+
+                    // エンコーダーをMutexでラップしてSync制約を満たす
+                    let encoder = match AudioEncoder::new(audio_format, sample_rate, opus_bitrate) {
+                        Ok(enc) => std::sync::Mutex::new(enc),
+                        Err(e) => {
+                            log::error!("チャンネル {}: エンコーダー初期化失敗: {:?}", channel_id, e);
+                            return;
+                        }
+                    };
 
                     let input_stream = stream! {
                         let mut pcm_buffer: Vec<i16> = Vec::new();
@@ -101,8 +160,8 @@ impl TranscribeBackend for AwsTranscribeBackend {
                         let initial_min_samples = (sample_rate as f64 * 0.15) as usize; // 0.15秒分（再接続直後）
                         let mut chunk_count = 0; // 送信チャンク数をカウント
 
-                        log::info!("チャンネル {}: バッファサイズ設定 - 初期: {}サンプル({:.2}秒), 通常: {}サンプル({:.2}秒) @ {}Hz",
-                                   channel_id, initial_min_samples, initial_min_samples as f64 / sample_rate as f64,
+                        log::info!("チャンネル {}: {} エンコード開始 - バッファサイズ: 初期{}サンプル({:.2}秒), 通常{}サンプル({:.2}秒) @ {}Hz",
+                                   channel_id, encoder_name, initial_min_samples, initial_min_samples as f64 / sample_rate as f64,
                                    max_samples, max_samples as f64 / sample_rate as f64, sample_rate);
 
                         loop {
@@ -122,14 +181,19 @@ impl TranscribeBackend for AwsTranscribeBackend {
                                         max_samples
                                     };
 
-                                    // バッファが一定サイズに達したらFLACエンコードして送信
+                                    // バッファが一定サイズに達したらエンコードして送信
                                     if pcm_buffer.len() >= min_samples {
                                         let to_encode: Vec<i16> = pcm_buffer.drain(..min_samples.min(pcm_buffer.len())).collect();
                                         chunk_count += 1;
 
-                                        match flac_encoder.encode(&to_encode) {
-                                            Ok(flac_data) => {
-                                                let blob = Blob::new(flac_data);
+                                        // MutexGuardがyieldを跨がないようにスコープで囲む
+                                        let encode_result = {
+                                            encoder.lock().unwrap().encode(&to_encode)
+                                        };
+
+                                        match encode_result {
+                                            Ok(encoded_data) => {
+                                                let blob = Blob::new(encoded_data);
                                                 if chunk_count % 10 == 0 {
                                                     log::info!(
                                                         "チャンネル {}: AWS送信 チャンク#{} - {}サンプル → {}バイト",
@@ -142,7 +206,7 @@ impl TranscribeBackend for AwsTranscribeBackend {
                                                 yield Ok(AudioStream::AudioEvent(AudioEvent::builder().audio_chunk(blob).build()));
                                             }
                                             Err(e) => {
-                                                log::error!("FLACエンコードエラー: {:?}", e);
+                                                log::error!("音声エンコードエラー: {:?}", e);
                                             }
                                         }
                                     }
@@ -151,14 +215,19 @@ impl TranscribeBackend for AwsTranscribeBackend {
                                     log::debug!("AwsTranscribeBackend: チャンネルクローズ");
                                     // チャンネルがクローズされた場合、残りのバッファを送信
                                     if !pcm_buffer.is_empty() {
-                                        match flac_encoder.encode(&pcm_buffer) {
-                                            Ok(flac_data) => {
-                                                let blob = Blob::new(flac_data);
-                                                log::debug!("Amazon Transcribe 最終送信: {} サンプル → {} バイト", pcm_buffer.len(), blob.as_ref().len());
+                                        let samples_len = pcm_buffer.len();
+                                        // MutexGuardがyieldを跨がないようにスコープで囲む
+                                        let encode_result = {
+                                            encoder.lock().unwrap().encode(&pcm_buffer)
+                                        };
+                                        match encode_result {
+                                            Ok(encoded_data) => {
+                                                let blob = Blob::new(encoded_data);
+                                                log::debug!("Amazon Transcribe 最終送信: {} サンプル → {} バイト", samples_len, blob.as_ref().len());
                                                 yield Ok(AudioStream::AudioEvent(AudioEvent::builder().audio_chunk(blob).build()));
                                             }
                                             Err(e) => {
-                                                log::error!("FLACエンコードエラー: {:?}", e);
+                                                log::error!("音声エンコードエラー: {:?}", e);
                                             }
                                         }
                                     }
@@ -169,14 +238,18 @@ impl TranscribeBackend for AwsTranscribeBackend {
                                     // タイムアウトした場合、バッファに残っているデータを送信
                                     if !pcm_buffer.is_empty() {
                                         let to_encode = pcm_buffer.split_off(0);
-                                        match flac_encoder.encode(&to_encode) {
-                                            Ok(flac_data) => {
-                                                let blob = Blob::new(flac_data);
+                                        // MutexGuardがyieldを跨がないようにスコープで囲む
+                                        let encode_result = {
+                                            encoder.lock().unwrap().encode(&to_encode)
+                                        };
+                                        match encode_result {
+                                            Ok(encoded_data) => {
+                                                let blob = Blob::new(encoded_data);
                                                 log::debug!("Amazon Transcribe タイムアウト送信: {} サンプル → {} バイト", to_encode.len(), blob.as_ref().len());
                                                 yield Ok(AudioStream::AudioEvent(AudioEvent::builder().audio_chunk(blob).build()));
                                             }
                                             Err(e) => {
-                                                log::error!("FLACエンコードエラー: {:?}", e);
+                                                log::error!("音声エンコードエラー: {:?}", e);
                                             }
                                         }
                                     }
@@ -190,7 +263,7 @@ impl TranscribeBackend for AwsTranscribeBackend {
                         .start_stream_transcription()
                         .language_code(language_code.clone())
                         .media_sample_rate_hertz(sample_rate as i32)
-                        .media_encoding(MediaEncoding::Flac)
+                        .media_encoding(media_encoding.clone())
                         .audio_stream(input_stream.into())
                         .send()
                         .await
@@ -379,10 +452,64 @@ mod tests {
             timeout_seconds: 10,
             connect_on_startup: false,
             send_buffered_on_reconnect: true,
+            audio_format: AudioFormat::Flac,
+            opus_bitrate: 64000,
         };
 
         let start_time = SystemTime::now();
         let result = AwsTranscribeBackend::new(config, 0, start_time).await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_aws_transcribe_backend_creation_opus() {
+        let config = TranscribeConfig {
+            backend: TranscribeBackendType::Aws,
+            region: "ap-northeast-1".to_string(),
+            language_code: "ja-JP".to_string(),
+            sample_rate: 48000,
+            max_retries: 3,
+            timeout_seconds: 10,
+            connect_on_startup: false,
+            send_buffered_on_reconnect: true,
+            audio_format: AudioFormat::Opus,
+            opus_bitrate: 64000,
+        };
+
+        let start_time = SystemTime::now();
+        let result = AwsTranscribeBackend::new(config, 0, start_time).await;
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_audio_encoder_flac() {
+        let mut encoder = AudioEncoder::new(AudioFormat::Flac, 16000, 64000).unwrap();
+        assert_eq!(encoder.format_name(), "FLAC");
+
+        let samples = vec![0i16; 1600];
+        let result = encoder.encode(&samples);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_audio_encoder_opus() {
+        let mut encoder = AudioEncoder::new(AudioFormat::Opus, 48000, 64000).unwrap();
+        assert_eq!(encoder.format_name(), "OGG-Opus");
+
+        let samples = vec![0i16; 4800];
+        let result = encoder.encode(&samples);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_get_media_encoding() {
+        assert!(matches!(
+            get_media_encoding(AudioFormat::Flac),
+            MediaEncoding::Flac
+        ));
+        assert!(matches!(
+            get_media_encoding(AudioFormat::Opus),
+            MediaEncoding::OggOpus
+        ));
     }
 }

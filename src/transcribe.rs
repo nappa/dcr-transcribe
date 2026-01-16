@@ -255,6 +255,8 @@ mod tests {
             timeout_seconds: 10,
             connect_on_startup: false,
             send_buffered_on_reconnect: true,
+            audio_format: crate::config::AudioFormat::Flac,
+            opus_bitrate: 64000,
         };
 
         let result = TranscribeClient::new(config, 0).await;

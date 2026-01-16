@@ -92,6 +92,21 @@ pub enum TranscribeBackendType {
     Whisper,
 }
 
+/// 音声エンコード形式
+///
+/// Amazon Transcribeに送信する音声データのエンコード形式を指定する。
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AudioFormat {
+    /// FLAC形式（可逆圧縮、デフォルト）
+    /// 圧縮率: 30-50%、処理負荷: 低
+    #[default]
+    Flac,
+    /// OGG-Opus形式（非可逆圧縮）
+    /// 圧縮率: 90%以上、処理負荷: 中
+    Opus,
+}
+
 /// AWS Transcribe 設定
 ///
 /// AWS Transcribe Streaming APIに関する設定。
@@ -106,6 +121,7 @@ pub enum TranscribeBackendType {
 /// - `timeout_seconds`: 10 秒
 /// - `connect_on_startup`: false (音声検出まで接続しない)
 /// - `send_buffered_on_reconnect`: true (再接続時にバッファを送信)
+/// - `audio_format`: "flac" (FLAC形式)
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TranscribeConfig {
     #[serde(default = "default_backend")]
@@ -126,6 +142,13 @@ pub struct TranscribeConfig {
     /// 再接続時に切断中に蓄積されたバッファの音声を送信するか
     #[serde(default = "default_send_buffered_on_reconnect")]
     pub send_buffered_on_reconnect: bool,
+    /// 音声エンコード形式（flac または opus）
+    #[serde(default)]
+    pub audio_format: AudioFormat,
+    /// Opusエンコードのビットレート（bps）
+    /// 音声の場合は24000〜64000を推奨、高品質の場合は128000まで
+    #[serde(default = "default_opus_bitrate")]
+    pub opus_bitrate: i32,
 }
 
 /// OpenAI Whisper API 設定
@@ -288,6 +311,10 @@ fn default_send_buffered_on_reconnect() -> bool {
     true // デフォルトでは再接続時にバッファを送信
 }
 
+fn default_opus_bitrate() -> i32 {
+    64000 // 64kbps（音声に最適）
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -355,6 +382,8 @@ impl Default for TranscribeConfig {
             timeout_seconds: default_timeout_seconds(),
             connect_on_startup: default_connect_on_startup(),
             send_buffered_on_reconnect: default_send_buffered_on_reconnect(),
+            audio_format: AudioFormat::default(),
+            opus_bitrate: default_opus_bitrate(),
         }
     }
 }
@@ -483,6 +512,7 @@ mod tests {
         assert_eq!(config.transcribe.region, "ap-northeast-1");
         assert_eq!(config.transcribe.connect_on_startup, false);
         assert_eq!(config.transcribe.send_buffered_on_reconnect, true);
+        assert_eq!(config.transcribe.audio_format, AudioFormat::Flac);
         assert_eq!(config.channels.len(), 2);
     }
 

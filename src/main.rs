@@ -5,6 +5,7 @@ mod buffer;
 mod channel_processor;
 mod config;
 mod flac_encoder;
+mod opus_encoder;
 mod transcribe;
 mod transcribe_backend;
 mod tui;
