@@ -19,8 +19,9 @@ mod whisper_api;
 use anyhow::{Context, Result};
 use audio_input::AudioInput;
 use audio_output::AudioOutput;
+use aws_credential_types::provider::ProvideCredentials;
 use channel_processor::ChannelProcessor;
-use config::Config;
+use config::{Config, TranscribeBackendType};
 use env_logger::Env;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -31,6 +32,39 @@ use std::sync::{
 use tokio::sync::mpsc;
 use tui::TuiApp;
 use tui_state::TuiState;
+
+/// AWS 認証情報を起動時に検証する。
+///
+/// SDK の標準クレデンシャルチェーン(env vars → ~/.aws/credentials → IMDS など)を
+/// 試して、いずれかから取得できない場合は明確なエラーで終了する。
+/// これにより「起動はするが文字起こしが永遠に失敗する」状況を回避する。
+async fn validate_aws_credentials() -> Result<()> {
+    log::info!("AWS 認証情報を確認中...");
+    let sdk_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+    let provider = sdk_config
+        .credentials_provider()
+        .ok_or_else(|| anyhow::anyhow!("AWS credentials provider が見つかりません"))?;
+
+    let creds = provider.provide_credentials().await.map_err(|e| {
+        anyhow::anyhow!(
+            "AWS 認証情報の読み込みに失敗しました: {}\n\n\
+             以下のいずれかを設定してから再起動してください:\n\
+             - 環境変数 AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_REGION を export\n\
+             - ~/.aws/credentials ファイルに [default] プロファイルを設定\n\
+             - その他、AWS SDK が標準で参照するクレデンシャルソース",
+            e
+        )
+    })?;
+
+    let key_id = creds.access_key_id();
+    let masked = if key_id.len() > 4 {
+        format!("...{}", &key_id[key_id.len() - 4..])
+    } else {
+        "****".to_string()
+    };
+    log::info!("AWS 認証情報を確認(access_key_id={})", masked);
+    Ok(())
+}
 
 /// ログファイルに書き込むためのWriter
 struct LogWriter(Arc<Mutex<std::fs::File>>);
@@ -100,6 +134,14 @@ async fn main() -> Result<()> {
 
     log::info!("dcr-transcribe を起動します");
     log::info!("設定: {:?}", config);
+
+    // AWS バックエンド使用時は、起動前に認証情報が解決できるかを確認する。
+    // 解決できないまま起動するとログだけ汚れて文字起こしが永遠に動かないので、fail-fast。
+    if config.transcribe.backend == TranscribeBackendType::Aws {
+        validate_aws_credentials()
+            .await
+            .context("AWS 認証情報の検証に失敗しました")?;
+    }
 
     // 全チャンネル共通の start_time を作成(以降で使用)
     let start_time = std::time::SystemTime::now();

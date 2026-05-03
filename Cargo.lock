@@ -1088,6 +1088,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "aws-config",
+ "aws-credential-types",
  "aws-sdk-transcribestreaming",
  "aws-smithy-types",
  "axum",
