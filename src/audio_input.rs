@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Sample, SizedSample};
 use regex_lite::Regex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
@@ -113,8 +114,16 @@ impl AudioInput {
         T: SizedSample + Sample + Send + 'static,
         <T as Sample>::Float: Into<f32>,
     {
+        // 各チャンネルのドロップ累積カウンタ。real-time callback からの過剰な log を避けるため、
+        // 「初回」と「100件ごと」だけログを出す。
+        let drop_counters: Arc<Vec<AtomicU64>> = Arc::new(
+            (0..channel_senders.len())
+                .map(|_| AtomicU64::new(0))
+                .collect(),
+        );
         let channel_senders = Arc::new(channel_senders);
 
+        let drop_counters_cb = drop_counters.clone();
         let data_callback = move |data: &[T], _info: &cpal::InputCallbackInfo| {
             // タイムスタンプを取得（全チャンネルで共有）
             let timestamp_ns = SystemTime::now()
@@ -161,9 +170,19 @@ impl AudioInput {
                             // 成功時はログ出力しない（パフォーマンス重視）
                         }
                         Err(mpsc::error::TrySendError::Full(_)) => {
-                            log::warn!("チャンネル {} への送信失敗: バッファ満杯", ch);
+                            // RT callback では過剰な log は致命的(I/O・アロケーション)。
+                            // 累積カウントを atomic で更新し、初回 + 100 件ごとに 1 度だけ警告。
+                            let prev = drop_counters_cb[ch].fetch_add(1, Ordering::Relaxed);
+                            if prev == 0 || (prev + 1) % 100 == 0 {
+                                log::warn!(
+                                    "チャンネル {}: 入力バッファ満杯でサンプルドロップ(累計 {} 件)",
+                                    ch,
+                                    prev + 1
+                                );
+                            }
                         }
                         Err(mpsc::error::TrySendError::Closed(_)) => {
+                            // クローズはシャットダウン時の 1 回限りなので毎回ログ出して OK
                             log::warn!("チャンネル {} への送信失敗: チャンネルクローズ", ch);
                         }
                     }
@@ -193,7 +212,7 @@ impl AudioInput {
 
     /// デバイス一覧を表示
     pub fn list_devices() -> Result<()> {
-        let host = cpal::default_host();
+        let _host = cpal::default_host();
         println!("利用可能な入力デバイス:");
         println!();
 

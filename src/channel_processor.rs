@@ -1,3 +1,6 @@
+// 一部のヘルパー/アクセサは現時点で未使用だが API として保持する
+#![allow(dead_code)]
+
 use crate::aws_transcribe::AwsTranscribeBackend;
 use crate::buffer::AudioBuffer;
 use crate::config::{BufferConfig, ChannelConfig, OutputConfig, TranscribeBackendType, TranscribeConfig, VadConfig, WhisperConfig};
@@ -19,6 +22,59 @@ enum TranscribeConnectionState {
     /// 接続中
     Connected,
 }
+
+/// 切断中の音声バッファに蓄積する最大チャンク数。
+/// 100ms チャンクで運用していると 1000 件 ≒ 100 秒分。
+/// 超過時は最古から破棄(DropOldest 相当)してメモリ膨張を防ぐ。
+const MAX_BUFFERED_DISCONNECT_CHUNKS: usize = 1000;
+
+/// 再接続失敗時の指数バックオフ管理。
+///
+/// 失敗が続くと待ち時間を倍増(`max_ms` で頭打ち)、成功で `initial_ms` にリセット。
+/// 「次に再接続を試みていい時刻まで待つ」という単純な状態を持つ。
+#[derive(Debug)]
+struct ReconnectBackoff {
+    /// 直近に失敗した時刻。None なら初回 or 直近成功してリセット済
+    last_failure_at: Option<std::time::Instant>,
+    /// 現在のバックオフ間隔(ms)
+    current_ms: u64,
+    initial_ms: u64,
+    max_ms: u64,
+}
+
+impl ReconnectBackoff {
+    fn new(initial_ms: u64, max_ms: u64) -> Self {
+        Self {
+            last_failure_at: None,
+            current_ms: initial_ms,
+            initial_ms,
+            max_ms,
+        }
+    }
+
+    /// 現時点で再接続を試みてよいか
+    fn should_attempt(&self, now: std::time::Instant) -> bool {
+        match self.last_failure_at {
+            None => true,
+            Some(t) => {
+                now.duration_since(t) >= std::time::Duration::from_millis(self.current_ms)
+            }
+        }
+    }
+
+    fn record_success(&mut self) {
+        self.last_failure_at = None;
+        self.current_ms = self.initial_ms;
+    }
+
+    fn record_failure(&mut self, now: std::time::Instant) {
+        self.last_failure_at = Some(now);
+        self.current_ms = self.current_ms.saturating_mul(2).min(self.max_ms);
+    }
+}
+
+const RECONNECT_BACKOFF_INITIAL_MS: u64 = 500;
+const RECONNECT_BACKOFF_MAX_MS: u64 = 30_000;
 
 /// 1つのチャンネルの完全な処理パイプライン
 ///
@@ -52,6 +108,8 @@ pub struct ChannelProcessor {
     connect_on_startup: bool,
     /// 再接続時にバッファを送信するか
     send_buffered_on_reconnect: bool,
+    /// 再接続バックオフ管理
+    reconnect_backoff: ReconnectBackoff,
 }
 
 impl ChannelProcessor {
@@ -125,6 +183,10 @@ impl ChannelProcessor {
             buffered_samples_during_disconnect: Vec::new(),
             connect_on_startup: transcribe_config.connect_on_startup,
             send_buffered_on_reconnect: transcribe_config.send_buffered_on_reconnect,
+            reconnect_backoff: ReconnectBackoff::new(
+                RECONNECT_BACKOFF_INITIAL_MS,
+                RECONNECT_BACKOFF_MAX_MS,
+            ),
         })
     }
 
@@ -232,7 +294,42 @@ impl ChannelProcessor {
                     self.buffered_samples_during_disconnect.len(),
                     buffered_duration_ms
                 );
-                self.reconnect_transcribe().await?;
+
+                let now = std::time::Instant::now();
+
+                // バックオフ中なら再接続を試みず、サンプルだけバッファ
+                if !self.reconnect_backoff.should_attempt(now) {
+                    log::debug!(
+                        "チャンネル {}: 再接続バックオフ中(次回まで {}ms)、サンプルのみバッファ",
+                        self.channel_id,
+                        self.reconnect_backoff.current_ms
+                    );
+                    self.buffered_samples_during_disconnect.push(samples.clone());
+                    while self.buffered_samples_during_disconnect.len() > MAX_BUFFERED_DISCONNECT_CHUNKS {
+                        self.buffered_samples_during_disconnect.remove(0);
+                    }
+                    self.silence_duration_ms = 0;
+                    return Ok(());
+                }
+
+                // 再接続を試みる
+                if let Err(e) = self.reconnect_transcribe().await {
+                    self.reconnect_backoff.record_failure(now);
+                    log::warn!(
+                        "チャンネル {}: 再接続失敗(次回まで {}ms)、サンプルを切断中バッファへ蓄積({} 件目): {}",
+                        self.channel_id,
+                        self.reconnect_backoff.current_ms,
+                        self.buffered_samples_during_disconnect.len() + 1,
+                        e
+                    );
+                    self.buffered_samples_during_disconnect.push(samples.clone());
+                    while self.buffered_samples_during_disconnect.len() > MAX_BUFFERED_DISCONNECT_CHUNKS {
+                        self.buffered_samples_during_disconnect.remove(0);
+                    }
+                    self.silence_duration_ms = 0;
+                    return Ok(());
+                }
+                self.reconnect_backoff.record_success();
 
                 // 再接続時にバッファ送信が有効な場合
                 if self.send_buffered_on_reconnect && !self.buffered_samples_during_disconnect.is_empty() {
@@ -567,34 +664,22 @@ impl ChannelProcessor {
     }
 
     /// フィラーワード（言い淀み）を削除
+    ///
+    /// 全位置(文頭・文中・文末・連続)に出現するフィラーを除去する。
+    /// 長いフィラーから先に除去することで、`あのー` を `あの` で剥がしてしまい
+    /// 残骸 `ー` を出すといった部分一致問題を回避する。
     pub fn remove_filler_words(text: &str) -> String {
-        // 削除対象のフィラーワードリスト
+        // 長さ降順(同長は任意)に並べる: 長いほうを先に除去
         let filler_words = [
-            "えっと",
-            "あの",
-            "ええと",
-            "ええ",
-            "えー",
-            "えーと",
-            "あのー",
-            "っと",
-            "っとー",
+            "あのー", "ええと", "えーと", "えっと", "っとー",
+            "えー", "ええ", "あの", "っと",
         ];
 
         let mut result = text.to_string();
-
-        // 各フィラーワードを削除
         for filler in &filler_words {
-            // 完全一致する単語を削除（前後に空白がある場合）
-            result = result.replace(&format!("{} ", filler), "");
-            result = result.replace(&format!(" {}", filler), "");
-            // 文頭・文末の場合
-            if result.starts_with(filler) {
-                result = result[filler.len()..].to_string();
-            }
-            if result.ends_with(filler) {
-                result = result[..result.len() - filler.len()].to_string();
-            }
+            // String::replace は非重複の全マッチを置換するので、これだけで
+            // 文頭・文中・文末・連続出現すべてに対応できる
+            result = result.replace(filler, "");
         }
 
         // 連続する空白を1つにまとめる
@@ -728,7 +813,6 @@ impl ChannelProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::AudioFormat;
 
     #[tokio::test]
     #[ignore] // AWS認証情報が必要なため、通常はスキップ
@@ -781,5 +865,201 @@ mod tests {
         .await;
 
         assert!(result.is_ok());
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // remove_filler_words: フィラーワード除去
+    // ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn filler_empty_string() {
+        assert_eq!(ChannelProcessor::remove_filler_words(""), "");
+    }
+
+    #[test]
+    fn filler_no_filler() {
+        assert_eq!(
+            ChannelProcessor::remove_filler_words("こんにちは"),
+            "こんにちは"
+        );
+    }
+
+    #[test]
+    fn filler_only_one_filler() {
+        assert_eq!(ChannelProcessor::remove_filler_words("えっと"), "");
+    }
+
+    #[test]
+    fn filler_at_start() {
+        assert_eq!(
+            ChannelProcessor::remove_filler_words("えっと、こんにちは"),
+            "、こんにちは"
+        );
+    }
+
+    #[test]
+    fn filler_at_end() {
+        assert_eq!(
+            ChannelProcessor::remove_filler_words("こんにちはえっと"),
+            "こんにちは"
+        );
+    }
+
+    #[test]
+    fn filler_in_middle() {
+        // 期待: 中央のフィラーも除去される
+        assert_eq!(
+            ChannelProcessor::remove_filler_words("今日はえっと明日です"),
+            "今日は明日です"
+        );
+    }
+
+    #[test]
+    fn filler_consecutive_at_start() {
+        // 期待: 連続するフィラーをすべて除去
+        assert_eq!(
+            ChannelProcessor::remove_filler_words("えっとえっと、こんにちは"),
+            "、こんにちは"
+        );
+    }
+
+    #[test]
+    fn filler_with_surrounding_spaces() {
+        assert_eq!(
+            ChannelProcessor::remove_filler_words("hello えっと world"),
+            "hello world"
+        );
+    }
+
+    #[test]
+    fn filler_collapses_double_spaces() {
+        let r = ChannelProcessor::remove_filler_words("a えっと  b");
+        // 二重スペースが圧縮される
+        assert!(!r.contains("  "), "should not contain double space, got: {:?}", r);
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // is_punctuation_only
+    // ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn punct_empty() {
+        assert!(ChannelProcessor::is_punctuation_only(""));
+        assert!(ChannelProcessor::is_punctuation_only("   "));
+    }
+
+    #[test]
+    fn punct_periods_only() {
+        assert!(ChannelProcessor::is_punctuation_only("。"));
+        assert!(ChannelProcessor::is_punctuation_only("、"));
+        assert!(ChannelProcessor::is_punctuation_only("、。"));
+    }
+
+    #[test]
+    fn punct_real_text_is_not() {
+        assert!(!ChannelProcessor::is_punctuation_only("こんにちは"));
+        assert!(!ChannelProcessor::is_punctuation_only("a"));
+        assert!(!ChannelProcessor::is_punctuation_only("、こんにちは"));
+    }
+
+    #[test]
+    fn punct_と_is_treated_as_punctuation() {
+        // 元実装の仕様: フィラー除去で残った "と" を捨てる目的で 'と' を許可文字に含めている。
+        // 副作用として、"と" 単体や "とと" は punctuation_only と判定される。
+        assert!(ChannelProcessor::is_punctuation_only("と"));
+        assert!(ChannelProcessor::is_punctuation_only("、と。"));
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // ReconnectBackoff
+    // ─────────────────────────────────────────────────────────────────
+
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn backoff_fresh_allows_attempt() {
+        let b = ReconnectBackoff::new(500, 30000);
+        assert!(b.should_attempt(Instant::now()));
+    }
+
+    #[test]
+    fn backoff_blocks_until_window_elapsed() {
+        let mut b = ReconnectBackoff::new(500, 30000);
+        let t0 = Instant::now();
+        b.record_failure(t0);
+        // 直後は blocked
+        assert!(!b.should_attempt(t0));
+        // 100ms 後も blocked(window=1000ms = 500*2)
+        assert!(!b.should_attempt(t0 + Duration::from_millis(100)));
+        // 1000ms ちょうどで通る(>=)
+        assert!(b.should_attempt(t0 + Duration::from_millis(1000)));
+        // それ以降も通る
+        assert!(b.should_attempt(t0 + Duration::from_millis(2000)));
+    }
+
+    #[test]
+    fn backoff_doubles_each_failure() {
+        let mut b = ReconnectBackoff::new(500, 30000);
+        let t0 = Instant::now();
+        b.record_failure(t0);
+        assert_eq!(b.current_ms, 1000);
+        b.record_failure(t0);
+        assert_eq!(b.current_ms, 2000);
+        b.record_failure(t0);
+        assert_eq!(b.current_ms, 4000);
+        b.record_failure(t0);
+        assert_eq!(b.current_ms, 8000);
+    }
+
+    #[test]
+    fn backoff_caps_at_max() {
+        let mut b = ReconnectBackoff::new(500, 4000);
+        let t0 = Instant::now();
+        for _ in 0..10 {
+            b.record_failure(t0);
+        }
+        assert_eq!(b.current_ms, 4000);
+    }
+
+    #[test]
+    fn backoff_success_resets_window_and_interval() {
+        let mut b = ReconnectBackoff::new(500, 30000);
+        let t0 = Instant::now();
+        b.record_failure(t0);
+        b.record_failure(t0);
+        assert_eq!(b.current_ms, 2000);
+        assert!(b.last_failure_at.is_some());
+
+        b.record_success();
+        assert!(b.last_failure_at.is_none());
+        assert_eq!(b.current_ms, 500);
+        // success 直後は再度 attempt 可能
+        assert!(b.should_attempt(Instant::now()));
+    }
+
+    #[test]
+    fn backoff_failure_then_success_recovers_quickly() {
+        let mut b = ReconnectBackoff::new(500, 30000);
+        let t0 = Instant::now();
+        b.record_failure(t0);
+        b.record_failure(t0);
+        // 失敗 2 回 → 2000ms 待ち
+        assert!(!b.should_attempt(t0 + Duration::from_millis(1500)));
+
+        // でも成功すればすぐリセット
+        b.record_success();
+        assert!(b.should_attempt(t0 + Duration::from_millis(1500)));
+    }
+
+    #[test]
+    fn backoff_does_not_overflow_on_extreme_failures() {
+        // saturating_mul のおかげで panic しないこと
+        let mut b = ReconnectBackoff::new(u64::MAX / 2, u64::MAX);
+        let t0 = Instant::now();
+        b.record_failure(t0);
+        b.record_failure(t0);
+        b.record_failure(t0);
+        // u64::MAX を超えない
+        assert!(b.current_ms <= u64::MAX);
     }
 }

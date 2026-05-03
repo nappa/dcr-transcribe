@@ -1,7 +1,10 @@
+// 一部のフィールド/メソッドは Debug 経由のみで使われる、または保持目的で未使用
+#![allow(dead_code)]
+
 use crate::types::{Stability, VadState};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 /// Transcribe接続状態
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

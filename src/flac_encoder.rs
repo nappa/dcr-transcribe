@@ -1,3 +1,6 @@
+// 一部のメソッド/フィールドは現時点で未使用だが API として保持する
+#![allow(dead_code)]
+
 use crate::types::SampleI16;
 use anyhow::Result;
 use flacenc::bitsink::ByteSink;

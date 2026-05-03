@@ -6,6 +6,7 @@ mod channel_processor;
 mod config;
 mod flac_encoder;
 mod opus_encoder;
+mod remote_server;
 mod transcribe;
 mod transcribe_backend;
 mod tui;
@@ -100,6 +101,23 @@ async fn main() -> Result<()> {
     log::info!("dcr-transcribe を起動します");
     log::info!("設定: {:?}", config);
 
+    // 全チャンネル共通の start_time を作成(以降で使用)
+    let start_time = std::time::SystemTime::now();
+
+    // Remote サーバ(SSE)を起動
+    let remote_state: Option<Arc<remote_server::RemoteState>> = match config.remote.clone() {
+        Some(cfg) if cfg.enabled => match remote_server::start(cfg, &config.channels, start_time)
+            .await
+        {
+            Ok(state) => Some(state),
+            Err(e) => {
+                log::error!("Remote サーバ起動失敗(無効化して続行): {}", e);
+                None
+            }
+        },
+        _ => None,
+    };
+
     // Ctrl+C ハンドラを設定
     let running = Arc::new(AtomicBool::new(true));
     let running_clone = running.clone();
@@ -110,9 +128,6 @@ async fn main() -> Result<()> {
 
     // TUI状態を作成
     let tui_state = TuiState::new();
-
-    // 全チャンネル共通の start_time を作成
-    let start_time = std::time::SystemTime::now();
 
     // チャンネルプロセッサを作成
     let mut processors = Vec::new();
@@ -239,6 +254,7 @@ async fn main() -> Result<()> {
         // タスク2: 文字起こし結果取得スレッド
         let processor_clone = processor.clone();
         let running_clone = running.clone();
+        let remote_state_clone = remote_state.clone();
         let transcript_task = tokio::spawn(async move {
             while running_clone.load(Ordering::SeqCst) {
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -263,7 +279,15 @@ async fn main() -> Result<()> {
                                 if let Ok(json) = serde_json::to_string(&result) {
                                     log::info!("{}", json);
                                 }
+
+                                // Remote サーバへ転送(同期、ブロックしない)
+                                if let Some(state) = &remote_state_clone {
+                                    state.push(&result);
+                                }
                             }
+                        } else if let Some(state) = &remote_state_clone {
+                            // partial も(設定で有効な場合のみ内部で振り分け)
+                            state.push(&result);
                         }
                     }
                 }

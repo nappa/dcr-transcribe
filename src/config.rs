@@ -19,8 +19,60 @@ pub struct Config {
     pub output: OutputConfig,
     #[serde(default)]
     pub flac: FlacConfig,
+    pub remote: Option<RemoteConfig>,
     #[serde(default)]
     pub channels: Vec<ChannelConfig>,
+}
+
+/// リモート閲覧用 HTTP/SSE サーバ設定
+///
+/// `axum` ベースの軽量サーバを localhost で起動し、ngrok 経由で公開する想定。
+/// 確定結果のみリアルタイム配信(転送量最小化のため)。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RemoteConfig {
+    #[serde(default = "default_remote_enabled")]
+    pub enabled: bool,
+    /// listen アドレス。ngrok 経由のみ想定なので 127.0.0.1 推奨
+    #[serde(default = "default_remote_listen")]
+    pub listen: String,
+    /// 新規クライアントへ初期送信する履歴件数
+    #[serde(default = "default_remote_history_size")]
+    pub history_size: usize,
+    /// partial 結果も配信するか(転送量増、デフォルト false)
+    #[serde(default = "default_remote_include_partials")]
+    pub include_partials: bool,
+    /// partial を配信する場合のチャンネル毎の throttle 間隔(ms)
+    #[serde(default = "default_remote_partial_throttle_ms")]
+    pub partial_throttle_ms: u64,
+    /// 共有トークン。空なら認証なし。クエリ文字列 `?t=...` で照合
+    #[serde(default)]
+    pub auth_token: String,
+    /// HTTP Basic 認証のユーザー名(空なら Basic 認証は無効)
+    #[serde(default)]
+    pub basic_auth_user: String,
+    /// HTTP Basic 認証のパスワード
+    #[serde(default)]
+    pub basic_auth_pass: String,
+}
+
+fn default_remote_enabled() -> bool {
+    true
+}
+
+fn default_remote_listen() -> String {
+    "127.0.0.1:8765".to_string()
+}
+
+fn default_remote_history_size() -> usize {
+    200
+}
+
+fn default_remote_include_partials() -> bool {
+    false
+}
+
+fn default_remote_partial_throttle_ms() -> u64 {
+    500
 }
 
 /// オーディオ入力設定
@@ -325,6 +377,8 @@ impl Default for Config {
             whisper: None, // デフォルトではWhisper設定なし
             output: OutputConfig::default(),
             flac: FlacConfig::default(),
+            remote: None, // デフォルトでは Remote サーバ無効
+
             channels: vec![
                 ChannelConfig {
                     id: 0,
@@ -518,7 +572,7 @@ mod tests {
 
     #[test]
     fn test_write_and_read_config() {
-        let mut temp_file = NamedTempFile::new().unwrap();
+        let temp_file = NamedTempFile::new().unwrap();
         let path = temp_file.path();
 
         // デフォルト設定を書き込み

@@ -1,3 +1,6 @@
+// 一部のメソッドは現時点で未使用だが API として保持する
+#![allow(dead_code)]
+
 use crate::config::VadConfig;
 use crate::types::{SampleI16, VadState};
 
@@ -397,5 +400,141 @@ mod tests {
 
         // 音声状態
         assert!(vad.is_voice());
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // ハングオーバー機構の精密な挙動
+    // ─────────────────────────────────────────────────────────────────
+
+    fn voice_chunk(samples: usize) -> Vec<i16> {
+        (0..samples)
+            .map(|i| ((i as f32 * 0.1).sin() * 10000.0) as i16)
+            .collect()
+    }
+
+    #[test]
+    fn hangover_resets_on_resumed_voice() {
+        // 音声 → 無音(ハングオーバー減少) → 音声 でハングオーバーがリセットされること
+        let config = VadConfig {
+            threshold_db: -40.0,
+            hangover_duration_ms: 500,
+            silence_disconnect_threshold_ms: 10000,
+        };
+        let mut vad = VoiceActivityDetector::new(&config, 16000);
+
+        let voice = voice_chunk(1600); // 100ms
+        let silence = vec![0i16; 1600]; // 100ms
+
+        vad.process(&voice);
+        assert_eq!(
+            vad.get_state(),
+            VadState::Voice {
+                hangover_remaining_ms: 500
+            }
+        );
+
+        // 100ms 無音 → 残り 400ms
+        vad.process(&silence);
+        assert_eq!(
+            vad.get_state(),
+            VadState::Voice {
+                hangover_remaining_ms: 400
+            }
+        );
+
+        // さらに 100ms 無音 → 残り 300ms
+        vad.process(&silence);
+        assert_eq!(
+            vad.get_state(),
+            VadState::Voice {
+                hangover_remaining_ms: 300
+            }
+        );
+
+        // 音声再開 → 500ms にリセット
+        vad.process(&voice);
+        assert_eq!(
+            vad.get_state(),
+            VadState::Voice {
+                hangover_remaining_ms: 500
+            }
+        );
+    }
+
+    #[test]
+    fn hangover_countdown_is_proportional_to_chunk_size() {
+        let config = VadConfig {
+            threshold_db: -40.0,
+            hangover_duration_ms: 500,
+            silence_disconnect_threshold_ms: 10000,
+        };
+        let mut vad = VoiceActivityDetector::new(&config, 16000);
+
+        vad.process(&voice_chunk(1600)); // 音声開始
+        assert_eq!(
+            vad.get_state(),
+            VadState::Voice {
+                hangover_remaining_ms: 500
+            }
+        );
+
+        // 200ms 分の無音 → 500-200=300 ms 残るはず
+        let silence_200ms = vec![0i16; 3200];
+        vad.process(&silence_200ms);
+        assert_eq!(
+            vad.get_state(),
+            VadState::Voice {
+                hangover_remaining_ms: 300
+            }
+        );
+
+        // さらに 250ms → 50ms 残る(まだ Voice)
+        let silence_250ms = vec![0i16; 4000];
+        let still_voice = vad.process(&silence_250ms);
+        assert!(still_voice, "still within hangover (50ms left)");
+        assert_eq!(
+            vad.get_state(),
+            VadState::Voice {
+                hangover_remaining_ms: 50
+            }
+        );
+    }
+
+    #[test]
+    fn brief_silence_below_hangover_does_not_break_voice_state() {
+        let config = VadConfig {
+            threshold_db: -40.0,
+            hangover_duration_ms: 500,
+            silence_disconnect_threshold_ms: 10000,
+        };
+        let mut vad = VoiceActivityDetector::new(&config, 16000);
+
+        vad.process(&voice_chunk(1600));
+        assert!(vad.is_voice());
+
+        // 100ms (< 500ms hangover) → 音声扱い継続
+        let brief = vec![0i16; 1600];
+        let r = vad.process(&brief);
+        assert!(r, "100ms silence within 500ms hangover should still be voice");
+        assert!(vad.is_voice());
+    }
+
+    #[test]
+    fn long_silence_exceeding_hangover_returns_to_silence() {
+        let config = VadConfig {
+            threshold_db: -40.0,
+            hangover_duration_ms: 500,
+            silence_disconnect_threshold_ms: 10000,
+        };
+        let mut vad = VoiceActivityDetector::new(&config, 16000);
+
+        vad.process(&voice_chunk(1600));
+        assert!(vad.is_voice());
+
+        // 1秒 (> 500ms hangover) → Silence
+        let long = vec![0i16; 16000];
+        let r = vad.process(&long);
+        assert!(!r, "long silence should drop to Silence");
+        assert_eq!(vad.get_state(), VadState::Silence);
     }
 }

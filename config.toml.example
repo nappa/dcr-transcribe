@@ -54,6 +54,19 @@ send_buffered_on_reconnect = true
 # Directory for WAV file output
 wav_output_dir = "./recordings"
 
+# Remote viewer (HTTP/SSE server, expose via ngrok)
+# Tail-style live view of confirmed transcripts in any browser.
+# Run `ngrok http 8765` separately to expose to remote viewers.
+# [remote]
+# enabled = true
+# listen = "127.0.0.1:8765"     # bind address (keep on loopback; ngrok reaches localhost)
+# history_size = 200            # entries kept for new clients on reconnect
+# include_partials = false      # also stream partial results (more bandwidth)
+# partial_throttle_ms = 500     # throttle partials per channel (only used if include_partials=true)
+# auth_token = ""               # shared secret; clients pass `?t=...` (empty = no auth)
+# basic_auth_user = ""          # HTTP Basic 認証ユーザー名(空なら Basic 認証無効)
+# basic_auth_pass = ""          # HTTP Basic 認証パスワード
+
 [flac]
 # Enable FLAC compression for AWS Transcribe
 enabled = true

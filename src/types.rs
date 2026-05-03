@@ -1,3 +1,6 @@
+// 一部のフィールドは Debug derive 経由のみで使われるため dead_code とみなされる
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
 
@@ -229,14 +232,15 @@ impl TranscriptResult {
         let duration = now.duration_since(start_time).unwrap_or_default();
         let timestamp_seconds = duration.as_secs_f64();
 
-        // ISO 8601形式のタイムスタンプを生成
+        // ISO 8601 形式のタイムスタンプを生成(ミリ秒精度)
+        let unix = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default();
         let timestamp = chrono::DateTime::from_timestamp(
-            now.duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64,
-            0,
+            unix.as_secs() as i64,
+            unix.subsec_nanos(),
         )
-        .map(|dt| dt.to_rfc3339())
+        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
         .unwrap_or_default();
 
         Self {
@@ -269,14 +273,15 @@ impl TranscriptResult {
     ) -> Self {
         let now = SystemTime::now();
 
-        // ISO 8601形式のタイムスタンプを生成
+        // ISO 8601 形式のタイムスタンプを生成(ミリ秒精度)
+        let unix = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default();
         let timestamp = chrono::DateTime::from_timestamp(
-            now.duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64,
-            0,
+            unix.as_secs() as i64,
+            unix.subsec_nanos(),
         )
-        .map(|dt| dt.to_rfc3339())
+        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
         .unwrap_or_default();
 
         Self {
@@ -371,5 +376,52 @@ mod tests {
         assert_eq!(parsed["channel"], 1);
         assert_eq!(parsed["text"], "こんにちは");
         assert_eq!(parsed["is_partial"], true);
+    }
+
+    #[test]
+    fn timestamp_has_millisecond_precision() {
+        let start_time = SystemTime::now();
+        let r = TranscriptResult::new(0, "x".into(), false, None, start_time);
+        // 形式: "YYYY-MM-DDThh:mm:ss.sssZ"
+        // ミリ秒部分は 3 桁、Z 終端
+        assert!(
+            r.timestamp.ends_with('Z'),
+            "timestamp should end with Z, got: {}",
+            r.timestamp
+        );
+        assert!(
+            r.timestamp.contains('.'),
+            "timestamp should contain sub-second separator, got: {}",
+            r.timestamp
+        );
+        // "T" の後ろに "."、その後 3 桁数字、"Z"
+        let dot_pos = r.timestamp.rfind('.').unwrap();
+        let after_dot = &r.timestamp[dot_pos + 1..];
+        // "234Z" のような形
+        let frac = &after_dot[..after_dot.len() - 1]; // Z を除く
+        assert_eq!(frac.len(), 3, "milliseconds should be 3 digits, got: {}", frac);
+        assert!(frac.chars().all(|c| c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn timestamps_differ_within_same_second() {
+        // 10ms 待つと timestamp が変わるはず(ミリ秒精度がある証拠)
+        let st = SystemTime::now();
+        let r1 = TranscriptResult::new(0, "a".into(), false, None, st);
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        let r2 = TranscriptResult::new(0, "b".into(), false, None, st);
+        assert_ne!(
+            r1.timestamp, r2.timestamp,
+            "two transcripts created 15ms apart should have different timestamps"
+        );
+    }
+
+    #[test]
+    fn new_with_audio_time_also_has_subsecond_precision() {
+        let r = TranscriptResult::new_with_audio_time(0, "x".into(), false, None, 12.345);
+        assert!(r.timestamp.ends_with('Z'));
+        assert!(r.timestamp.contains('.'));
+        // audio_start_seconds がそのまま入る
+        assert!((r.timestamp_seconds - 12.345).abs() < 0.001);
     }
 }

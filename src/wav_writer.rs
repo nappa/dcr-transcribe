@@ -1,3 +1,6 @@
+// 一部のメソッドは現時点で未使用だが API として保持する
+#![allow(dead_code)]
+
 use crate::types::SampleI16;
 use anyhow::{Context, Result};
 use std::fs;

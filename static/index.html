@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0f1115">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<title>dcr-transcribe</title>
+<style>
+:root{
+  --bg:#0f1115;--bg2:#161922;--fg:#e8eaed;--muted:#888c95;--border:#1f222a;
+  --safe-top:env(safe-area-inset-top,0);
+  --safe-bot:env(safe-area-inset-bottom,0);
+  --safe-l:env(safe-area-inset-left,0);
+  --safe-r:env(safe-area-inset-right,0);
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;padding:0;min-height:100%}
+body{
+  background:var(--bg);color:var(--fg);
+  font-family:-apple-system,BlinkMacSystemFont,"Hiragino Sans","Yu Gothic UI","Noto Sans JP",sans-serif;
+  font-size:15px;line-height:1.5;
+  -webkit-text-size-adjust:100%;
+  padding-left:var(--safe-l);padding-right:var(--safe-r);
+}
+header{
+  position:sticky;top:0;z-index:10;
+  background:var(--bg2);border-bottom:1px solid var(--border);
+  padding:calc(8px + var(--safe-top)) 12px 6px;
+}
+.tr{display:flex;align-items:center;gap:10px;margin-bottom:6px}
+.tr h1{font-size:14px;margin:0;font-weight:600;flex:1}
+.s{font-size:11px;padding:3px 9px;border-radius:10px;background:#2a2d34;color:var(--muted);white-space:nowrap}
+.s.on{background:#1a4a2a;color:#9f9}
+.s.off{background:#4a1a1a;color:#f99}
+.s.reco{background:#4a3a1a;color:#fc6}
+.chips{
+  display:flex;gap:6px;overflow-x:auto;-webkit-overflow-scrolling:touch;
+  margin:0 -12px;padding:0 12px 4px;scrollbar-width:none;
+}
+.chips::-webkit-scrollbar{display:none}
+.chip{
+  flex-shrink:0;font-size:12px;padding:6px 12px;border-radius:14px;
+  border:1px solid transparent;cursor:pointer;user-select:none;
+  background:#2a2d34;color:var(--muted);
+  min-height:30px;display:flex;align-items:center;
+}
+.chip.on{background:var(--ch-bg);color:var(--ch-fg);border-color:var(--ch-fg)}
+#older{
+  padding:10px;text-align:center;font-size:13px;color:var(--muted);
+  cursor:pointer;border-bottom:1px solid var(--border);user-select:none;
+  display:none;
+}
+#older.show{display:block}
+#older:active{background:var(--bg2)}
+#log{padding:0 0 calc(80px + var(--safe-bot))}
+.r{padding:9px 12px;border-bottom:1px solid var(--border);background:var(--ch-bg)}
+.r .meta{display:flex;gap:8px;font-size:11px;color:var(--muted);margin-bottom:3px}
+.r .name{color:var(--ch-fg);font-weight:600}
+.r .ts{font-variant-numeric:tabular-nums}
+.r .x{font-size:15px;word-break:break-word}
+.p{opacity:.55;font-style:italic}
+.gap{
+  padding:6px 12px;background:#2a2030;color:#fc6;font-size:11px;text-align:center;
+  border-bottom:1px solid var(--border);
+}
+.c0{--ch-bg:#14233a;--ch-fg:#6cb6ff}
+.c1{--ch-bg:#143a1c;--ch-fg:#6cf99a}
+.c2{--ch-bg:#3a2e14;--ch-fg:#ffd86c}
+.c3{--ch-bg:#3a1820;--ch-fg:#ff90b0}
+.c4{--ch-bg:#2a1838;--ch-fg:#cc88ff}
+.c5{--ch-bg:#3a2c14;--ch-fg:#ffb060}
+.c6{--ch-bg:#143a3a;--ch-fg:#6cffe0}
+.c7{--ch-bg:#2a2a2a;--ch-fg:#c0c0c0}
+.c8{--ch-bg:#3a2614;--ch-fg:#ff9c70}
+.c9{--ch-bg:#143a30;--ch-fg:#6cffaa}
+.fab{
+  position:fixed;left:50%;bottom:calc(20px + var(--safe-bot));
+  transform:translateX(-50%);
+  background:#2a4060;color:#fff;border:none;
+  padding:11px 20px;border-radius:22px;font-size:13px;font-weight:600;
+  box-shadow:0 4px 14px rgba(0,0,0,.45);cursor:pointer;display:none;z-index:5;
+  font-family:inherit;
+}
+.fab.show{display:block}
+@media(prefers-reduced-motion:no-preference){
+  .r{animation:in .18s ease-out}
+  @keyframes in{from{opacity:0;transform:translateY(4px)}}
+}
+</style>
+</head>
+<body>
+<header>
+  <div class="tr">
+    <h1>dcr-transcribe</h1>
+    <span class="s off" id="s">未接続</span>
+  </div>
+  <div class="chips" id="chips"></div>
+</header>
+<div id="older">↑ もっと前を読み込む</div>
+<div id="log"></div>
+<button class="fab" id="fab">↓ 最新へ</button>
+<script>
+(function(){
+var log=document.getElementById("log"),stat=document.getElementById("s"),chipsBox=document.getElementById("chips"),fab=document.getElementById("fab"),older=document.getElementById("older");
+var p=new URLSearchParams(location.search);
+var token=p.get("t")||"";
+var wantP=p.get("p")==="1";
+var HIDE="dcr-hide";
+var hidden=new Set(JSON.parse(localStorage.getItem(HIDE)||"[]"));
+
+// 状態
+var es=null;
+var anchorMs=0;
+var names={};
+var stick=true;
+var newCount=0;
+var firstShownId=0;        // DOM 上で最も古いイベント ID(0 = まだ何もない)
+var lastSeenId=0;          // 受信済みの最大 ID
+var loadingOlder=false;
+var hiddenAt=0;
+var wasStickyOnHide=true;
+var FAST_THRESHOLD_MS=30000; // この時間以上 hidden だったらファストロード
+var FAST_HEAD=20;            // ファストロード時に取得する件数
+
+function pad(n){return n<10?"0"+n:""+n}
+function fmt(s){if(!anchorMs)return"";var d=new Date(anchorMs+s*1000);return pad(d.getHours())+":"+pad(d.getMinutes())+":"+pad(d.getSeconds())}
+function esc(s){return s.replace(/[&<>]/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;"}[c]})}
+function atBottom(){return(window.innerHeight+window.scrollY)>=document.documentElement.scrollHeight-80}
+function scrollBottom(){window.scrollTo(0,document.documentElement.scrollHeight)}
+
+function applyHidden(){
+  var st=document.getElementById("hs");
+  if(!st){st=document.createElement("style");st.id="hs";document.head.appendChild(st)}
+  st.textContent=Array.from(hidden).map(function(c){return".c"+c+"{display:none}"}).join("");
+}
+function persist(){localStorage.setItem(HIDE,JSON.stringify(Array.from(hidden)))}
+applyHidden();
+
+function makeChip(id,name){
+  var b=document.createElement("div");
+  b.className="chip c"+id+(hidden.has(id)?"":" on");
+  b.textContent=name;
+  b.onclick=function(){
+    if(hidden.has(id)){hidden.delete(id);b.classList.add("on")}
+    else{hidden.add(id);b.classList.remove("on")}
+    applyHidden();persist();
+  };
+  return b;
+}
+
+function makeRow(id,e){
+  var d=document.createElement("div");
+  d.className="r c"+e.c+(e.p?" p":"");
+  if(id)d.dataset.id=id;
+  var n=names[e.c]!==undefined?names[e.c]:"ch"+e.c;
+  d.innerHTML='<div class="meta"><span class="name">'+esc(n)+'</span><span class="ts">'+fmt(e.s)+'</span></div><div class="x">'+esc(e.x)+'</div>';
+  return d;
+}
+
+function makeGapNote(n){
+  var d=document.createElement("div");
+  d.className="gap";
+  d.textContent="… "+n+" 件スキップ(↑タップで読み込み)";
+  return d;
+}
+
+function append(id,e){
+  var d=makeRow(id,e);
+  log.appendChild(d);
+  if(id){
+    if(id>lastSeenId)lastSeenId=id;
+    if(firstShownId===0||id<firstShownId)firstShownId=id;
+  }
+  while(log.children.length>500)log.removeChild(log.firstChild);
+  updateOlderUI();
+  if(stick){requestAnimationFrame(scrollBottom)}
+  else{newCount++;fab.textContent="↓ 新着 "+newCount+" 件";fab.classList.add("show")}
+}
+
+function prepend(items){
+  if(!items||!items.length)return;
+  // id 昇順に並べる(server から既にそうだが念のため)
+  items.sort(function(a,b){return a.id-b.id});
+  // スクロール位置の保持: 追加前後の高さ差ぶんスクロール
+  var prevHeight=document.documentElement.scrollHeight;
+  var prevY=window.scrollY;
+  // 古い順に DOM 先頭へ insert(insertBefore で前から挿入)
+  var anchor=log.firstChild;
+  for(var i=0;i<items.length;i++){
+    var it=items[i];
+    log.insertBefore(makeRow(it.id,it),anchor);
+  }
+  firstShownId=items[0].id;
+  // 高さが増えたぶん下にスクロールして、見ている位置を保つ
+  var newHeight=document.documentElement.scrollHeight;
+  window.scrollTo(0,prevY+(newHeight-prevHeight));
+  updateOlderUI();
+}
+
+function updateOlderUI(){
+  if(firstShownId>1)older.classList.add("show");
+  else older.classList.remove("show");
+}
+
+function loadOlder(){
+  if(loadingOlder||firstShownId<=1)return;
+  loadingOlder=true;
+  older.textContent="読み込み中…";
+  var url="/history?before="+firstShownId+"&limit=50";
+  if(token)url+="&t="+encodeURIComponent(token);
+  fetch(url).then(function(r){
+    if(!r.ok)throw new Error("HTTP "+r.status);
+    return r.json();
+  }).then(function(data){
+    var items=(data&&data.items)||[];
+    if(items.length===0){
+      // それ以上古いものは server にも無い → ボタンを「これ以上ない」表示にして無効化
+      older.textContent="これより前の履歴はありません";
+      firstShownId=1; // 再 fetch を抑止
+      setTimeout(function(){older.classList.remove("show")},1500);
+    }else{
+      prepend(items);
+      older.textContent="↑ もっと前を読み込む";
+    }
+    loadingOlder=false;
+  }).catch(function(){
+    older.textContent="↑ もっと前を読み込む(失敗・タップで再試行)";
+    loadingOlder=false;
+  });
+}
+older.onclick=loadOlder;
+
+addEventListener("scroll",function(){
+  stick=atBottom();
+  if(stick){newCount=0;fab.classList.remove("show")}
+  // 上端近くで自動的にさかのぼり
+  if(!loadingOlder&&window.scrollY<200&&firstShownId>1)loadOlder();
+},{passive:true});
+
+fab.onclick=function(){scrollBottom();newCount=0;fab.classList.remove("show")};
+
+function buildStreamUrl(opts){
+  var qs=[];
+  if(token)qs.push("t="+encodeURIComponent(token));
+  if(wantP)qs.push("p=1");
+  if(opts&&opts.head)qs.push("head="+opts.head);
+  return "/stream"+(qs.length?"?"+qs.join("&"):"");
+}
+
+function connect(opts){
+  if(es){try{es.close()}catch(_){}}
+  es=new EventSource(buildStreamUrl(opts));
+  es.addEventListener("hello",function(ev){
+    try{
+      var d=JSON.parse(ev.data);
+      var newAnchor=new Date(d.anchor).getTime();
+      anchorMs=newAnchor;
+      // チャンネル一覧は初回のみ描画(再接続では更新しない)
+      if(chipsBox.children.length===0){
+        d.channels.forEach(function(c){
+          names[c.id]=c.name;
+          chipsBox.appendChild(makeChip(c.id,c.name));
+        });
+      }
+    }catch(_){}
+  });
+  es.addEventListener("msg",function(ev){
+    try{
+      var id=parseInt(ev.lastEventId,10)||0;
+      var data=JSON.parse(ev.data);
+      // ファストロード後の最初のイベントで、前回 lastSeenId と差があれば「N 件スキップ」表示
+      if(opts&&opts.gapFrom&&id>opts.gapFrom+1){
+        var skipped=id-opts.gapFrom-1;
+        log.appendChild(makeGapNote(skipped));
+        opts.gapFrom=null; // 一度だけ
+      }
+      append(id,data);
+    }catch(_){}
+  });
+  es.onopen=function(){stat.className="s on";stat.textContent="接続中"};
+  es.onerror=function(){
+    if(es.readyState===EventSource.CONNECTING){
+      stat.className="s reco";stat.textContent="再接続中…";
+    }else{
+      stat.className="s off";stat.textContent="切断";
+    }
+  };
+}
+
+// ファストロード: DOM をクリアして最新だけ取得
+function fastReload(){
+  var prevLast=lastSeenId;
+  log.innerHTML="";
+  firstShownId=0;
+  newCount=0;
+  fab.classList.remove("show");
+  stick=true;
+  scrollBottom();
+  connect({head:FAST_HEAD,gapFrom:prevLast});
+}
+
+document.addEventListener("visibilitychange",function(){
+  if(document.hidden){
+    hiddenAt=Date.now();
+    wasStickyOnHide=stick;
+  }else{
+    var elapsed=hiddenAt?Date.now()-hiddenAt:0;
+    hiddenAt=0;
+    // 末尾を見ていた人だけファストロード(さかのぼって読んでいた人の位置は壊さない)
+    if(elapsed>FAST_THRESHOLD_MS&&wasStickyOnHide){
+      fastReload();
+    }
+  }
+});
+
+connect();
+})();
+</script>
+</body>
+</html>

@@ -1,3 +1,6 @@
+// 一部のメソッド/フィールド(format_name, reconnection_count)は計測/将来用で未使用
+#![allow(dead_code)]
+
 use crate::config::{AudioFormat, TranscribeConfig};
 use crate::flac_encoder::FlacEncoder;
 use crate::opus_encoder::OpusEncoder;
@@ -116,11 +119,12 @@ impl TranscribeBackend for AwsTranscribeBackend {
         let channel_id = self.channel_id;
         let start_time = self.start_time;
 
-        // 古いタスクがあれば破棄（チャンネルクローズにより自動終了）
+        // 古いタスクがあれば明示的に abort する。
+        // 注: tokio の JoinHandle は drop しても task は止まらない(detach されるだけ)。
+        // 前バージョンは drop に頼っていたが、確実にクリーンアップするため abort() に変更。
         if let Some(old_handle) = self.task_handle.take() {
-            log::debug!("チャンネル {}: 古いTranscribeタスクを破棄", channel_id);
-            // タスクハンドルをドロップすることで、バックグラウンドで終了させる
-            drop(old_handle);
+            log::debug!("チャンネル {}: 古い Transcribe タスクを abort", channel_id);
+            old_handle.abort();
         }
 
         let handle = tokio::spawn({
@@ -433,6 +437,15 @@ impl TranscribeBackend for AwsTranscribeBackend {
 
     fn channel_id(&self) -> usize {
         self.channel_id
+    }
+}
+
+impl Drop for AwsTranscribeBackend {
+    /// バックエンドが drop されるときに、生きているバックグラウンドタスクを確実に停止する。
+    fn drop(&mut self) {
+        if let Some(handle) = self.task_handle.take() {
+            handle.abort();
+        }
     }
 }
 

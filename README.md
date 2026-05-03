@@ -178,6 +178,130 @@ enabled = true
 
 詳細は [ARCHITECTURE.md](ARCHITECTURE.md) を参照してください。
 
+## リモート閲覧 (HTTP/SSE + ngrok)
+
+ローカルマシン内に軽量 HTTP サーバを立て、`ngrok` 経由で外部から `tail -f` 風にライブ閲覧する機能。
+
+### 特徴
+
+- **モバイルファースト UI** — スマホ前提、レスポンシブ、safe-area 対応、システムフォントで日本語綺麗
+- **チャンネルフィルタ** — チャンネル毎にチップで表示/非表示を切替(localStorage 永続化)
+- **チャンネル色分け** — TUI と同様、行ごとに背景色で識別
+- **転送量極小化** — 確定結果のみデフォルト送信、JSON フィールド 1 文字短縮 (`c/s/x/p`)、
+  外部 CDN なしの単一 HTML(gzip 後 ~3KB)
+- **多クライアント耐性** — `tokio::sync::broadcast` で各クライアント独立、互いに影響しない
+- **スロークライアント切断** — 一定量以上遅れたクライアントは自動切断 → 他クライアントに影響なし
+- **回線断耐性** — 各イベントに単調増加 ID を付与、再接続時 `Last-Event-ID` で欠損分のみ再送(重複なし)
+- **既存パイプラインから完全隔離** — 同期非ブロッキングの `state.push()` のみ、Mutex は数 µs レベル
+- **ngrok 障害でもメイン処理は無傷** — ngrok と本体は別プロセスで完全に独立
+
+### 1. config.toml に `[remote]` セクションを追加
+
+```toml
+[remote]
+enabled = true
+listen = "127.0.0.1:8765"   # loopback で listen、ngrok が公開
+history_size = 200          # 新規クライアントへ送信する履歴件数
+include_partials = false    # partial も配信するか(転送量増)
+partial_throttle_ms = 500   # partial の throttle(include_partials=true 時のみ有効)
+auth_token = ""             # 共有トークン。設定すると `?t=...` 必須
+```
+
+### 2. 起動
+
+```bash
+cargo run --release
+```
+
+ログに `Remote サーバ起動: http://127.0.0.1:8765 (auth=off, partials=false)` が出ればOK。
+
+### 3. ngrok で公開
+
+別ターミナルで:
+
+```bash
+ngrok http 8765
+```
+
+表示される `https://xxxxxx.ngrok-free.app` をブラウザで開くと、リアルタイムに文字起こしが流れます。
+
+### セキュリティ
+
+外部公開する場合、以下のいずれかで認証してください:
+
+**A. アプリ側で HTTP Basic 認証** (推奨)
+```toml
+[remote]
+basic_auth_user = "viewer"
+basic_auth_pass = "ランダムな長いパスワード"
+```
+
+ブラウザでアクセスすると認証ダイアログが出ます。一度入力すればブラウザがキャッシュし、
+SSE 接続(EventSource)も自動的に同じ認証情報を送信します。
+
+**B. アプリ側でトークン認証**
+```toml
+[remote]
+auth_token = "ランダムな長い文字列"
+```
+
+クライアントは `https://xxxxxx.ngrok-free.app/?t=<token>` でアクセス。
+ブックマーク等で URL に埋め込めるので「リンク 1 つで開ける」用途に向く。
+
+**C. ngrok 側で Basic 認証**
+```bash
+ngrok http 8765 --basic-auth user:pass
+```
+
+A〜C はすべて併用可能(全てを通過する必要あり、二段階以上のゲート構成)。
+Basic 認証は `/`, `/stream`, `/history` に適用、`/healthz` は常に認証不要(外部監視用)。
+
+### URL クエリパラメータ
+
+| パラメータ | 説明 |
+|---|---|
+| `?t=<token>` | `auth_token` 設定時に必須 |
+| `?p=1` | partial 結果も表示(`include_partials=true` で送信されている場合のみ) |
+| `?t=X&p=1` | 両方併用 |
+
+### 転送量の目安
+
+確定結果のみ(デフォルト)で:
+
+| 項目 | サイズ |
+|---|---|
+| HTML 初回 | 約 6.7KB(gzip 後 ~2.9KB) |
+| 1 イベント (SSE) | 約 80-200 bytes(発話の長さによる) |
+| Keep-alive | 15 秒ごとにコメント行(数 bytes) |
+| 1 時間あたり(100 発話) | 約 15KB + keep-alive ≒ **18KB/h** |
+| 再接続(短時間切断) | 0-数百 bytes(`Last-Event-ID` で欠損分のみ送信) |
+| 再接続(長時間切断・履歴脱落) | 直近 200 件分まで(40-50KB 程度) |
+
+### 動作確認
+
+ローカルで動作確認:
+```bash
+curl http://127.0.0.1:8765/healthz       # → "ok"
+curl http://127.0.0.1:8765/              # → HTML
+curl -N http://127.0.0.1:8765/stream     # → SSE 接続(Ctrl+C で切断)
+
+# 欠損補完の動作確認:
+# 一度 stream に繋いで `id: 5` まで受信したと仮定 → 再接続時に Last-Event-ID を渡すと
+# それ以降のみ受信できる
+curl -N -H "Last-Event-ID: 5" http://127.0.0.1:8765/stream
+```
+
+### トラブルシュート
+
+| 症状 | 対処 |
+|------|------|
+| ブラウザで「切断」のまま | サーバが起動しているか確認: `curl http://127.0.0.1:8765/healthz` |
+| ngrok URL で "401 Unauthorized" | Basic 認証設定済みなら正しい user:pass を入力(またはブラウザのキャッシュをクリア)。token 設定済みならクエリ `?t=<token>` を付ける |
+| 履歴が表示されない | F12 開発者ツールで `/stream` の SSE 受信状況を確認 |
+| 表示にラグがある | ngrok 経由は中継分のレイテンシがある(通常 <500ms)。LAN 直結なら遅延ほぼゼロ |
+| 「再接続中…」のまま戻らない | サーバが再起動した可能性。`anchor` 変更時はブラウザリロードを推奨 |
+| ログに「スロークライアントを切断」 | クライアント側ネットが詰まっている。自動再接続で復帰、欠損は `Last-Event-ID` で補完される |
+
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.

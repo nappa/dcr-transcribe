@@ -1,3 +1,7 @@
+// 旧 TranscribeClient(現在は aws_transcribe::AwsTranscribeBackend に置き換え済み)。
+// 後方互換性のため残しているが未使用。
+#![allow(dead_code)]
+
 use crate::config::TranscribeConfig;
 use crate::types::TranscriptResult;
 use anyhow::Result;

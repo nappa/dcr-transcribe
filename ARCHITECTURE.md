@@ -592,6 +592,75 @@ pub enum TranscribeStatus {
 - `q` または `Esc`: アプリケーション終了
 - 自動更新: 200msecごと
 
+## Remote Server モジュール
+
+**責務**: HTTP/SSE による文字起こし結果のリアルタイム配信(ngrok 経由でモバイル端末から閲覧)
+
+**ファイル**: `src/remote_server.rs`, `static/index.html`
+
+**設計目標**:
+- スマートフォンからの閲覧を主対象とする
+- 多クライアント / スロークライアント耐性
+- 細い回線 / 切断の頻発に耐える
+- 既存パイプラインから完全隔離
+
+**フロー**:
+
+```
+[transcript task]
+    │ state.push(&result)  (同期、Mutex は µs レベル)
+    v
+[RemoteState]
+    ├── next_id: AtomicU64                              (単調増加 ID)
+    ├── history: Mutex<VecDeque<StoredEvent {id,event}>>(再接続時の欠損補完用)
+    └── broadcaster: broadcast::Sender<StoredEvent>     (既存接続へのライブ配信、cap=256)
+    v
+[axum HTTP/SSE handlers]
+    ├── GET /          → モバイル対応 HTML(gzip 後 ~3KB)
+    ├── GET /stream    → SSE: hello + 履歴(Last-Event-ID 以降) + ライブ
+    └── GET /healthz   → "ok"
+    v
+[127.0.0.1:8765] ←── ngrok ──→ [モバイルブラウザ N 台]
+```
+
+**多クライアント・スロークライアント対策**:
+
+- `tokio::sync::broadcast` で各クライアントが独立 Receiver を持つ → 互いに影響なし
+- broadcast 容量 256 を超えて遅れた Receiver は `Lagged(n)` を受信 → SSE 接続を即切断
+- 切断されたクライアントは自動再接続し、`Last-Event-ID` ヘッダで欠損 ID を伝える
+- サーバは history から該当 ID 以降のみ送信し、重複なく回復
+
+**回線断耐性**:
+
+- 各イベントに単調増加 `event_id: u64` を付与
+- SSE response の `Event::id()` で送信 → ブラウザが `lastEventId` プロパティに保持
+- 切断時、ブラウザは自動で `Last-Event-ID` ヘッダ付きで再接続
+- サーバは history を `id > last_event_id` でフィルタ
+- history を超えた古い ID の場合は graceful fallback(現在の history を全件送信。欠損はあるが重複しない)
+
+**race-free な subscribe**:
+
+`push()` と `subscribe()` が同一 Mutex を経由することで、SSE クライアントが「履歴 + ライブで同一イベントを 2 回受信」を起こさない。
+
+**転送量最小化の手法**:
+
+- JSON キーを 1 文字に短縮: `c` (channel), `s` (timestamp_seconds), `x` (text), `p` (partial)
+- `p` が false なら省略 (`#[serde(skip_serializing_if)]`)
+- partial は default で送らない、有効時もチャンネル毎 throttle
+- HTML/JS は単一ファイル、外部依存なし、gzip 後 ~3KB
+- SSE 圧縮は使わない(中継プロキシで stream バッファ事故を避けるため)
+- 再接続時 `Last-Event-ID` で欠損のみ転送(重複なし)
+
+**モバイル UI**:
+
+- viewport-fit=cover + `env(safe-area-inset-*)` で notch / ホームインジケータ回避
+- システムフォント (`-apple-system`, `Hiragino Sans`, `Yu Gothic UI`) で日本語綺麗
+- スティッキーヘッダにチャンネルフィルタチップ(タップで表示/非表示、localStorage 永続化)
+- 「最新へ」FAB(スクロール上方時に新着件数を表示)
+- 接続状態を可視化(接続中/再接続中…/切断 を色付きピルで表示)
+
+詳細なセットアップ手順は [README.md](README.md#リモート閲覧-httpsse--ngrok) を参照。
+
 ## 今後の拡張性
 
 - **複数の文字起こしバックエンド**: Google Speech-to-Text, Azure等への対応

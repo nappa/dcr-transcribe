@@ -1,3 +1,6 @@
+// reconnection_count は計測/将来用で未使用
+#![allow(dead_code)]
+
 use crate::transcribe_backend::TranscribeBackend;
 use crate::types::TranscriptResult;
 use anyhow::{Context, Result};
@@ -81,39 +84,86 @@ impl WhisperBackend {
 
     /// Whisper APIを呼び出して文字起こし
     async fn transcribe_audio(&self, wav_data: Vec<u8>) -> Result<String> {
-        let part = multipart::Part::bytes(wav_data)
-            .file_name("audio.wav")
-            .mime_str("audio/wav")?;
+        self.transcribe_audio_with_url(
+            "https://api.openai.com/v1/audio/transcriptions",
+            wav_data,
+        )
+        .await
+    }
 
-        let mut form = multipart::Form::new()
-            .part("file", part)
-            .text("model", self.config.model.clone());
+    /// 指定 URL に対して文字起こしリクエストを送る(テスト時にモックサーバへ向ける用)。
+    ///
+    /// リトライ仕様:
+    /// - 429 (rate limit) / 5xx (server error) / network error は最大 3 回まで再送
+    /// - 4xx (auth/format error) は即座に諦める
+    /// - 指数バックオフ(500ms → 1s → 2s)
+    async fn transcribe_audio_with_url(&self, url: &str, wav_data: Vec<u8>) -> Result<String> {
+        const MAX_ATTEMPTS: u32 = 3;
+        let mut backoff_ms: u64 = 500;
 
-        if let Some(ref language) = self.config.language {
-            form = form.text("language", language.clone());
-        }
+        for attempt in 1..=MAX_ATTEMPTS {
+            // multipart::Form は consume されるので毎回作り直す
+            let part = multipart::Part::bytes(wav_data.clone())
+                .file_name("audio.wav")
+                .mime_str("audio/wav")?;
+            let mut form = multipart::Form::new()
+                .part("file", part)
+                .text("model", self.config.model.clone());
+            if let Some(ref language) = self.config.language {
+                form = form.text("language", language.clone());
+            }
 
-        let response = self
-            .client
-            .post("https://api.openai.com/v1/audio/transcriptions")
-            .header("Authorization", format!("Bearer {}", self.config.api_key))
-            .multipart(form)
-            .send()
-            .await
-            .context("Whisper API リクエスト失敗")?;
+            let send_result = self
+                .client
+                .post(url)
+                .header("Authorization", format!("Bearer {}", self.config.api_key))
+                .multipart(form)
+                .send()
+                .await;
 
-        if !response.status().is_success() {
+            // ネットワークエラー
+            let response = match send_result {
+                Ok(r) => r,
+                Err(e) => {
+                    if attempt >= MAX_ATTEMPTS {
+                        return Err(anyhow::anyhow!("Whisper API リクエスト失敗: {}", e));
+                    }
+                    log::warn!(
+                        "Whisper API: ネットワークエラー(試行 {}/{}, {}ms 後リトライ): {}",
+                        attempt, MAX_ATTEMPTS, backoff_ms, e
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                    backoff_ms = backoff_ms.saturating_mul(2);
+                    continue;
+                }
+            };
+
             let status = response.status();
-            let error_text = response.text().await.unwrap_or_default();
-            anyhow::bail!("Whisper API エラー: {} - {}", status, error_text);
+            if status.is_success() {
+                return response
+                    .json::<WhisperResponse>()
+                    .await
+                    .context("Whisper API レスポンスパース失敗")
+                    .map(|r| r.text);
+            }
+
+            // リトライ可能か判定
+            let retryable = status.as_u16() == 429 || status.is_server_error();
+            let body = response.text().await.unwrap_or_default();
+
+            if !retryable || attempt >= MAX_ATTEMPTS {
+                anyhow::bail!("Whisper API エラー: {} - {}", status, body);
+            }
+
+            log::warn!(
+                "Whisper API: HTTP {}(試行 {}/{}, {}ms 後リトライ): {}",
+                status, attempt, MAX_ATTEMPTS, backoff_ms, body
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+            backoff_ms = backoff_ms.saturating_mul(2);
         }
 
-        let whisper_response: WhisperResponse = response
-            .json::<WhisperResponse>()
-            .await
-            .context("Whisper API レスポンスパース失敗")?;
-
-        Ok(whisper_response.text)
+        unreachable!("retry loop should always exit via Ok or Err");
     }
 }
 
@@ -133,11 +183,12 @@ impl TranscribeBackend for WhisperBackend {
         let config = self.config.clone();
         let client = self.client.clone();
 
-        // 古いタスクがあれば破棄（チャンネルクローズにより自動終了）
+        // 古いタスクがあれば明示的に abort する。
+        // 注: tokio の JoinHandle は drop しても task は止まらない(detach されるだけ)。
+        // 前バージョンは drop に頼っていたが、確実にクリーンアップするため abort() に変更。
         if let Some(old_handle) = self.task_handle.take() {
-            log::debug!("チャンネル {}: 古いWhisperタスクを破棄", channel_id);
-            // タスクハンドルをドロップすることで、バックグラウンドで終了させる
-            drop(old_handle);
+            log::debug!("チャンネル {}: 古い Whisper タスクを abort", channel_id);
+            old_handle.abort();
         }
 
         let handle = tokio::spawn(async move {
@@ -263,5 +314,258 @@ impl TranscribeBackend for WhisperBackend {
 
     fn channel_id(&self) -> usize {
         self.channel_id
+    }
+}
+
+impl Drop for WhisperBackend {
+    /// バックエンドが drop されるときに、生きているバックグラウンドタスクを確実に停止する。
+    fn drop(&mut self) {
+        if let Some(handle) = self.task_handle.take() {
+            handle.abort();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::SystemTime;
+
+    fn cfg() -> WhisperConfig {
+        WhisperConfig {
+            api_key: "test-key".to_string(),
+            model: "whisper-1".to_string(),
+            language: Some("ja".to_string()),
+            sample_rate: 16000,
+            chunk_duration_secs: 5,
+        }
+    }
+
+    async fn backend() -> WhisperBackend {
+        WhisperBackend::new(cfg(), 0, SystemTime::now())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn pcm_to_wav_produces_valid_riff_header() {
+        let b = backend().await;
+        let pcm: Vec<i16> = (0..1600).map(|i| i as i16).collect();
+        let wav = b.pcm_to_wav(&pcm).unwrap();
+        assert_eq!(&wav[0..4], b"RIFF");
+        assert_eq!(&wav[8..12], b"WAVE");
+        assert!(wav.len() > 44, "WAV header + data should be > 44 bytes");
+    }
+
+    #[tokio::test]
+    async fn pcm_to_wav_handles_empty_input() {
+        let b = backend().await;
+        let wav = b.pcm_to_wav(&[]).unwrap();
+        // ヘッダのみ
+        assert_eq!(&wav[0..4], b"RIFF");
+    }
+
+    #[tokio::test]
+    async fn transcribe_succeeds_on_200() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/v1/audio/transcriptions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"text":"こんにちは"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let b = backend().await;
+        let wav = b.pcm_to_wav(&vec![0i16; 16]).unwrap();
+        let url = format!("{}/v1/audio/transcriptions", server.url());
+        let r = b.transcribe_audio_with_url(&url, wav).await.unwrap();
+
+        assert_eq!(r, "こんにちは");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn transcribe_retries_on_429_then_succeeds() {
+        let mut server = mockito::Server::new_async().await;
+        let mock_429 = server
+            .mock("POST", "/v1/audio/transcriptions")
+            .with_status(429)
+            .with_body("rate limited")
+            .expect(1)
+            .create_async()
+            .await;
+        let mock_ok = server
+            .mock("POST", "/v1/audio/transcriptions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"text":"recovered"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let b = backend().await;
+        let wav = b.pcm_to_wav(&vec![0i16; 16]).unwrap();
+        let url = format!("{}/v1/audio/transcriptions", server.url());
+        let r = b.transcribe_audio_with_url(&url, wav).await.unwrap();
+
+        assert_eq!(r, "recovered");
+        mock_429.assert_async().await;
+        mock_ok.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn transcribe_retries_on_500_then_succeeds() {
+        let mut server = mockito::Server::new_async().await;
+        let mock_500 = server
+            .mock("POST", "/v1/audio/transcriptions")
+            .with_status(500)
+            .with_body("internal error")
+            .expect(1)
+            .create_async()
+            .await;
+        let mock_ok = server
+            .mock("POST", "/v1/audio/transcriptions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"text":"after-5xx"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let b = backend().await;
+        let wav = b.pcm_to_wav(&vec![0i16; 16]).unwrap();
+        let url = format!("{}/v1/audio/transcriptions", server.url());
+        let r = b.transcribe_audio_with_url(&url, wav).await.unwrap();
+
+        assert_eq!(r, "after-5xx");
+        mock_500.assert_async().await;
+        mock_ok.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn transcribe_does_not_retry_on_401() {
+        // 認証エラーは即座に諦める(リトライしない)
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/v1/audio/transcriptions")
+            .with_status(401)
+            .with_body("unauthorized")
+            .expect(1) // 1 回しか呼ばれないこと
+            .create_async()
+            .await;
+
+        let b = backend().await;
+        let wav = b.pcm_to_wav(&vec![0i16; 16]).unwrap();
+        let url = format!("{}/v1/audio/transcriptions", server.url());
+        let r = b.transcribe_audio_with_url(&url, wav).await;
+
+        assert!(r.is_err(), "401 should produce Err");
+        let err_msg = format!("{}", r.unwrap_err());
+        assert!(err_msg.contains("401"));
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn transcribe_does_not_retry_on_400() {
+        // 4xx (Bad Request) もリトライしない
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/v1/audio/transcriptions")
+            .with_status(400)
+            .with_body("bad request")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let b = backend().await;
+        let wav = b.pcm_to_wav(&vec![0i16; 16]).unwrap();
+        let url = format!("{}/v1/audio/transcriptions", server.url());
+        let r = b.transcribe_audio_with_url(&url, wav).await;
+
+        assert!(r.is_err());
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn transcribe_gives_up_after_max_retries() {
+        // 永続的に 500 を返すと、3 回試行して諦める
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/v1/audio/transcriptions")
+            .with_status(503)
+            .with_body("service unavailable")
+            .expect(3) // 3 回呼ばれる
+            .create_async()
+            .await;
+
+        let b = backend().await;
+        let wav = b.pcm_to_wav(&vec![0i16; 16]).unwrap();
+        let url = format!("{}/v1/audio/transcriptions", server.url());
+        let r = b.transcribe_audio_with_url(&url, wav).await;
+
+        assert!(r.is_err(), "should fail after max retries");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn transcribe_passes_authorization_header() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/v1/audio/transcriptions")
+            .match_header("authorization", "Bearer test-key")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"text":"ok"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let b = backend().await;
+        let wav = b.pcm_to_wav(&vec![0i16; 16]).unwrap();
+        let url = format!("{}/v1/audio/transcriptions", server.url());
+        let r = b.transcribe_audio_with_url(&url, wav).await.unwrap();
+        assert_eq!(r, "ok");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn transcribe_includes_language_in_form() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/v1/audio/transcriptions")
+            .match_body(mockito::Matcher::Regex(r#"name="language""#.to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"text":"ok"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let b = backend().await; // language = Some("ja")
+        let wav = b.pcm_to_wav(&vec![0i16; 16]).unwrap();
+        let url = format!("{}/v1/audio/transcriptions", server.url());
+        let _ = b.transcribe_audio_with_url(&url, wav).await.unwrap();
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn transcribe_handles_invalid_json_response() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/v1/audio/transcriptions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body("not valid json")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let b = backend().await;
+        let wav = b.pcm_to_wav(&vec![0i16; 16]).unwrap();
+        let url = format!("{}/v1/audio/transcriptions", server.url());
+        let r = b.transcribe_audio_with_url(&url, wav).await;
+        assert!(r.is_err(), "invalid JSON should produce Err");
     }
 }

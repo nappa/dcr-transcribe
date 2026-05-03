@@ -1,3 +1,6 @@
+// 一部のメソッド/フィールドは現時点で未使用だが API として保持する
+#![allow(dead_code)]
+
 use crate::config::BufferConfig;
 use crate::types::{BufferedChunk, DropPolicy, SampleI16};
 use std::collections::VecDeque;
@@ -263,5 +266,123 @@ mod tests {
 
         // 最初のチャンクは削除されているはず
         assert!(buffer.len() < 48000);
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // 容量オーバー時の drop policy
+    // ─────────────────────────────────────────────────────────────────
+
+    fn cfg(secs: u32, p: DropPolicy) -> BufferConfig {
+        BufferConfig {
+            capacity_seconds: secs,
+            drop_policy: p,
+        }
+    }
+
+    #[test]
+    fn drop_oldest_drops_front() {
+        let mut b = AudioBuffer::new(&cfg(1, DropPolicy::DropOldest), 16000);
+        // 1秒(16000サンプル)で満タンに → 次の push で 1番目が落ちる
+        b.push(BufferedChunk { samples: vec![1i16; 8000], timestamp_ns: 0 });
+        b.push(BufferedChunk { samples: vec![2i16; 8000], timestamp_ns: 500_000_000 });
+        assert_eq!(b.len(), 16000);
+
+        b.push(BufferedChunk { samples: vec![3i16; 8000], timestamp_ns: 1_000_000_000 });
+        assert!(b.len() <= 16000, "should be capped");
+
+        // 最古(1)が落ちて、2 と 3 が残るはず
+        let latest = b.get_latest(1.0);
+        assert!(latest.iter().any(|&v| v == 3), "newest should remain");
+        assert!(latest.iter().any(|&v| v == 2), "second-oldest should remain");
+        assert!(!latest.iter().any(|&v| v == 1), "DropOldest should evict 1");
+    }
+
+    #[test]
+    fn drop_newest_drops_back() {
+        let mut b = AudioBuffer::new(&cfg(1, DropPolicy::DropNewest), 16000);
+        b.push(BufferedChunk { samples: vec![1i16; 8000], timestamp_ns: 0 });
+        b.push(BufferedChunk { samples: vec![2i16; 8000], timestamp_ns: 500_000_000 });
+        b.push(BufferedChunk { samples: vec![3i16; 8000], timestamp_ns: 1_000_000_000 });
+
+        assert!(b.len() <= 16000);
+        // DropNewest なので、いま push した 3 が落ちる
+        let latest = b.get_latest(1.0);
+        assert!(latest.iter().any(|&v| v == 2), "older data should be retained");
+        assert!(!latest.iter().any(|&v| v == 3), "DropNewest should evict 3");
+    }
+
+    #[test]
+    fn block_policy_falls_back_to_drop_oldest() {
+        let mut b = AudioBuffer::new(&cfg(1, DropPolicy::Block), 16000);
+        b.push(BufferedChunk { samples: vec![1i16; 8000], timestamp_ns: 0 });
+        b.push(BufferedChunk { samples: vec![2i16; 8000], timestamp_ns: 500_000_000 });
+        b.push(BufferedChunk { samples: vec![3i16; 8000], timestamp_ns: 1_000_000_000 });
+
+        assert!(b.len() <= 16000);
+        // Block は DropOldest にフォールバックされる
+        let latest = b.get_latest(1.0);
+        assert!(latest.iter().any(|&v| v == 3), "newest should remain (DropOldest fallback)");
+        assert!(!latest.iter().any(|&v| v == 1), "oldest should be evicted");
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // エッジケース
+    // ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn zero_capacity_buffer_rejects_data() {
+        // capacity=0 で push しても panic せず、結果は空
+        let mut b = AudioBuffer::new(&cfg(0, DropPolicy::DropOldest), 16000);
+        b.push(BufferedChunk { samples: vec![1i16; 1000], timestamp_ns: 0 });
+        assert_eq!(b.len(), 0);
+        assert!(b.is_empty());
+    }
+
+    #[test]
+    fn zero_capacity_with_empty_chunk_does_not_panic() {
+        let mut b = AudioBuffer::new(&cfg(0, DropPolicy::DropOldest), 16000);
+        b.push(BufferedChunk { samples: vec![], timestamp_ns: 0 });
+        assert_eq!(b.len(), 0);
+    }
+
+    #[test]
+    fn oversized_single_chunk_drains_with_drop_oldest() {
+        // capacity=1秒(16000)に対して 24000 サンプルの単一 chunk を push
+        let mut b = AudioBuffer::new(&cfg(1, DropPolicy::DropOldest), 16000);
+        b.push(BufferedChunk { samples: vec![1i16; 24000], timestamp_ns: 0 });
+        // chunk 単位での DropOldest なので、結果として buffer は空になる
+        assert_eq!(b.len(), 0);
+    }
+
+    #[test]
+    fn empty_buffer_get_range_returns_empty() {
+        let b = AudioBuffer::new(&cfg(10, DropPolicy::DropOldest), 16000);
+        assert!(b.get_range(0, 1_000_000_000).is_empty());
+    }
+
+    #[test]
+    fn empty_buffer_clear_before_does_not_panic() {
+        let mut b = AudioBuffer::new(&cfg(10, DropPolicy::DropOldest), 16000);
+        b.clear_before(1_000_000_000);
+        assert!(b.is_empty());
+    }
+
+    #[test]
+    fn clear_resets_buffer() {
+        let mut b = AudioBuffer::new(&cfg(10, DropPolicy::DropOldest), 16000);
+        b.push(BufferedChunk { samples: vec![1i16; 1000], timestamp_ns: 0 });
+        b.push(BufferedChunk { samples: vec![2i16; 1000], timestamp_ns: 100 });
+        assert_eq!(b.len(), 2000);
+        b.clear();
+        assert_eq!(b.len(), 0);
+        assert!(b.is_empty());
+    }
+
+    #[test]
+    fn duration_seconds_reflects_total() {
+        let mut b = AudioBuffer::new(&cfg(10, DropPolicy::DropOldest), 16000);
+        b.push(BufferedChunk { samples: vec![1i16; 16000], timestamp_ns: 0 }); // 1秒分
+        b.push(BufferedChunk { samples: vec![2i16; 8000], timestamp_ns: 1_000_000_000 }); // 0.5秒分
+        assert!((b.duration_seconds() - 1.5).abs() < 0.01);
     }
 }

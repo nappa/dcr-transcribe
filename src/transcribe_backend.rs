@@ -1,3 +1,6 @@
+// trait の channel_id() メソッドは現時点で呼び出し元なし、将来用に保持
+#![allow(dead_code)]
+
 use crate::types::TranscriptResult;
 use anyhow::Result;
 use async_trait::async_trait;

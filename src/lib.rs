@@ -47,6 +47,7 @@ pub mod channel_processor;
 pub mod config;
 pub mod flac_encoder;
 pub mod opus_encoder;
+pub mod remote_server;
 pub mod transcribe;
 pub mod transcribe_backend;
 pub mod tui_state;
