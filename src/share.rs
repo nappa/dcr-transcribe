@@ -1,4 +1,4 @@
-//! 閲覧画面のログイン URL と QR コード(TUI で表示する)
+//! 閲覧画面のログイン URL と QR コード(TUI と閲覧画面の「共有」で表示する)
 
 use crate::config::{RemoteConfig, TunnelConfig};
 use anyhow::{Context, Result};
@@ -65,6 +65,31 @@ pub fn qr_modules(text: &str) -> Result<Vec<Vec<bool>>> {
         }
     }
     Ok(rows)
+}
+
+/// QR コードの SVG(閲覧画面の「共有」で表示する)。黒の連続は 1 本の矩形にまとめて小さくする
+pub fn qr_svg(text: &str) -> Result<String> {
+    let m = qr_modules(text)?;
+    let n = m.len();
+    let mut rects = String::new();
+    for (y, row) in m.iter().enumerate() {
+        let mut x = 0;
+        while x < n {
+            if !row[x] {
+                x += 1;
+                continue;
+            }
+            let start = x;
+            while x < n && row[x] {
+                x += 1;
+            }
+            rects.push_str(&format!("M{} {}h{}v1h-{}z", start, y, x - start, x - start));
+        }
+    }
+    Ok(format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {n} {n}\" shape-rendering=\"crispEdges\">\
+         <rect width=\"{n}\" height=\"{n}\" fill=\"#fff\"/><path fill=\"#000\" d=\"{rects}\"/></svg>"
+    ))
 }
 
 #[cfg(test)]
@@ -143,5 +168,15 @@ mod tests {
         assert_eq!(grids.len(), 1);
         let (_, content) = grids[0].decode().unwrap();
         assert_eq!(content, url);
+    }
+
+    #[test]
+    fn svg_has_one_path_for_dark_modules() {
+        let svg = qr_svg("https://t.example.com/?k=abc").unwrap();
+        let n = qr_modules("https://t.example.com/?k=abc").unwrap().len();
+        assert!(svg.starts_with("<svg") && svg.ends_with("</svg>"));
+        assert!(svg.contains(&format!("viewBox=\"0 0 {n} {n}\"")));
+        assert_eq!(svg.matches("<path").count(), 1);
+        assert!(svg.len() < 8_000, "{}", svg.len());
     }
 }

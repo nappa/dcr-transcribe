@@ -39,6 +39,31 @@ body{
 .s.off{background:#4a1a1a;color:#f99}
 .s.reco{background:#4a3a1a;color:#fc6}
 .s.chain{background:#1a3a4a;color:#8cf;cursor:pointer}
+.shb{
+  font:inherit;font-size:11px;padding:3px 10px;border-radius:10px;border:1px solid #3a4150;
+  background:transparent;color:var(--fg);cursor:pointer;white-space:nowrap;
+}
+/* 共有の窓(スマホは下から、PC は中央) */
+.modal{position:fixed;inset:0;z-index:30;background:rgba(0,0,0,.55);display:flex;align-items:flex-end;justify-content:center}
+.modal[hidden]{display:none}
+.sheet{
+  background:var(--bg2);width:100%;max-width:420px;border-radius:16px 16px 0 0;
+  padding:16px 16px calc(16px + var(--safe-bot));text-align:center;
+}
+.sheet .hd{display:flex;align-items:center;font-weight:600;margin-bottom:12px}
+.sheet .hd span{flex:1;text-align:left}
+.sheet .x{border:none;background:transparent;color:var(--muted);font-size:18px;cursor:pointer;padding:0 4px}
+.sheet img{width:min(64vw,240px);aspect-ratio:1;background:#fff;padding:8px;border-radius:8px;image-rendering:pixelated}
+.sheet .url{margin:10px 0 4px;font-size:12px;word-break:break-all;color:var(--muted);user-select:all}
+.sheet .warn{margin:0 0 12px;font-size:11px;color:#fc6}
+.sheet .btns{display:flex;gap:8px}
+.sheet .btns button{flex:1;min-height:40px;border:none;border-radius:10px;font:inherit;font-weight:600;cursor:pointer;background:#2a4060;color:#fff}
+.sheet .btns button[hidden]{display:none}
+.sheet .msg{margin:10px 0 0;font-size:12px;color:#9f9;min-height:1.5em}
+@media(min-width:900px){
+  .modal{align-items:center}
+  .sheet{border-radius:16px}
+}
 .s.chain[hidden]{display:none}
 .chips{
   display:flex;gap:6px;overflow-x:auto;-webkit-overflow-scrolling:touch;
@@ -184,6 +209,7 @@ body{
   <div class="tr">
     <h1>dcr-transcribe</h1>
     <span class="s chain" id="chain" hidden></span>
+    <button class="shb" id="share" title="閲覧画面のリンクを共有">共有</button>
     <span class="s off" id="s">未接続</span>
   </div>
   <nav class="tabs" id="tabs"></nav>
@@ -201,6 +227,16 @@ body{
 </main>
 </div>
 <button class="fab" id="fab">↑ 最新へ</button>
+<div class="modal" id="shm" hidden>
+  <div class="sheet" role="dialog" aria-modal="true" aria-label="閲覧画面を共有">
+    <div class="hd"><span>閲覧画面を共有</span><button class="x" id="shx" aria-label="閉じる">✕</button></div>
+    <img id="shqr" alt="ログイン用の QR コード">
+    <div class="url" id="shurl"></div>
+    <p class="warn">このリンクを知っている人は閲覧できます</p>
+    <div class="btns"><button id="shnative">共有…</button><button id="shcopy">コピー</button></div>
+    <p class="msg" id="shmsg"></p>
+  </div>
+</div>
 <script>
 (function(){
 var liveBar=document.getElementById("live"),lchips=document.getElementById("lchips"),lplay=document.getElementById("lplay");
@@ -974,8 +1010,48 @@ document.addEventListener("visibilitychange",function(){
   }
 });
 
+// ── 閲覧画面の共有(ログイン URL を共有シート・コピー・QR で渡す) ──
+// 画面側はログインキーを持っていない(ログイン後に URL から消している)ので、ログイン済みの人だけが使える /share から受け取る
+var shm=document.getElementById("shm"),shurl=document.getElementById("shurl"),shqr=document.getElementById("shqr"),
+    shmsg=document.getElementById("shmsg"),shnative=document.getElementById("shnative"),shareUrl="";
+document.getElementById("share").onclick=function(){
+  fetch("/share",{cache:"no-store"}).then(function(r){
+    if(!r.ok)throw new Error("HTTP "+r.status);
+    return r.json();
+  }).then(function(d){
+    shareUrl=location.origin+d.path;
+    shurl.textContent=shareUrl;
+    shqr.src="/share/qr.svg?u="+encodeURIComponent(shareUrl);
+    shnative.hidden=!navigator.share;
+    shmsg.textContent="";
+    shm.hidden=false;
+  }).catch(function(){alert("共有用のリンクを取得できませんでした")});
+};
+function closeShare(){shm.hidden=true}
+document.getElementById("shx").onclick=closeShare;
+shm.onclick=function(e){if(e.target===shm)closeShare()};
+shnative.onclick=function(){
+  navigator.share({title:"dcr-transcribe",url:shareUrl}).catch(function(){});
+};
+document.getElementById("shcopy").onclick=function(){
+  function done(){shmsg.textContent="コピーしました"}
+  if(navigator.clipboard&&navigator.clipboard.writeText){
+    navigator.clipboard.writeText(shareUrl).then(done).catch(fallback);
+  }else fallback();
+  // 古いブラウザ向け
+  function fallback(){
+    var t=document.createElement("textarea");
+    t.value=shareUrl;t.style.position="fixed";t.style.opacity="0";
+    document.body.appendChild(t);t.select();
+    try{document.execCommand("copy");done()}catch(_){shmsg.textContent="コピーできませんでした。URL を長押ししてコピーしてください"}
+    document.body.removeChild(t);
+  }
+};
+
 // PC 向けのキー操作
 document.addEventListener("keydown",function(e){
+  // 共有の窓が開いている間は Esc で閉じるだけ
+  if(!shm.hidden){if(e.key==="Escape")closeShare();return}
   if(e.metaKey||e.ctrlKey||e.altKey||/INPUT|TEXTAREA/.test(e.target.tagName))return;
   if(e.key==="0"){setView("all");return}
   if(/^[1-9]$/.test(e.key)){

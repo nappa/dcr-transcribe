@@ -17,6 +17,8 @@
 //! - `GET /healthz` - "ok" 返却
 //! - `POST /verify` - Turnstile のトークンを検証してセッションクッキーを発行
 //! - `GET /session` - セッションが有効なら 204(期限切れを画面側で検知するため)
+//! - `GET /share` - 共有用のログインパス(`{"path":"/?k=..."}`)。ログイン済みの人だけ
+//! - `GET /share/qr.svg?u=<URL>` - URL の QR コード(SVG)。ログイン済みの人だけ
 //!
 //! # アクセス制限 (`crate::access`)
 //!
@@ -618,6 +620,8 @@ fn router(state: Arc<RemoteState>) -> Router {
         .route("/live", get(serve_live))
         .route("/verify", post(serve_verify))
         .route("/session", get(serve_session))
+        .route("/share", get(serve_share))
+        .route("/share/qr.svg", get(serve_share_qr))
         .route("/healthz", get(serve_health))
         .layer(middleware::from_fn_with_state(state.clone(), guard))
         .with_state(state)
@@ -743,6 +747,37 @@ async fn serve_verify(
             log::warn!("Remote: bot 確認に失敗 (ip={:?}): {}", remote_ip, e);
             (StatusCode::FORBIDDEN, "verification failed").into_response()
         }
+    }
+}
+
+/// 共有用のログインパス。ログイン済み(= キーを知っている)人だけが取れる(guard で確認済み)
+async fn serve_share(State(state): State<Arc<RemoteState>>) -> Response {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json"), (header::CACHE_CONTROL, "no-store")],
+        serde_json::json!({ "path": state.login_path() }).to_string(),
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
+struct ShareQrQuery {
+    u: String,
+}
+
+/// 共有 URL の QR コード(SVG)
+async fn serve_share_qr(Query(q): Query<ShareQrQuery>) -> Response {
+    if q.u.is_empty() || q.u.len() > 512 {
+        return (StatusCode::BAD_REQUEST, "invalid url").into_response();
+    }
+    match crate::share::qr_svg(&q.u) {
+        Ok(svg) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "image/svg+xml"), (header::CACHE_CONTROL, "private, no-store")],
+            svg,
+        )
+            .into_response(),
+        Err(_) => (StatusCode::BAD_REQUEST, "invalid url").into_response(),
     }
 }
 
@@ -2181,5 +2216,32 @@ mod tests {
             let err = start(cfg, &[], SystemTime::now(), false, None).await.err().expect("起動しない");
             assert!(err.to_string().contains("login_key"), "{}", err);
         }
+    }
+
+    #[tokio::test]
+    async fn http_share_requires_login_and_returns_login_path() {
+        let addr = boot(with_login_key(make_state(false, 10))).await;
+        let client = no_redirect();
+        for path in ["/share", "/share/qr.svg?u=https%3A%2F%2Fx"] {
+            let r = client.get(format!("http://{}{}", addr, path)).send().await.unwrap();
+            assert_eq!(r.status(), 403, "{}", path);
+        }
+        let cookie = login_cookie(&client, addr).await;
+        let r = client.get(format!("http://{}/share", addr)).header("Cookie", &cookie).send().await.unwrap();
+        assert_eq!(r.status(), 200);
+        let j: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(j["path"], "/?k=key123");
+
+        let r = client
+            .get(format!("http://{}/share/qr.svg?u=https%3A%2F%2Ft.example.com%2F%3Fk%3Dkey123", addr))
+            .header("Cookie", &cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        assert_eq!(r.headers()["content-type"], "image/svg+xml");
+        assert!(r.text().await.unwrap().starts_with("<svg"));
+        let r = client.get(format!("http://{}/share/qr.svg?u=", addr)).header("Cookie", &cookie).send().await.unwrap();
+        assert_eq!(r.status(), 400);
     }
 }
