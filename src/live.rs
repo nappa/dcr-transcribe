@@ -8,7 +8,7 @@
 //! - どのミックスも無いときは `active` フラグを落とし、入力側はフレームを作らない
 //! - 同じコールバック由来のサンプルを足すので、チャンネル間の時間ずれは起きない
 
-use crate::aac::AacEncoder;
+use crate::aac::{AacEncoder, AacProfile};
 use anyhow::{bail, Result};
 use axum::body::Bytes;
 use std::collections::HashMap;
@@ -35,6 +35,7 @@ struct Mix {
 pub struct LiveHub {
     sample_rate: u32,
     bitrate: u32,
+    profile: AacProfile,
     /// 配信してよいチャンネル(有効なチャンネル)
     channels: Vec<usize>,
     /// キーは昇順・重複なしのチャンネル ID 列
@@ -43,10 +44,11 @@ pub struct LiveHub {
 }
 
 impl LiveHub {
-    pub fn new(sample_rate: u32, bitrate: u32, channels: Vec<usize>) -> Arc<Self> {
+    pub fn new(sample_rate: u32, bitrate: u32, profile: AacProfile, channels: Vec<usize>) -> Arc<Self> {
         Arc::new(Self {
             sample_rate,
             bitrate,
+            profile,
             channels,
             mixes: Mutex::new(HashMap::new()),
             active: Arc::new(AtomicBool::new(false)),
@@ -79,7 +81,7 @@ impl LiveHub {
         mixes.insert(
             key,
             Mix {
-                encoder: AacEncoder::new(self.sample_rate, self.bitrate)?,
+                encoder: AacEncoder::new(self.sample_rate, self.bitrate, self.profile)?,
                 tx,
                 buf: Vec::new(),
             },
@@ -162,7 +164,7 @@ mod tests {
 
     #[test]
     fn subscribe_validates_channels() {
-        let hub = LiveHub::new(48000, 48000, vec![2, 3]);
+        let hub = LiveHub::new(48000, 48000, AacProfile::Lc, vec![2, 3]);
         assert!(hub.subscribe(&[]).is_err());
         assert!(hub.subscribe(&[1]).is_err());
         assert!(hub.subscribe(&[2, 9]).is_err());
@@ -173,7 +175,7 @@ mod tests {
 
     #[test]
     fn listeners_of_same_set_share_one_mix() {
-        let hub = LiveHub::new(48000, 48000, vec![2, 3]);
+        let hub = LiveHub::new(48000, 48000, AacProfile::Lc, vec![2, 3]);
         let _a = hub.subscribe(&[2, 3]).unwrap();
         let _b = hub.subscribe(&[3, 2]).unwrap();
         let _c = hub.subscribe(&[2]).unwrap();
@@ -182,7 +184,7 @@ mod tests {
 
     #[test]
     fn delivers_adts_and_drops_mix_without_listeners() {
-        let hub = LiveHub::new(48000, 48000, vec![0, 1]);
+        let hub = LiveHub::new(48000, 48000, AacProfile::Lc, vec![0, 1]);
         let mut rx = hub.subscribe(&[0, 1]).unwrap();
 
         // 10 ms × 30 = 300 ms 分 → AAC フレーム(1024 サンプル)が十数個出る

@@ -10,12 +10,20 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
+/// デバイスの表示名(cpal 0.17 以降は `description()` 経由)
+pub fn cpal_device_name(device: &cpal::Device) -> Result<String> {
+    Ok(device.description()?.name().to_string())
+}
+
 /// オーディオデバイスからのマルチチャンネル音声入力
 pub struct AudioInput {
     device: cpal::Device,
     config: cpal::StreamConfig,
     stream: Option<cpal::Stream>,
+    /// 設定上のチャンネル数(下流に流すチャンネル数)
     num_channels: u16,
+    /// 実際にデバイスから開くチャンネル数。設定より少なければ残りは無音で埋める
+    device_channels: u16,
     live_tap: Option<LiveTap>,
 }
 
@@ -41,11 +49,11 @@ impl AudioInput {
             // デバイスIDが指定されている場合は、デバイス一覧から検索
             Self::input_devices()?
                 .into_iter()
-                .find(|d| d.name().ok().as_deref() == Some(&config.device_id))
+                .find(|d| cpal_device_name(d).ok().as_deref() == Some(config.device_id.as_str()))
                 .with_context(|| format!("デバイスが見つかりません: {}", config.device_id))?
         };
 
-        log::info!("入力デバイス: {:?}", device.name());
+        log::info!("入力デバイス: {:?}", cpal_device_name(&device));
 
         // デバイスの設定を取得
         let default_config = device
@@ -55,14 +63,31 @@ impl AudioInput {
         log::info!(
             "デバイス設定: {:?}, {}Hz, {}ch",
             default_config.sample_format(),
-            default_config.sample_rate().0,
+            default_config.sample_rate(),
             default_config.channels()
         );
 
+        // デバイスが持つ以上のチャンネルは開けないので、足りない分は無音のチャンネルとして扱う
+        // (例: モノラルの内蔵マイクで 3ch 構成をテストする)
+        let device_max_channels = device
+            .supported_input_configs()
+            .ok()
+            .and_then(|configs| configs.map(|c| c.channels()).max())
+            .unwrap_or(default_config.channels());
+        let device_channels = config.channels.min(device_max_channels);
+        if device_channels < config.channels {
+            log::warn!(
+                "入力デバイスは {}ch のため、チャンネル {}〜{} は無音として扱います",
+                device_channels,
+                device_channels,
+                config.channels - 1
+            );
+        }
+
         // ストリーム設定を作成
         let stream_config = cpal::StreamConfig {
-            channels: config.channels,
-            sample_rate: cpal::SampleRate(config.sample_rate),
+            channels: device_channels,
+            sample_rate: config.sample_rate,
             buffer_size: cpal::BufferSize::Fixed(4096),
         };
 
@@ -71,6 +96,7 @@ impl AudioInput {
             config: stream_config,
             stream: None,
             num_channels: config.channels,
+            device_channels,
             live_tap: None,
         })
     }
@@ -89,7 +115,7 @@ impl AudioInput {
     /// Result<()>
     pub fn start(&mut self, channel_senders: Vec<Option<mpsc::Sender<AudioChunk>>>) -> Result<()> {
         let num_channels = self.num_channels;
-        let sample_rate = self.config.sample_rate.0;
+        let sample_rate = self.config.sample_rate;
 
         // デバイスのデフォルトフォーマットを取得
         let default_config = self.device.default_input_config()?;
@@ -140,6 +166,7 @@ impl AudioInput {
 
         let drop_counters_cb = drop_counters.clone();
         let live_tap = self.live_tap.clone();
+        let device_channels = self.device_channels as usize;
         let data_callback = move |data: &[T], _info: &cpal::InputCallbackInfo| {
             let live_on = live_tap
                 .as_ref()
@@ -153,7 +180,7 @@ impl AudioInput {
                 .as_nanos();
 
             // インターリーブされたデータを各チャンネルに分離
-            let samples_per_channel = data.len() / num_channels as usize;
+            let samples_per_channel = data.len() / device_channels;
 
             // 各チャンネルを順次処理
             for ch in 0..num_channels as usize {
@@ -164,10 +191,22 @@ impl AudioInput {
                     continue;
                 };
 
-                // このチャンネルのサンプルを抽出
+                // このチャンネルのサンプルを抽出(デバイスに無いチャンネルは無音)
+                if ch >= device_channels {
+                    let silence = vec![0i16; samples_per_channel];
+                    if live_on {
+                        live_channels.push((ch, silence.clone()));
+                    }
+                    let _ = sender.try_send(AudioChunk {
+                        samples: silence,
+                        format: AudioFormat { sample_rate, channels: 1 },
+                        timestamp_ns,
+                    });
+                    continue;
+                }
                 let mut channel_samples = Vec::with_capacity(samples_per_channel);
                 for frame in 0..samples_per_channel {
-                    let idx = frame * num_channels as usize + ch;
+                    let idx = frame * device_channels + ch;
                     if idx < data.len() {
                         let sample = data[idx];
                         let f = sample.to_float_sample().into();
@@ -229,7 +268,7 @@ impl AudioInput {
 
         let stream = self
             .device
-            .build_input_stream(&self.config, data_callback, error_callback, None)
+            .build_input_stream(self.config.clone(), data_callback, error_callback, None)
             .context("入力ストリームの構築に失敗")?;
 
         Ok(stream)
@@ -250,15 +289,15 @@ impl AudioInput {
         println!();
 
         for (idx, device) in Self::input_devices()?.into_iter().enumerate() {
-            let name = device.name()?;
+            let name = cpal_device_name(&device)?;
             println!("  [{}] {}", idx, name);
 
             device.supported_input_configs()?.for_each(|config_range| {
                 println!(
                     "      フォーマット: {:?}, {}-{}Hz, {}ch",
                     config_range.sample_format(),
-                    config_range.min_sample_rate().0,
-                    config_range.max_sample_rate().0,
+                    config_range.min_sample_rate(),
+                    config_range.max_sample_rate(),
                     config_range.channels()
                 );
             });
@@ -274,7 +313,7 @@ impl AudioInput {
         let devices = host
             .input_devices()?
             .filter(|device| {
-                if let Ok(name) = device.name() {
+                if let Ok(name) = cpal_device_name(&device) {
                     // 除外するデバイス名のリスト
                     let excluded_names_regex = Regex::new("MacBook (Air|Pro)|AirPods|iPhone|Webcam|Background|Microsoft Teams|ZoomAudioDevice").unwrap();
                     if excluded_names_regex.is_match(&name) {

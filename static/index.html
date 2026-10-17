@@ -26,7 +26,8 @@ body{
   -webkit-text-size-adjust:100%;
   padding-left:var(--safe-l);padding-right:var(--safe-r);
 }
-header{
+/* スマホ: 上部に固定ヘッダ(タブ + ライブ)。PC: 左サイドバー(下の @media) */
+#side{
   position:sticky;top:0;z-index:10;
   background:var(--bg2);border-bottom:1px solid var(--border);
   padding:calc(8px + var(--safe-top)) 12px 6px;
@@ -51,6 +52,33 @@ header{
   min-height:30px;display:flex;align-items:center;
 }
 .chip.on{background:var(--ch-bg);color:var(--ch-fg);border-color:var(--ch-fg)}
+/* チャンネルタブ(表示するチャンネルの切り替え + 受信状態) */
+.tabs{
+  display:flex;gap:6px;overflow-x:auto;-webkit-overflow-scrolling:touch;
+  margin:0 -12px 2px;padding:0 12px 6px;scrollbar-width:none;
+}
+.tabs::-webkit-scrollbar{display:none}
+.tab{
+  flex-shrink:0;position:relative;display:flex;flex-direction:column;gap:3px;
+  min-width:72px;padding:6px 10px 7px;border-radius:10px;border:1px solid transparent;
+  background:#22252d;color:var(--muted);font:inherit;font-size:12px;text-align:left;cursor:pointer;
+}
+.tab.sel{background:var(--ch-bg,#2a3550);color:var(--ch-fg,#cfe0ff);border-color:var(--ch-fg,#6c8fd8)}
+.tab .tn{display:flex;align-items:center;gap:6px;font-weight:600;white-space:nowrap}
+.tab .dot{width:8px;height:8px;border-radius:50%;background:#444a55;flex-shrink:0}
+.tab.rx .dot{background:#ff4d4d;box-shadow:0 0 0 3px rgba(255,77,77,.25)}
+.tab .meter{height:3px;border-radius:2px;background:#2f333c;overflow:hidden}
+.tab .meter i{display:block;height:100%;width:0;background:var(--ch-fg,#8aa);transition:width .25s}
+.tab.rx .meter i{background:#ff6b6b}
+.tab .tst{display:none;font-size:11px;font-variant-numeric:tabular-nums}
+.tab .tx{margin-left:auto;font-size:10px;font-weight:600;padding:0 5px;border-radius:6px;background:#333842;color:#778}
+.tab .tx.on{background:#1a4a2a;color:#9f9}
+.tab .tx.err{background:#4a1a1a;color:#f99}
+.tab.unknown .dot,.tab.unknown .meter i{opacity:.3}
+@media(prefers-reduced-motion:no-preference){
+  .tab.rx .dot{animation:pulse 1s ease-in-out infinite}
+  @keyframes pulse{50%{box-shadow:0 0 0 6px rgba(255,77,77,0)}}
+}
 .live{display:flex;align-items:center;gap:8px;margin-top:4px}
 .live[hidden]{display:none}
 .live .lbl{font-size:11px;color:var(--muted);flex-shrink:0}
@@ -70,7 +98,12 @@ header{
 #older:active{background:var(--bg2)}
 #log{padding:0}
 #older{margin-bottom:calc(80px + var(--safe-bot))}
+#empty{padding:40px 16px;text-align:center;color:var(--muted);font-size:13px}
 .r.now{box-shadow:inset 3px 0 0 var(--ch-fg)}
+/* 同じ録音区間の行が続くときは 1 かたまりに見せる(▶ は一番上の行だけ) */
+.r.joined{border-bottom-color:transparent;padding-bottom:2px}
+.r.cont{padding-top:2px}
+.r.cont .name{visibility:hidden}
 .r{padding:9px 12px;border-bottom:1px solid var(--border);background:var(--ch-bg)}
 .r .meta{display:flex;gap:8px;font-size:11px;color:var(--muted);margin-bottom:3px}
 .r .name{color:var(--ch-fg);font-weight:600}
@@ -112,34 +145,69 @@ header{
   .r{animation:in .18s ease-out}
   @keyframes in{from{opacity:0;transform:translateY(4px)}}
 }
+/* PC: 左にチャンネルのカード、右に読みやすい幅のタイムライン */
+@media(min-width:900px){
+  body{font-size:16px}
+  .app{display:grid;grid-template-columns:300px minmax(0,1fr)}
+  #side{
+    position:sticky;top:0;height:100vh;overflow-y:auto;
+    border-bottom:none;border-right:1px solid var(--border);padding:16px;
+  }
+  .tr h1{font-size:16px}
+  .tabs{flex-direction:column;overflow:visible;margin:8px 0 14px;padding:0;gap:8px}
+  .tab{min-width:0;padding:10px 12px;font-size:13px;gap:6px}
+  .tab .meter{height:5px}
+  .tab .tst{display:block;color:var(--muted)}
+  .tab.rx .tst{color:#ff8a8a}
+  .tab:hover{border-color:#3a3f4a}
+  .live{flex-wrap:wrap;margin-top:0}
+  .live .lbl{width:100%;font-size:12px}
+  .live .chips{flex-wrap:wrap;overflow:visible;flex:1 1 100%}
+  .lp{width:100%;min-height:36px;font-size:13px}
+  main{max-width:880px;width:100%;justify-self:center}
+  .r{padding:11px 20px}
+  .r .x{font-size:16px;line-height:1.6}
+  .r:hover{filter:brightness(1.12)}
+  .fab{left:calc(300px + (100vw - 300px)/2)}
+  .keys{display:block}
+}
+.keys{display:none;margin-top:14px;font-size:11px;color:var(--muted);line-height:1.7}
+.keys kbd{background:#2a2d34;border-radius:4px;padding:0 5px;font-family:inherit}
 </style>
 </head>
 <body>
-<header>
+<div class="app">
+<aside id="side">
   <div class="tr">
     <h1>dcr-transcribe</h1>
     <span class="s chain" id="chain" hidden></span>
     <span class="s off" id="s">未接続</span>
   </div>
-  <div class="chips" id="chips"></div>
+  <nav class="tabs" id="tabs"></nav>
   <div class="live" id="live" hidden>
     <span class="lbl">ライブ</span>
     <div class="chips" id="lchips"></div>
     <button class="lp" id="lplay">▶ 聞く</button>
   </div>
-</header>
-<div id="log"></div>
-<div id="older">↓ もっと前を読み込む</div>
+  <div class="keys"><kbd>0</kbd> すべて <kbd>1</kbd>〜<kbd>9</kbd> チャンネル <kbd>L</kbd> ライブ <kbd>Esc</kbd> 再生停止</div>
+</aside>
+<main>
+  <div id="log"></div>
+  <div id="empty" hidden>まだ受信していません</div>
+  <div id="older">↓ もっと前を読み込む</div>
+</main>
+</div>
 <button class="fab" id="fab">↑ 最新へ</button>
 <script>
 (function(){
 var liveBar=document.getElementById("live"),lchips=document.getElementById("lchips"),lplay=document.getElementById("lplay");
-var log=document.getElementById("log"),stat=document.getElementById("s"),chipsBox=document.getElementById("chips"),fab=document.getElementById("fab"),older=document.getElementById("older");
+var log=document.getElementById("log"),stat=document.getElementById("s"),tabsBox=document.getElementById("tabs"),fab=document.getElementById("fab"),older=document.getElementById("older"),emptyEl=document.getElementById("empty");
 var p=new URLSearchParams(location.search);
 var token=p.get("t")||"";
 var wantP=p.get("p")==="1";
-var HIDE="dcr-hide";
-var hidden=new Set(JSON.parse(localStorage.getItem(HIDE)||"[]"));
+var TAB="dcr-tab";
+// 表示するチャンネル("all" かチャンネル ID)
+var view=localStorage.getItem(TAB)||"all";
 var LIVE="dcr-live";
 var liveSel=new Set(JSON.parse(localStorage.getItem(LIVE)||"[]"));
 
@@ -171,34 +239,91 @@ function atTop(){return window.scrollY<80}
 function nearBottom(){return(window.innerHeight+window.scrollY)>=document.documentElement.scrollHeight-200}
 function scrollTop(){window.scrollTo(0,0)}
 
-function applyHidden(){
-  var st=document.getElementById("hs");
-  if(!st){st=document.createElement("style");st.id="hs";document.head.appendChild(st)}
-  // ログの行だけを隠す(チップまで隠すと戻せなくなる)
-  st.textContent=Array.from(hidden).map(function(c){return"#log .c"+c+"{display:none}"}).join("");
-}
-function persist(){localStorage.setItem(HIDE,JSON.stringify(Array.from(hidden)))}
-applyHidden();
+function visible(c){return view==="all"||+view===c}
 
-function makeChip(id,name){
-  var b=document.createElement("div");
-  b.className="chip c"+id+(hidden.has(id)?"":" on");
-  b.textContent=name;
-  b.onclick=function(){
-    if(hidden.has(id)){hidden.delete(id);b.classList.add("on")}
-    else{hidden.add(id);b.classList.remove("on")}
-    applyHidden();persist();
-  };
+// ── チャンネルタブ ──
+// 選んだチャンネル以外の行を CSS で隠す(DOM はそのまま)
+function applyView(){
+  var st=document.getElementById("vs");
+  if(!st){st=document.createElement("style");st.id="vs";document.head.appendChild(st)}
+  st.textContent=view==="all"?"":"#log>*:not(.c"+(+view)+"){display:none}";
+  tabsBox.querySelectorAll(".tab").forEach(function(t){t.classList.toggle("sel",t.dataset.v===String(view))});
+  updateEmpty();
+}
+function setView(v){
+  view=String(v);
+  try{localStorage.setItem(TAB,view)}catch(_){}
+  applyView();
+  scrollTop();
+}
+function updateEmpty(){
+  var any=view==="all"?log.firstChild:log.querySelector(".c"+(+view));
+  emptyEl.hidden=!!any;
+}
+function makeTab(v,name){
+  var b=document.createElement("button");
+  b.className="tab"+(v==="all"?"":" c"+v+" unknown");
+  b.dataset.v=v;
+  b.innerHTML='<span class="tn">'+(v==="all"?"":'<span class="dot"></span>')+'<span>'+esc(name)+'</span>'+(v==="all"?"":'<span class="tx" title="Transcribe">T</span>')+'</span>'
+    +(v==="all"?'<span class="tst" data-all></span>':'<span class="meter"><i></i></span><span class="tst">—</span>');
+  b.onclick=function(){setView(v)};
   return b;
 }
+
+// ── 受信状態(event: st) ──
+// [c, 音量dB, 受信中, Transcribe(0=未接続 1=接続中 2=エラー)]。変化したチャンネルだけ届く
+var chs={};   // c -> {l, r, x, since(受信開始), last(最後に受信していた時刻)}
+function applyStatus(list){
+  var now=Date.now();
+  list.forEach(function(a){
+    var c=a[0],cur=chs[c]||{};
+    var r=a[2]===1;
+    if(r&&!cur.r)cur.since=now;
+    if(!r&&cur.r)cur.last=now;
+    cur.l=a[1];cur.r=r;cur.x=a[3];
+    chs[c]=cur;
+    drawTab(c);
+  });
+  drawAllTab();
+}
+function ago(ms){
+  var s=Math.floor(ms/1000);
+  if(s<60)return s+"秒";
+  if(s<3600)return Math.floor(s/60)+"分";
+  return Math.floor(s/3600)+"時間";
+}
+function drawTab(c){
+  var t=tabsBox.querySelector('.tab[data-v="'+c+'"]'),st=chs[c];
+  if(!t||!st)return;
+  t.classList.remove("unknown");
+  t.classList.toggle("rx",st.r);
+  t.querySelector(".meter i").style.width=Math.max(0,Math.min(100,(st.l+60)/60*100))+"%";
+  var tx=t.querySelector(".tx");
+  tx.className="tx"+(st.x===1?" on":st.x===2?" err":"");
+  tx.title=st.x===1?"Transcribe 接続中":st.x===2?"Transcribe エラー":"Transcribe 未接続";
+  var now=Date.now();
+  t.querySelector(".tst").textContent=st.r?"受信中 "+ago(now-st.since)
+    :st.last?"最終受信 "+ago(now-st.last)+"前":"待機中";
+}
+function drawAllTab(){
+  var t=tabsBox.querySelector("[data-all]");
+  if(!t)return;
+  var n=0;for(var c in chs)if(chs[c].r)n++;
+  t.textContent=n?"受信中 "+n+" ch":"";
+  t.closest(".tab").classList.toggle("rx",n>0);
+}
+// 経過秒の表示を進める(通信なし)
+setInterval(function(){for(var c in chs)drawTab(c)},1000);
+// 切断中は状態が古いので薄く表示
+function markStatusUnknown(){tabsBox.querySelectorAll(".tab[data-v]:not([data-v=all])").forEach(function(t){t.classList.add("unknown")})}
 
 function makeRow(id,e){
   var d=document.createElement("div");
   d.className="r c"+e.c+(e.p?" p":"");
   if(id)d.dataset.id=id;
+  if(e.g)d.dataset.g=e.g;
   var n=names[e.c]!==undefined?names[e.c]:"ch"+e.c;
   d.innerHTML='<div class="meta"><span class="name">'+esc(n)+'</span><span class="ts">'+fmtMs(msOf(e.s))+'</span></div><div class="x">'+esc(e.x)+'</div>';
-  if(e.g)d.querySelector(".meta").appendChild(makePlay(e.g));
   return d;
 }
 
@@ -232,28 +357,64 @@ function setPlay(b){
   b.classList.toggle("on",g===playingId);
   // 一覧に無いのは、まだ録音中か、サーバの保持件数を超えて消えたもの
   b.textContent=!sg?(g<=maxSegId?"録音なし":"録音中"):g===playingId?"■ 停止":"▶ "+(sg.d/1000).toFixed(1)+"秒";
-  var row=b.closest(".r");
-  if(row)row.classList.toggle("now",g===playingId);
 }
 function refreshPlay(g){
   log.querySelectorAll('.pl[data-g="'+g+'"]').forEach(setPlay);
+  log.querySelectorAll('.r[data-g="'+g+'"]').forEach(function(r){r.classList.toggle("now",g===playingId)});
+}
+// 同じ録音区間の行のうち、一番上(新しい側)の行にだけ ▶ を置き、隣り合う行をつなげて見せる
+function groupSeg(g){
+  var rows=log.querySelectorAll('.r[data-g="'+g+'"]');
+  for(var i=0;i<rows.length;i++){
+    var r=rows[i],b=r.querySelector(".pl");
+    if(i===0){if(!b)r.querySelector(".meta").appendChild(makePlay(g))}
+    else if(b)b.remove();
+    var next=r.nextElementSibling,prev=r.previousElementSibling;
+    r.classList.toggle("joined",!!next&&next.dataset.g===String(g));
+    r.classList.toggle("cont",!!prev&&prev.dataset.g===String(g));
+  }
+  refreshPlay(g);
+}
+// 行を挿入したら、その行と上下の行が属するかたまりを組み直す
+function regroupAround(d){
+  var gs={};
+  [d,d.previousElementSibling,d.nextElementSibling].forEach(function(r){if(r&&r.dataset.g)gs[r.dataset.g]=1});
+  for(var g in gs)groupSeg(+g);
 }
 
 // ── ライブ再生(選んだチャンネルをサーバでミックスした AAC ストリーム) ──
-var liveAudio=null,liveWanted=false,liveRetry=0,resumeLive=false;
+// 細い・揺れる回線向けに、ブラウザ内に溜まった分(=遅延)を監視して追いつかせる:
+//   1.5 秒超: 少し速く再生 / 4 秒超: 今の音まで飛ぶ / 6 秒以上止まったまま: つなぎ直す
+var liveAudio=null,liveWanted=false,liveRetry=0,resumeLive=false,liveWaitSince=0,liveLag=0;
+var LIVE_FAST_LAG=1.5,LIVE_JUMP_LAG=4,LIVE_STALL_MS=6000;
 function liveUi(state){
   lplay.className="lp"+(state==="on"?" on":state==="wait"?" wait":"");
-  lplay.textContent=state==="on"?"■ 停止":state==="wait"?"接続中…":"▶ 聞く";
+  lplay.textContent=state==="on"?"■ 停止"+(liveLag>1?"(遅延 "+liveLag.toFixed(1)+"秒)":""):state==="wait"?"接続中…":"▶ 聞く";
 }
+setInterval(function(){
+  if(!liveWanted||!liveAudio)return;
+  var a=liveAudio;
+  if(liveWaitSince&&Date.now()-liveWaitSince>LIVE_STALL_MS){startLive();return}
+  if(!a.buffered.length||a.paused)return;
+  var end=a.buffered.end(a.buffered.length-1);
+  liveLag=Math.max(0,end-a.currentTime);
+  if(liveLag>LIVE_JUMP_LAG){
+    try{a.currentTime=end-0.5}catch(_){}
+    a.playbackRate=1;
+  }else{
+    a.playbackRate=liveLag>LIVE_FAST_LAG?1.1:1;
+  }
+  if(!liveWaitSince)liveUi("on");
+},1000);
 function startLive(){
-  var chs=Array.from(liveSel).sort(function(a,b){return a-b});
-  if(!chs.length){lplay.textContent="ch を選択";setTimeout(function(){liveUi("off")},1200);return}
+  var sel=Array.from(liveSel).sort(function(a,b){return a-b});
+  if(!sel.length){lplay.textContent="ch を選択";setTimeout(function(){liveUi("off")},1200);return}
   liveWanted=true;
   clearTimeout(liveRetry);
   if(!liveAudio){
     liveAudio=new Audio();
-    liveAudio.onplaying=function(){if(liveWanted)liveUi("on")};
-    liveAudio.onwaiting=function(){if(liveWanted)liveUi("wait")};
+    liveAudio.onplaying=function(){liveWaitSince=0;if(liveWanted)liveUi("on")};
+    liveAudio.onwaiting=function(){if(!liveWaitSince)liveWaitSince=Date.now();if(liveWanted)liveUi("wait")};
     // 回線断などで止まったら少し待ってつなぎ直す
     liveAudio.onerror=liveAudio.onended=function(){
       if(!liveWanted)return;
@@ -263,12 +424,15 @@ function startLive(){
     };
   }
   // 毎回 URL を変えて、溜まった古い音ではなく今の音から聞く
-  liveAudio.src=withToken("/live?c="+chs.join(",")+"&_="+Date.now());
+  liveWaitSince=Date.now();liveLag=0;
+  liveAudio.playbackRate=1;
+  liveAudio.src=withToken("/live?c="+sel.join(",")+"&_="+Date.now());
   liveUi("wait");
   liveAudio.play().catch(function(){if(liveWanted){liveWanted=false;liveUi("off")}});
 }
 function stopLive(){
   liveWanted=false;
+  liveWaitSince=0;liveLag=0;
   clearTimeout(liveRetry);
   if(liveAudio){liveAudio.pause();liveAudio.removeAttribute("src");liveAudio.load()}
   liveUi("off");
@@ -342,13 +506,13 @@ function clipEnded(g){
   if(resumeLive){chainOn=false;chainUi();resumeLive=false;startLive();return}
   waitingNext=true;chainUi();
 }
-// 録音時刻が g の次に新しい区間(非表示のチャンネルは飛ばす)
+// 録音時刻が g の次に新しい区間(タブで表示していないチャンネルは飛ばす)
 function nextSeg(g){
   var cur=segs[g],best=0,bt=Infinity;
   if(!cur)return 0;
   for(var id in segs){
     var sg=segs[id],i=+id;
-    if(hidden.has(sg.c))continue;
+    if(!visible(sg.c))continue;
     var later=sg.t>cur.t||(sg.t===cur.t&&i>g);
     if(later&&(sg.t<bt||(sg.t===bt&&i<best))){best=i;bt=sg.t}
   }
@@ -359,22 +523,25 @@ function addSeg(sg,live){
   if(segs[sg.i])return;
   segs[sg.i]={c:sg.c,t:sg.t,d:sg.d};
   if(sg.i>maxSegId)maxSegId=sg.i;
-  if(log.querySelector('.pl[data-g="'+sg.i+'"]'))refreshPlay(sg.i);
-  else if(live){
-    // 文字起こしが(まだ)ない区間は録音だけの行として出す。後から文字起こしが来たら消す
+  if(log.querySelector('.r[data-g="'+sg.i+'"]'))refreshPlay(sg.i);
+  else if(live||(log.lastChild&&sg.t>=+log.lastChild.dataset.k)){
+    // 文字起こしが(まだ)ない区間は録音だけの行として出す。後から文字起こしが来たら消す。
+    // 接続時にまとめて取った区間は、表示中の範囲(一番古い行より新しいもの)だけ出す
     var d=document.createElement("div");
-    d.className="r sg c"+sg.c;d.dataset.sg=sg.i;
+    d.className="r sg c"+sg.c;d.dataset.sg=sg.i;d.dataset.g=sg.i;
     var n=names[sg.c]!==undefined?names[sg.c]:"ch"+sg.c;
     d.innerHTML='<div class="meta"><span class="name">'+esc(n)+'</span><span class="ts">'+fmtMs(sg.t)+'</span></div><div class="x">(文字起こしなし)</div>';
-    d.querySelector(".meta").appendChild(makePlay(sg.i));
     insertSorted(d,sg.t);
+    regroupAround(d);
+    updateEmpty();
     noteNew();
   }
   // 連続再生が新着待ちなら続けて再生(行を作った後に呼ぶとその行が再生中表示になる)
-  if(waitingNext&&!hidden.has(sg.c)&&nextSeg(lastPlayed)===sg.i)playClip(sg.i);
+  if(waitingNext&&visible(sg.c)&&nextSeg(lastPlayed)===sg.i)playClip(sg.i);
 }
 function loadSegs(){
-  fetch(withToken("/segments?after="+maxSegId)).then(function(r){
+  // 初回は新しい側だけ(細い回線で全件取らない)。再接続時は取りこぼし分だけ
+  fetch(withToken("/segments?after="+maxSegId+(maxSegId?"":"&limit=300"))).then(function(r){
     if(!r.ok)throw new Error("HTTP "+r.status);
     return r.json();
   }).then(function(data){
@@ -397,14 +564,16 @@ function noteNew(){
 
 function append(id,e){
   if(e.g){var only=log.querySelector('[data-sg="'+e.g+'"]');if(only)log.removeChild(only)}
-  insertSorted(makeRow(id,e),msOf(e.s));
+  regroupAround(insertSorted(makeRow(id,e),msOf(e.s)));
   if(id){
     if(id>lastSeenId)lastSeenId=id;
     if(firstShownId===0||id<firstShownId)firstShownId=id;
   }
   // 古い(下端の)行から捨てる
   while(log.children.length>500)log.removeChild(log.lastChild);
+  if(log.lastChild&&log.lastChild.dataset.g)groupSeg(+log.lastChild.dataset.g);
   updateOlderUI();
+  updateEmpty();
   noteNew();
 }
 
@@ -412,7 +581,7 @@ function appendOlder(items){
   if(!items||!items.length)return;
   for(var i=0;i<items.length;i++){
     var it=items[i];
-    insertSorted(makeRow(it.id,it),msOf(it.s));
+    regroupAround(insertSorted(makeRow(it.id,it),msOf(it.s)));
     if(it.id<firstShownId||firstShownId===0)firstShownId=it.id;
   }
   updateOlderUI();
@@ -477,12 +646,16 @@ function connect(opts){
       var newAnchor=new Date(d.anchor).getTime();
       anchorMs=newAnchor;
       // チャンネル一覧は初回のみ描画(再接続では更新しない)
-      if(chipsBox.children.length===0){
+      if(tabsBox.children.length===0){
+        tabsBox.appendChild(makeTab("all","すべて"));
         d.channels.forEach(function(c){
           names[c.id]=c.name;
-          chipsBox.appendChild(makeChip(c.id,c.name));
+          tabsBox.appendChild(makeTab(String(c.id),c.name));
           if(d.live)lchips.appendChild(makeLiveChip(c.id,c.name));
         });
+        // 以前選んでいたタブが今は無ければ「すべて」に戻す
+        if(view!=="all"&&names[+view]===undefined)view="all";
+        applyView();
         if(d.live)liveBar.hidden=false;
         // 以前の選択に今は無いチャンネルが残っていたら落とす
         liveSel.forEach(function(id){if(names[id]===undefined)liveSel.delete(id)});
@@ -490,6 +663,9 @@ function connect(opts){
       // 切断中に閉じた区間もここで回収する
       if(d.seg)loadSegs();
     }catch(_){}
+  });
+  es.addEventListener("st",function(ev){
+    try{applyStatus(JSON.parse(ev.data))}catch(_){}
   });
   es.addEventListener("seg",function(ev){
     try{addSeg(JSON.parse(ev.data),true)}catch(_){}
@@ -510,6 +686,7 @@ function connect(opts){
   });
   es.onopen=function(){stat.className="s on";stat.textContent="接続中"};
   es.onerror=function(){
+    markStatusUnknown();
     if(es.readyState===EventSource.CONNECTING){
       stat.className="s reco";stat.textContent="再接続中…";
     }else{
@@ -522,6 +699,7 @@ function connect(opts){
 function fastReload(){
   var prevLast=lastSeenId;
   log.innerHTML="";
+  updateEmpty();
   firstShownId=0;
   newCount=0;
   fab.classList.remove("show");
@@ -542,6 +720,19 @@ document.addEventListener("visibilitychange",function(){
       fastReload();
     }
   }
+});
+
+// PC 向けのキー操作
+document.addEventListener("keydown",function(e){
+  if(e.metaKey||e.ctrlKey||e.altKey||/INPUT|TEXTAREA/.test(e.target.tagName))return;
+  if(e.key==="0"){setView("all");return}
+  if(/^[1-9]$/.test(e.key)){
+    var t=tabsBox.querySelectorAll(".tab")[+e.key];
+    if(t)setView(t.dataset.v);
+    return;
+  }
+  if(e.key==="l"||e.key==="L"){lplay.click();return}
+  if(e.key==="Escape"){if(chainOn)stopChain();else if(liveWanted)stopLive()}
 });
 
 connect();

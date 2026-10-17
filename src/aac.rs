@@ -15,6 +15,17 @@ const FLUSH_FRAMES: usize = 3;
 /// 1 フレームの出力上限(モノラル 6144 bit + ADTS ヘッダに余裕を持たせる)
 const MAX_FRAME_BYTES: usize = 2048;
 
+/// AAC のプロファイル
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AacProfile {
+    /// AAC-LC。48kbps 以上向け
+    Lc,
+    /// HE-AAC (AAC-LC + SBR)。16〜32kbps の細い回線向け
+    #[default]
+    He,
+}
+
 /// モノラル i16 → ADTS のストリーミングエンコーダ
 pub struct AacEncoder {
     encoder: Encoder,
@@ -24,13 +35,16 @@ pub struct AacEncoder {
 }
 
 impl AacEncoder {
-    pub fn new(sample_rate: u32, bitrate: u32) -> Result<Self> {
+    pub fn new(sample_rate: u32, bitrate: u32, profile: AacProfile) -> Result<Self> {
         let encoder = Encoder::new(EncoderParams {
             bit_rate: BitRate::Cbr(bitrate),
             sample_rate,
             transport: Transport::Adts,
             channels: ChannelMode::Mono,
-            audio_object_type: AudioObjectType::Mpeg4LowComplexity,
+            audio_object_type: match profile {
+                AacProfile::Lc => AudioObjectType::Mpeg4LowComplexity,
+                AacProfile::He => AudioObjectType::Mpeg4HeAac,
+            },
         })
         .map_err(|e| anyhow!("AAC エンコーダの初期化に失敗 ({} Hz, {} bps): {}", sample_rate, bitrate, e))?;
         Ok(Self {
@@ -109,7 +123,7 @@ pub(crate) mod tests {
 
     #[test]
     fn produces_decodable_adts() {
-        let mut enc = AacEncoder::new(48000, 64000).unwrap();
+        let mut enc = AacEncoder::new(48000, 64000, AacProfile::Lc).unwrap();
         let mut out = Vec::new();
         // 半端な長さで分けて投入しても 1 本のストリームになる
         let input = sine(48000, 48000);
@@ -129,8 +143,23 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn he_aac_is_decodable_at_low_bitrate() {
+        let mut enc = AacEncoder::new(48000, 16000, AacProfile::He).unwrap();
+        let mut out = Vec::new();
+        let input = sine(48000 * 2, 48000);
+        enc.encode(&input, &mut out).unwrap();
+        enc.flush(&mut out).unwrap();
+        // 2 秒 × 16 kbps = 4 KB 前後
+        assert!((3_000..6_000).contains(&out.len()), "{}", out.len());
+        let decoded = decode(&out);
+        assert!(!decoded.is_empty());
+        let rms = (decoded.iter().map(|&s| (s as f64).powi(2)).sum::<f64>() / decoded.len() as f64).sqrt();
+        assert!(rms > 1000.0, "rms={}", rms);
+    }
+
+    #[test]
     fn bitrate_is_roughly_honored() {
-        let mut enc = AacEncoder::new(48000, 48000).unwrap();
+        let mut enc = AacEncoder::new(48000, 48000, AacProfile::Lc).unwrap();
         let mut out = Vec::new();
         enc.encode(&sine(48000 * 4, 48000), &mut out).unwrap();
         // 4 秒 × 48 kbps = 24 KB 前後

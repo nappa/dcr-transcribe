@@ -72,7 +72,8 @@ wav_output_dir = "./recordings"
 # enabled = true
 # dir = "./recordings/segments"  # a timestamped subdirectory is created per run
 # format = "aac"                 # "aac" (ADTS, small, streaming-friendly) or "wav"
-# bitrate = 64000                # AAC bitrate (bps)
+# profile = "he"                 # "he" (HE-AAC, for 16-32 kbps) or "lc" (AAC-LC, 48 kbps+)
+# bitrate = 24000                # AAC bitrate (bps)
 # silence_split_ms = 2000        # close a segment after this much silence
 # pre_roll_ms = 300              # audio kept before the voice onset
 # tail_ms = 300                  # silence kept after the last voice
@@ -82,7 +83,8 @@ wav_output_dir = "./recordings"
 # Live listening from the remote viewer: pick channels, the server mixes them and streams AAC
 # [live]
 # enabled = true
-# bitrate = 48000                # AAC bitrate (bps) per listened mix
+# profile = "he"                 # "he" (HE-AAC) or "lc"
+# bitrate = 16000                # AAC bitrate (bps) per listened mix (~2 KB/s)
 
 [flac]
 # Enable FLAC compression for AWS Transcribe

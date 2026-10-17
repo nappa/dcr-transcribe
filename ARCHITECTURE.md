@@ -618,7 +618,7 @@ pub enum TranscribeStatus {
     └── segments: SegmentStore                          (録音区間の一覧 最大 1000 件 + 配信)
     v
 [axum HTTP/SSE handlers]
-    ├── GET /            → モバイル対応 HTML
+    ├── GET /            → スマホ・PC 対応 HTML(brotli + ETag)
     ├── GET /stream      → SSE: hello + 履歴(Last-Event-ID 以降) + ライブ(msg / seg)
     ├── GET /history     → 過去の文字起こし
     ├── GET /segments    → 録音区間の一覧(?after=<id> で差分)
@@ -653,7 +653,7 @@ pub enum TranscribeStatus {
 - JSON キーを 1 文字に短縮: `c` (channel), `s` (timestamp_seconds), `x` (text), `p` (partial)
 - `p` が false なら省略 (`#[serde(skip_serializing_if)]`)
 - partial は default で送らない、有効時もチャンネル毎 throttle
-- HTML/JS は単一ファイル、外部依存なし、gzip 後 ~3KB
+- HTML/JS は単一ファイル、外部依存なし、brotli で約 9.5KB(ETag で再取得は 304)
 - SSE 圧縮は使わない(中継プロキシで stream バッファ事故を避けるため)
 - 再接続時 `Last-Event-ID` で欠損のみ転送(重複なし)
 
@@ -661,7 +661,9 @@ pub enum TranscribeStatus {
 
 - viewport-fit=cover + `env(safe-area-inset-*)` で notch / ホームインジケータ回避
 - システムフォント (`-apple-system`, `Hiragino Sans`, `Yu Gothic UI`) で日本語綺麗
-- スティッキーヘッダにチャンネルフィルタチップ(タップで表示/非表示、localStorage 永続化)
+- スマホは上部タブ、PC(幅 900px 以上)は左サイドバー + 中央寄せのタイムライン。タブで表示チャンネルを切り替え(CSS で行を隠す)
+- 受信状態 `event: st`: `[c, 音量dB, 受信中, Transcribe]` を変化したときだけ配信(受信中は 6dB、待機中は 12dB 以上の音量変化で送る。受信中は 0.5 秒保持)
+- HTML は起動時に brotli(品質 11)で圧縮し ETag で 304。`/history` `/segments` は 512 bytes 以上なら brotli(品質 5)
 - 新しい順(新着が上)。各行に時刻 `data-k` を持たせて降順に挿入するので、遅れて届いた結果も時刻の位置に入る
 - 見ている位置より上に行が入ったらその分スクロールして表示を保つ(`overflow-anchor: none` で自前補正)
 - 「最新へ」FAB(下へスクロール中に新着件数を表示)、過去分は下端で `/history` から読み込む

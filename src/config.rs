@@ -1,3 +1,4 @@
+pub use crate::aac::AacProfile;
 use crate::types::DropPolicy;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -76,6 +77,9 @@ pub struct SegmentConfig {
     /// AAC のビットレート(bps)
     #[serde(default = "default_segment_bitrate")]
     pub bitrate: u32,
+    /// AAC のプロファイル。he (HE-AAC、低ビットレート向け) か lc
+    #[serde(default)]
+    pub profile: AacProfile,
     /// この長さ以上無音が続いたら区間を閉じる(ms)
     #[serde(default = "default_segment_silence_split_ms")]
     pub silence_split_ms: u64,
@@ -103,10 +107,13 @@ pub struct LiveConfig {
     /// AAC のビットレート(bps)。聞いている間はこの帯域を使い続ける
     #[serde(default = "default_live_bitrate")]
     pub bitrate: u32,
+    /// AAC のプロファイル。he (HE-AAC、低ビットレート向け) か lc
+    #[serde(default)]
+    pub profile: AacProfile,
 }
 
 fn default_live_bitrate() -> u32 {
-    48000
+    16000
 }
 
 impl Default for LiveConfig {
@@ -114,6 +121,7 @@ impl Default for LiveConfig {
         Self {
             enabled: false,
             bitrate: default_live_bitrate(),
+            profile: AacProfile::default(),
         }
     }
 }
@@ -128,7 +136,7 @@ pub enum SegmentFormat {
 }
 
 fn default_segment_bitrate() -> u32 {
-    64000
+    24000
 }
 
 fn default_segment_dir() -> String {
@@ -162,6 +170,7 @@ impl Default for SegmentConfig {
             dir: default_segment_dir(),
             format: SegmentFormat::default(),
             bitrate: default_segment_bitrate(),
+            profile: AacProfile::default(),
             silence_split_ms: default_segment_silence_split_ms(),
             pre_roll_ms: default_segment_pre_roll_ms(),
             tail_ms: default_segment_tail_ms(),

@@ -16,6 +16,12 @@
 //! - `GET /audio/{id}` - 録音区間の AAC / WAV(Range リクエスト対応、iOS Safari の再生に必須)
 //! - `GET /healthz` - "ok" 返却
 //!
+//! # 細い回線向けの転送量対策
+//!
+//! - HTML は起動時に brotli(最高圧縮)で 1 度だけ圧縮し、ETag で 304 を返す
+//! - `/history` `/segments` の JSON も、ある程度大きければ brotli で返す
+//! - チャンネルの状態 (`event: st`) は変化したときだけ、短い配列で送る
+//!
 //! # 多クライアント・スロークライアント耐性
 //!
 //! - `tokio::sync::broadcast` ベース: 各クライアントは独立した Receiver
@@ -64,6 +70,12 @@ const HTML_PAGE: &str = include_str!("../static/index.html");
 const BROADCAST_CAPACITY: usize = 256;
 /// メモリに保持する録音区間の最大数。古いものは一覧から消える(ファイルは残る)
 const MAX_SEGMENTS: usize = 1000;
+/// これより小さい JSON は圧縮しない(ヘッダのほうが大きくなる)
+const COMPRESS_MIN_BYTES: usize = 512;
+/// 状態の音量は、受信中はこの dB 以上動いたら送る
+const STATUS_LEVEL_STEP_RECEIVING: i8 = 6;
+/// 受信していないときの音量はこの dB 以上動いたときだけ送る(雑音の揺れで送らない)
+const STATUS_LEVEL_STEP_IDLE: i8 = 12;
 
 /// SSE で配信する1イベント(転送量最小化のため短いキー)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,6 +107,63 @@ struct WireSegment {
     d: u64,
 }
 
+/// 閲覧画面に出すチャンネルの状態(`event: st`)
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ChannelStatus {
+    pub channel: usize,
+    /// 音量 (dB)
+    pub level_db: f32,
+    /// 受信中(音量が閾値を超えている)
+    pub receiving: bool,
+    /// Transcribe 接続。0=未接続 1=接続中 2=エラー
+    pub transcribe: u8,
+}
+
+/// 配信形式 `[c, l, r, x]`(l は -60〜0 dB の整数)
+type WireStatus = (usize, i8, u8, u8);
+
+/// チャンネル状態の差分配信
+struct StatusStore {
+    /// 最後に送った状態
+    last: Mutex<HashMap<usize, WireStatus>>,
+    broadcaster: broadcast::Sender<Arc<str>>,
+}
+
+impl StatusStore {
+    fn new() -> Self {
+        let (tx, _rx) = broadcast::channel(64);
+        Self {
+            last: Mutex::new(HashMap::new()),
+            broadcaster: tx,
+        }
+    }
+
+    /// 全チャンネルの現状(接続直後・取りこぼし時の送り直し用)。まだ何も無ければ None
+    fn snapshot(&self) -> Option<String> {
+        let last = self.last.lock().unwrap();
+        if last.is_empty() {
+            return None;
+        }
+        let mut all: Vec<WireStatus> = last.values().copied().collect();
+        all.sort_unstable();
+        serde_json::to_string(&all).ok()
+    }
+}
+
+/// 前回送った状態から意味のある変化があったか
+fn status_changed(prev: Option<&WireStatus>, next: &WireStatus) -> bool {
+    let Some(prev) = prev else { return true };
+    if prev.2 != next.2 || prev.3 != next.3 {
+        return true;
+    }
+    let step = if next.2 == 1 {
+        STATUS_LEVEL_STEP_RECEIVING
+    } else {
+        STATUS_LEVEL_STEP_IDLE
+    };
+    (prev.1 - next.1).abs() >= step
+}
+
 /// 録音区間の一覧と配信
 struct SegmentStore {
     enabled: bool,
@@ -112,9 +181,13 @@ impl SegmentStore {
         }
     }
 
-    fn after(&self, after: u64) -> Vec<WireSegment> {
+    /// `after` より新しい区間を古い順に返す。`limit` があれば新しい側の `limit` 件だけ
+    fn after(&self, after: u64, limit: Option<usize>) -> Vec<WireSegment> {
         let items = self.items.lock().unwrap();
-        items.iter().filter(|(w, _)| w.i > after).map(|(w, _)| w.clone()).collect()
+        let matching: Vec<WireSegment> =
+            items.iter().filter(|(w, _)| w.i > after).map(|(w, _)| w.clone()).collect();
+        let start = limit.map_or(0, |n| matching.len().saturating_sub(n));
+        matching[start..].to_vec()
     }
 
     fn path(&self, id: u64) -> Option<std::path::PathBuf> {
@@ -186,6 +259,9 @@ struct SegmentsQuery {
     /// この ID より新しい区間を返す
     #[serde(default)]
     after: u64,
+    /// 新しい側から最大何件返すか(初回読み込みで全件取らないため)
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -230,6 +306,61 @@ pub struct RemoteState {
     channels: Vec<ChannelInfo>,
     segments: SegmentStore,
     live: Option<Arc<LiveHub>>,
+    status: StatusStore,
+    index: IndexPage,
+}
+
+/// 圧縮済みの HTML
+struct IndexPage {
+    br: Vec<u8>,
+    etag: String,
+}
+
+impl IndexPage {
+    fn new() -> Self {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        HTML_PAGE.hash(&mut h);
+        Self {
+            br: brotli_compress(HTML_PAGE.as_bytes(), 11),
+            etag: format!("\"{:016x}\"", h.finish()),
+        }
+    }
+}
+
+fn brotli_compress(data: &[u8], quality: u32) -> Vec<u8> {
+    use std::io::Write;
+    let mut out = Vec::with_capacity(data.len() / 3);
+    {
+        let mut w = brotli::CompressorWriter::new(&mut out, 4096, quality, 22);
+        // Vec への書き込みは失敗しない
+        let _ = w.write_all(data);
+    }
+    out
+}
+
+fn accepts_brotli(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.split(',').any(|e| e.trim().split(';').next() == Some("br")))
+}
+
+/// JSON を返す。クライアントが brotli を受け付け、ある程度大きければ圧縮する
+fn json_response(body: String, headers: &HeaderMap) -> Response {
+    let ctype = (header::CONTENT_TYPE, "application/json");
+    let cache = (header::CACHE_CONTROL, "no-store");
+    let vary = (header::VARY, "Accept-Encoding");
+    if body.len() >= COMPRESS_MIN_BYTES && accepts_brotli(headers) {
+        let br = brotli_compress(body.as_bytes(), 5);
+        return (
+            StatusCode::OK,
+            [ctype, cache, vary, (header::CONTENT_ENCODING, "br")],
+            br,
+        )
+            .into_response();
+    }
+    (StatusCode::OK, [ctype, cache, vary], body).into_response()
 }
 
 impl RemoteState {
@@ -290,6 +421,30 @@ impl RemoteState {
             items.pop_front();
         }
         let _ = self.segments.broadcaster.send(wire);
+    }
+
+    /// チャンネルの状態を更新し、変化があったチャンネルだけ配信する(同期、ノンブロッキング)
+    pub fn push_status(&self, items: &[ChannelStatus]) {
+        let mut last = self.status.last.lock().unwrap();
+        let mut changed: Vec<WireStatus> = Vec::new();
+        for st in items {
+            let wire = (
+                st.channel,
+                st.level_db.clamp(-60.0, 0.0).round() as i8,
+                st.receiving as u8,
+                st.transcribe,
+            );
+            if status_changed(last.get(&st.channel), &wire) {
+                last.insert(st.channel, wire);
+                changed.push(wire);
+            }
+        }
+        if changed.is_empty() {
+            return;
+        }
+        if let Ok(s) = serde_json::to_string(&changed) {
+            let _ = self.status.broadcaster.send(Arc::from(s));
+        }
     }
 
     /// SSE 接続用に「履歴のスナップショット」と「新規イベント受信用 Receiver」を atomic に取得。
@@ -402,6 +557,8 @@ pub async fn start(
         channels,
         segments: SegmentStore::new(segments_enabled),
         live,
+        status: StatusStore::new(),
+        index: IndexPage::new(),
     });
 
     let app = router(state.clone());
@@ -461,16 +618,32 @@ async fn serve_index(
     if !state.check_basic_auth(&headers) {
         return unauthorized_basic();
     }
-    (
-        StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
-            // 静的だがアプリと合わせて配信されるので軽くキャッシュする
-            (header::CACHE_CONTROL, "public, max-age=300"),
-        ],
-        HTML_PAGE,
-    )
-        .into_response()
+    let etag = state.index.etag.as_str();
+    // 毎回確認させるが、変わっていなければ 304 で本文を送らない
+    let common = [
+        (header::CACHE_CONTROL, "private, no-cache"),
+        (header::ETAG, etag),
+        (header::VARY, "Accept-Encoding"),
+    ];
+    let not_modified = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.split(',').any(|t| t.trim() == etag));
+    if not_modified {
+        return (StatusCode::NOT_MODIFIED, common).into_response();
+    }
+    let ctype = (header::CONTENT_TYPE, "text/html; charset=utf-8");
+    if accepts_brotli(&headers) {
+        (
+            StatusCode::OK,
+            common,
+            [ctype, (header::CONTENT_ENCODING, "br")],
+            state.index.br.clone(),
+        )
+            .into_response()
+    } else {
+        (StatusCode::OK, common, [ctype], HTML_PAGE).into_response()
+    }
 }
 
 /// /healthz: 認証なし(外部監視用)
@@ -545,15 +718,7 @@ async fn serve_history(
         })
         .collect();
     let body = serde_json::json!({ "items": items }).to_string();
-    (
-        StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, "application/json"),
-            (header::CACHE_CONTROL, "no-store"),
-        ],
-        body,
-    )
-        .into_response()
+    json_response(body, &headers)
 }
 
 async fn serve_segments(
@@ -567,16 +732,8 @@ async fn serve_segments(
     if !state.check_token(q.t.as_deref()) {
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }
-    let body = serde_json::json!({ "items": state.segments.after(q.after) }).to_string();
-    (
-        StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, "application/json"),
-            (header::CACHE_CONTROL, "no-store"),
-        ],
-        body,
-    )
-        .into_response()
+    let body = serde_json::json!({ "items": state.segments.after(q.after, q.limit) }).to_string();
+    json_response(body, &headers)
 }
 
 /// 録音区間のファイルを返す。一覧に登録済みの ID だけを受け付ける(任意パスは読ませない)
@@ -718,6 +875,7 @@ fn build_stream(
     async_stream::stream! {
         // hello より前に購読しておく(hello を受けたクライアントが /segments を取るまでの取りこぼし防止)
         let mut seg_rx = state.segments.broadcaster.subscribe();
+        let mut status_rx = state.status.broadcaster.subscribe();
 
         // 1. hello イベント(anchor + チャンネル名)
         let hello = Hello {
@@ -740,6 +898,11 @@ fn build_stream(
                     .id(stored.id.to_string())
                     .data(s));
             }
+        }
+
+        // 3.5 チャンネルの現状
+        if let Some(s) = state.status.snapshot() {
+            yield Ok(Event::default().event("st").data(s));
         }
 
         // 4. ライブ配信
@@ -776,6 +939,16 @@ fn build_stream(
                     Err(broadcast::error::RecvError::Lagged(_)) => break,
                     Err(broadcast::error::RecvError::Closed) => break,
                 },
+                r = status_rx.recv() => match r {
+                    Ok(s) => yield Ok(Event::default().event("st").data(s.to_string())),
+                    // 状態は最新だけ分かればよいので、取りこぼしたら現状を送り直して続ける
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        if let Some(s) = state.status.snapshot() {
+                            yield Ok(Event::default().event("st").data(s));
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
             }
         }
     }
@@ -803,6 +976,8 @@ mod tests {
             channels: vec![],
             segments: SegmentStore::new(false),
             live: None,
+            status: StatusStore::new(),
+            index: IndexPage::new(),
         })
     }
 
@@ -1318,6 +1493,8 @@ mod tests {
             channels: vec![],
             segments: SegmentStore::new(false),
             live: None,
+            status: StatusStore::new(),
+            index: IndexPage::new(),
         });
 
         // build_stream を直接駆動して、Lagged で break することを検証
@@ -1562,10 +1739,10 @@ mod tests {
                 path: "x.wav".into(),
             });
         }
-        let all = s.segments.after(0);
+        let all = s.segments.after(0, None);
         assert_eq!(all.len(), MAX_SEGMENTS);
         assert_eq!(all[0].i, 6);
-        assert_eq!(s.segments.after(MAX_SEGMENTS as u64).len(), 5);
+        assert_eq!(s.segments.after(MAX_SEGMENTS as u64, None).len(), 5);
     }
 
     #[tokio::test]
@@ -1690,7 +1867,8 @@ mod tests {
     // ─────────────────────────────────────────────────────────────────
 
     fn state_with_live() -> (Arc<RemoteState>, Arc<LiveHub>) {
-        let hub = LiveHub::new(48000, 48000, vec![2, 3]);
+        use crate::aac::AacProfile;
+        let hub = LiveHub::new(48000, 48000, AacProfile::Lc, vec![2, 3]);
         let mut s = make_state(false, 10);
         Arc::get_mut(&mut s).unwrap().live = Some(hub.clone());
         (s, hub)
@@ -1753,5 +1931,143 @@ mod tests {
         let addr = boot(s).await;
         let resp = reqwest::get(format!("http://{}/live?c=2", addr)).await.unwrap();
         assert_eq!(resp.status(), 401);
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // 転送量対策(brotli / ETag / 状態の差分配信 / 一覧の件数制限)
+    // ─────────────────────────────────────────────────────────────────
+
+    fn unbrotli(data: &[u8]) -> Vec<u8> {
+        use std::io::Read;
+        let mut out = Vec::new();
+        brotli::Decompressor::new(data, 4096).read_to_end(&mut out).unwrap();
+        out
+    }
+
+    #[tokio::test]
+    async fn http_index_is_brotli_with_etag() {
+        let addr = boot(make_state(false, 10)).await;
+        let client = reqwest::Client::new();
+
+        let resp = client
+            .get(format!("http://{}/", addr))
+            .header("Accept-Encoding", "gzip, deflate, br")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers()["content-encoding"], "br");
+        assert_eq!(resp.headers()["vary"], "Accept-Encoding");
+        let etag = resp.headers()["etag"].to_str().unwrap().to_string();
+        let body = resp.bytes().await.unwrap();
+        assert!(body.len() < HTML_PAGE.len() / 3, "{} / {}", body.len(), HTML_PAGE.len());
+        assert_eq!(unbrotli(&body), HTML_PAGE.as_bytes());
+
+        // 変わっていなければ本文なしの 304
+        let resp = client
+            .get(format!("http://{}/", addr))
+            .header("If-None-Match", &etag)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 304);
+        assert!(resp.bytes().await.unwrap().is_empty());
+
+        // brotli 非対応なら非圧縮
+        let resp = client.get(format!("http://{}/", addr)).send().await.unwrap();
+        assert!(resp.headers().get("content-encoding").is_none());
+        assert_eq!(resp.text().await.unwrap(), HTML_PAGE);
+    }
+
+    #[tokio::test]
+    async fn http_history_compresses_only_large_bodies() {
+        let s = make_state(false, 100);
+        for i in 0..40 {
+            s.push(&make_result(0, &format!("それなりに長い文字起こしの結果 {}", i), false));
+        }
+        let addr = boot(s).await;
+        let client = reqwest::Client::new();
+        let get = |q: &'static str| {
+            client
+                .get(format!("http://{}/history?{}", addr, q))
+                .header("Accept-Encoding", "br")
+                .send()
+        };
+        let big = get("before=1000&limit=40").await.unwrap();
+        assert_eq!(big.headers()["content-encoding"], "br");
+        let json: serde_json::Value = serde_json::from_slice(&unbrotli(&big.bytes().await.unwrap())).unwrap();
+        assert_eq!(json["items"].as_array().unwrap().len(), 40);
+
+        let small = get("before=3&limit=1").await.unwrap();
+        assert!(small.headers().get("content-encoding").is_none());
+    }
+
+    #[test]
+    fn segments_after_with_limit_returns_newest() {
+        let s = make_state(false, 10);
+        for i in 1..=10 {
+            s.push_segment(&SegmentInfo {
+                id: i,
+                channel: 0,
+                start_unix_ms: 0,
+                duration_ms: 0,
+                path: "x.aac".into(),
+            });
+        }
+        let ids = |v: Vec<WireSegment>| v.iter().map(|w| w.i).collect::<Vec<_>>();
+        assert_eq!(ids(s.segments.after(0, Some(3))), vec![8, 9, 10]);
+        assert_eq!(ids(s.segments.after(8, Some(5))), vec![9, 10]);
+        assert_eq!(ids(s.segments.after(0, None)).len(), 10);
+    }
+
+    fn st(channel: usize, level_db: f32, receiving: bool, transcribe: u8) -> ChannelStatus {
+        ChannelStatus { channel, level_db, receiving, transcribe }
+    }
+
+    #[test]
+    fn status_sent_only_on_meaningful_change() {
+        let s = make_state(false, 10);
+        let mut rx = s.status.broadcaster.subscribe();
+        let mut recv = || rx.try_recv().ok().map(|a| a.to_string());
+
+        s.push_status(&[st(0, -50.0, false, 0), st(1, -70.0, false, 0)]);
+        // 初回は全チャンネル。音量は -60 で頭打ち
+        assert_eq!(recv().as_deref(), Some("[[0,-50,0,0],[1,-60,0,0]]"));
+
+        // 受信していない間の小さな揺れ(12 dB 未満)は送らない
+        s.push_status(&[st(0, -42.0, false, 0), st(1, -60.0, false, 0)]);
+        assert_eq!(recv(), None);
+
+        // 受信開始は即送る。変化したチャンネルだけ
+        s.push_status(&[st(0, -20.0, true, 1), st(1, -60.0, false, 0)]);
+        assert_eq!(recv().as_deref(), Some("[[0,-20,1,1]]"));
+
+        // 受信中は 6 dB 以上で送る
+        s.push_status(&[st(0, -24.0, true, 1)]);
+        assert_eq!(recv(), None);
+        s.push_status(&[st(0, -27.0, true, 1)]);
+        assert_eq!(recv().as_deref(), Some("[[0,-27,1,1]]"));
+
+        // 接続直後用の現状は全チャンネル
+        assert_eq!(s.status.snapshot().as_deref(), Some("[[0,-27,1,1],[1,-60,0,0]]"));
+    }
+
+    #[tokio::test]
+    async fn sse_sends_status_snapshot_and_updates() {
+        use futures_util::StreamExt;
+        let s = make_state(false, 10);
+        s.push_status(&[st(2, -30.0, true, 1)]);
+        let mut stream = Box::pin(build_stream(s.clone(), SubscribeMode::All));
+        let _hello = stream.next().await.unwrap();
+        let snap = format!("{:?}", stream.next().await.unwrap().unwrap());
+        assert!(snap.contains("st") && snap.contains("[[2,-30,1,1]]"), "{}", snap);
+
+        s.push_status(&[st(2, -60.0, false, 0)]);
+        let ev = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(format!("{:?}", ev).contains("[[2,-60,0,0]]"));
     }
 }

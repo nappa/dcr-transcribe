@@ -155,6 +155,7 @@ async fn main() -> Result<()> {
         live::LiveHub::new(
             config.audio.sample_rate,
             config.live.bitrate,
+            config.live.profile,
             config.channels.iter().filter(|c| c.enabled).map(|c| c.id).collect(),
         )
     });
@@ -276,7 +277,7 @@ async fn main() -> Result<()> {
         let (live_tx, live_rx) = mpsc::channel(64);
         audio_input.set_live_tap(live_tx, hub.active_flag());
         tokio::spawn(hub.run(live_rx));
-        log::info!("ライブ再生: 有効 ({} bps)", config.live.bitrate);
+        log::info!("ライブ再生: 有効 ({:?}, {} bps)", config.live.profile, config.live.bitrate);
     }
     audio_input.start(channel_senders)?;
 
@@ -453,6 +454,44 @@ async fn main() -> Result<()> {
         }
     });
     tasks.push(output_monitor_task);
+
+    // タスク4: チャンネルの状態(受信中・音量・Transcribe 接続)を Remote サーバへ。
+    // 配信は変化があったときだけ(RemoteState::push_status 側で間引く)
+    if let Some(state) = remote_state.clone() {
+        let tui_state_clone = tui_state.clone();
+        let running_clone = running.clone();
+        tasks.push(tokio::spawn(async move {
+            // 閾値をまたいで細かくばたつかないよう、最後に閾値を超えてからしばらくは受信中とみなす
+            const RECEIVING_HOLD: std::time::Duration = std::time::Duration::from_millis(500);
+            let mut last_voice = std::collections::HashMap::<usize, std::time::Instant>::new();
+            while running_clone.load(Ordering::SeqCst) {
+                tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+                let now = std::time::Instant::now();
+                let items: Vec<remote_server::ChannelStatus> = tui_state_clone
+                    .get_all_channels()
+                    .iter()
+                    .map(|ch| {
+                        if ch.current_volume_db > ch.vad_threshold_db {
+                            last_voice.insert(ch.channel_id, now);
+                        }
+                        remote_server::ChannelStatus {
+                            channel: ch.channel_id,
+                            level_db: ch.current_volume_db,
+                            receiving: last_voice
+                                .get(&ch.channel_id)
+                                .is_some_and(|t| now.duration_since(*t) < RECEIVING_HOLD),
+                            transcribe: match ch.transcribe_status {
+                                tui_state::TranscribeStatus::Disconnected => 0,
+                                tui_state::TranscribeStatus::Connected => 1,
+                                tui_state::TranscribeStatus::Error => 2,
+                            },
+                        }
+                    })
+                    .collect();
+                state.push_status(&items);
+            }
+        }));
+    }
 
     // メインループ: 停止を待つ
     while running.load(Ordering::SeqCst) {

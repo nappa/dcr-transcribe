@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use crate::audio_input::cpal_device_name;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, FromSample, Sample, SampleFormat, SizedSample, Stream, StreamConfig};
 use std::sync::{Arc, Mutex};
@@ -21,7 +22,7 @@ impl AudioOutput {
         let device = if let Some(name) = device_name {
             // 指定されたデバイス名で検索
             host.output_devices()?
-                .find(|d| d.name().map(|n| n == name).unwrap_or(false))
+                .find(|d| cpal_device_name(d).map(|n| n == name).unwrap_or(false))
                 .ok_or_else(|| anyhow::anyhow!("出力デバイス '{}' が見つかりません", name))?
         } else {
             // デフォルトデバイスを使用
@@ -29,7 +30,7 @@ impl AudioOutput {
                 .ok_or_else(|| anyhow::anyhow!("デフォルト出力デバイスが見つかりません"))?
         };
 
-        log::info!("出力デバイス: {}", device.name()?);
+        log::info!("出力デバイス: {}", cpal_device_name(&device)?);
 
         Ok(Self {
             device,
@@ -45,10 +46,10 @@ impl AudioOutput {
         println!("=== 利用可能な出力デバイス ===");
 
         for (idx, device) in host.output_devices()?.enumerate() {
-            let name = device.name()?;
+            let name = cpal_device_name(&device)?;
             let is_default = host
                 .default_output_device()
-                .and_then(|d| d.name().ok())
+                .and_then(|d| cpal_device_name(&d).ok())
                 .map(|default_name| default_name == name)
                 .unwrap_or(false);
 
@@ -59,7 +60,7 @@ impl AudioOutput {
             if let Ok(config) = device.default_output_config() {
                 println!(
                     "   サンプルレート: {} Hz, チャンネル数: {}",
-                    config.sample_rate().0,
+                    config.sample_rate(),
                     config.channels()
                 );
             }
@@ -79,19 +80,19 @@ impl AudioOutput {
         log::info!(
             "出力デバイス設定: {:?}, {}Hz, {}ch",
             default_config.sample_format(),
-            default_config.sample_rate().0,
+            default_config.sample_rate(),
             default_config.channels()
         );
 
         let config = StreamConfig {
             channels: 1,
-            sample_rate: cpal::SampleRate(self.sample_rate),
+            sample_rate: self.sample_rate,
             buffer_size: cpal::BufferSize::Default,
         };
 
         log::info!(
             "出力ストリーム開始: サンプルレート={}Hz, チャンネル={}",
-            config.sample_rate.0,
+            config.sample_rate,
             config.channels
         );
 
@@ -143,7 +144,7 @@ impl AudioOutput {
         let stream = self
             .device
             .build_output_stream(
-                &config,
+                config,
                 move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
                     let mut buffer = sample_buffer.lock().unwrap();
 

@@ -12,7 +12,7 @@
 //! 無音中のサンプルは一旦メモリに保留し、発話が再開したらファイルへ書き出す。
 //! これにより末尾の無音をストリーミング書き込みのまま切り詰められる。
 
-use crate::aac::AacEncoder;
+use crate::aac::{AacEncoder, AacProfile};
 use crate::config::{SegmentConfig, SegmentFormat};
 use crate::types::SampleI16;
 use anyhow::{Context, Result};
@@ -48,14 +48,20 @@ enum SegmentWriter {
 }
 
 impl SegmentWriter {
-    fn create(path: &Path, spec: hound::WavSpec, format: SegmentFormat, bitrate: u32) -> Result<Self> {
+    fn create(
+        path: &Path,
+        spec: hound::WavSpec,
+        format: SegmentFormat,
+        bitrate: u32,
+        profile: AacProfile,
+    ) -> Result<Self> {
         Ok(match format {
             SegmentFormat::Wav => Self::Wav(
                 hound::WavWriter::create(path, spec)
                     .with_context(|| format!("区間 WAV の作成に失敗: {:?}", path))?,
             ),
             SegmentFormat::Aac => Self::Aac {
-                encoder: AacEncoder::new(spec.sample_rate, bitrate)?,
+                encoder: AacEncoder::new(spec.sample_rate, bitrate, profile)?,
                 file: BufWriter::new(
                     fs::File::create(path)
                         .with_context(|| format!("区間 AAC の作成に失敗: {:?}", path))?,
@@ -114,6 +120,7 @@ pub struct SegmentRecorder {
     spec: hound::WavSpec,
     format: SegmentFormat,
     bitrate: u32,
+    profile: AacProfile,
     threshold_db: f32,
     pre_roll_samples: usize,
     tail_samples: usize,
@@ -153,6 +160,7 @@ impl SegmentRecorder {
             },
             format: config.format,
             bitrate: config.bitrate,
+            profile: config.profile,
             threshold_db,
             pre_roll_samples: ms_to_samples(config.pre_roll_ms),
             tail_samples: ms_to_samples(config.tail_ms),
@@ -244,7 +252,7 @@ impl SegmentRecorder {
         let path = self
             .output_dir
             .join(format!("ch{}_{}_{}.{}", self.channel_id, local, id, ext));
-        let writer = SegmentWriter::create(&path, self.spec, self.format, self.bitrate)?;
+        let writer = SegmentWriter::create(&path, self.spec, self.format, self.bitrate, self.profile)?;
 
         let mut seg = OpenSegment {
             id,
