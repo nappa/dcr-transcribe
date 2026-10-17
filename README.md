@@ -297,16 +297,38 @@ cargo run --release
 > **Quick Tunnel (`cloudflared tunnel --url ...` / trycloudflare.com) は SSE 非対応なので使えない。**
 > Cloudflare に登録済みのドメインで名前付きトンネルを作る。
 
-初回のみ:
+#### おすすめ: ダッシュボードで作ってトークンを貼るだけ
+
+1. Cloudflare ダッシュボード → **Zero Trust → Networks → Tunnels → Create a tunnel** → 「Cloudflared」を選び、名前(例: `dcr-transcribe`)を付ける
+2. 「Install and run a connector」に表示されるコマンドの `eyJ...` で始まる長い文字列がトークン。これをコピーする(インストール作業は不要)
+3. **Public Hostname** を追加: Subdomain `transcribe` / Domain `example.com` / Service `HTTP` `127.0.0.1:8765`
+4. `config.toml` に貼る:
+
+```toml
+[tunnel]
+enabled = true
+token = "eyJ..."      # ダッシュボードのトークン(ファイルに置くなら token_file = "...")
+```
+
+これだけで、本体の起動と一緒にトンネルがつながる。`cloudflared tunnel login`・cert.pem・yml・`route dns` はいらない。
+別の PC に移すときも `config.toml` を持っていくだけ(トークンは秘密なので扱いに注意。`config.toml` は git 管理外)。
+
+- **cloudflared のインストールも不要**: PATH にも `bin_dir`(既定 `./bin`)にも無ければ、Cloudflare 公式の GitHub リリース(最新版)から
+  自動でダウンロードする(約 20MB、初回のみ)。macOS では Cloudflare の開発者署名が付いていることを確かめてから使う。
+  ダウンロードさせたくなければ `auto_download = false`
+- 本体の起動と一緒に cloudflared が立ち上がり、落ちたら 1 秒 → 最大 30 秒の間隔で起動し直し、本体の終了時に止まる
+  (SIGTERM、3 秒で終わらなければ強制終了)。cloudflared の出力は本体のログに入る(接続できると「トンネル: 接続しました」)
+- トークンは引数ではなく環境変数 `TUNNEL_TOKEN` で cloudflared に渡す(`ps` で見えない)
+
+#### CLI で作る場合(ローカル管理のトンネル)
 
 ```bash
-brew install cloudflared
 cloudflared tunnel login                                  # ブラウザでドメインを選んで認可
 cloudflared tunnel create dcr-transcribe                  # ~/.cloudflared/<UUID>.json が作られる
 cloudflared tunnel route dns dcr-transcribe transcribe.example.com
 ```
 
-`~/.cloudflared/config.yml`:
+`~/.cloudflared/dcr-transcribe.yml`:
 
 ```yaml
 tunnel: dcr-transcribe
@@ -317,26 +339,16 @@ ingress:
   - service: http_status:404
 ```
 
-本体に cloudflared の起動を任せる(推奨):
-
 ```toml
 [tunnel]
 enabled = true
-config = "~/.cloudflared/dcr-transcribe.yml"   # 上で作った設定ファイル
-# token_file = "..."                           # ダッシュボードで作ったトンネルならトークンを書いたファイル
+config = "~/.cloudflared/dcr-transcribe.yml"
 ```
 
-本体の起動と一緒に cloudflared が立ち上がり、落ちたら 1 秒 → 最大 30 秒の間隔で起動し直し、本体の終了時に止まる
-(SIGTERM、3 秒で終わらなければ強制終了)。cloudflared の出力は本体のログに入る(接続できると「トンネル: 接続しました」)。
+CLI で作ったトンネルは、ダッシュボードの Tunnels 一覧から **Migrate** するとダッシュボード管理に移せる。
+移したあとは `cloudflared tunnel token dcr-transcribe` で出るトークンを `token` に貼れば、yml は不要になる。
 
-手動で動かす場合は、本体を起動したあと別ターミナルで:
-
-```bash
-cloudflared tunnel --config ~/.cloudflared/dcr-transcribe.yml run
-```
-
-`https://transcribe.example.com` をブラウザで開くと、リアルタイムに文字起こしが流れます。
-(ダッシュボードの Zero Trust → Networks → Tunnels で作った場合は、トークンをファイルに書いて `token_file` に指定する)
+`https://transcribe.example.com/?k=<ログインキー>` をブラウザで開くと、リアルタイムに文字起こしが流れます。
 
 録音ファイルは `Cache-Control: private`、ライブは `no-store` で返すので、Cloudflare のエッジにはキャッシュされない。
 

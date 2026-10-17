@@ -8,6 +8,8 @@ target
 
 # local config
 /config.toml
+# cloudflared のダウンロード先
+/bin/
 /secrets/*
 /.env
 

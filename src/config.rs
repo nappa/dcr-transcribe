@@ -129,14 +129,25 @@ pub struct SegmentConfig {
 /// cloudflared を本体の子プロセスとして管理する設定
 ///
 /// 有効にすると、本体の起動と一緒に `cloudflared tunnel ... run` を立ち上げ、落ちたら起動し直し、
-/// 本体の終了時に止める。`config`(ローカル管理のトンネル)か `token_file`(ダッシュボード管理)のどちらかを指定する。
+/// 本体の終了時に止める。`token` / `token_file`(ダッシュボードで作ったトンネル)か
+/// `config`(ローカル管理のトンネル)のどれか 1 つを指定する。
+/// cloudflared が見つからなければ公式リリースから `bin_dir` にダウンロードする。
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TunnelConfig {
     #[serde(default)]
     pub enabled: bool,
-    /// cloudflared の実行ファイル(PATH から探す名前か絶対パス)
+    /// ダッシュボード(Zero Trust → Networks → Tunnels)で作ったトンネルのトークン
+    #[serde(default)]
+    pub token: String,
+    /// cloudflared の実行ファイル(PATH・bin_dir から探す名前か、パス)
     #[serde(default = "default_tunnel_cloudflared")]
     pub cloudflared: String,
+    /// cloudflared が見つからないとき、公式リリースからダウンロードするか
+    #[serde(default = "default_tunnel_auto_download")]
+    pub auto_download: bool,
+    /// ダウンロードした cloudflared を置くディレクトリ
+    #[serde(default = "default_tunnel_bin_dir")]
+    pub bin_dir: String,
     /// cloudflared の設定ファイル(例: "~/.cloudflared/dcr-transcribe.yml")
     #[serde(default)]
     pub config: String,
@@ -149,11 +160,22 @@ fn default_tunnel_cloudflared() -> String {
     "cloudflared".to_string()
 }
 
+fn default_tunnel_auto_download() -> bool {
+    true
+}
+
+fn default_tunnel_bin_dir() -> String {
+    "./bin".to_string()
+}
+
 impl Default for TunnelConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            token: String::new(),
             cloudflared: default_tunnel_cloudflared(),
+            auto_download: default_tunnel_auto_download(),
+            bin_dir: default_tunnel_bin_dir(),
             config: String::new(),
             token_file: String::new(),
         }

@@ -86,9 +86,12 @@ wav_output_dir = "./recordings"
 # Run cloudflared as a child process (started/restarted/stopped with the app)
 # [tunnel]
 # enabled = true
-# cloudflared = "cloudflared"                   # executable name or absolute path
-# config = "~/.cloudflared/dcr-transcribe.yml"  # locally-managed tunnel, or:
-# token_file = ""                               # file containing a dashboard-managed tunnel token
+# token = "eyJ..."                              # dashboard-managed tunnel token (Zero Trust → Networks → Tunnels), or:
+# token_file = ""                               # file containing the token, or:
+# config = "~/.cloudflared/dcr-transcribe.yml"  # locally-managed tunnel config
+# cloudflared = "cloudflared"                   # executable name (searched in PATH and bin_dir) or path
+# auto_download = true                          # download the official release if cloudflared is missing
+# bin_dir = "./bin"                             # where the downloaded cloudflared is placed
 
 # Live listening from the remote viewer: pick channels, the server mixes them and streams AAC
 # [live]
