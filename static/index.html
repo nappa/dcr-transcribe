@@ -70,7 +70,8 @@ body{
 .tab .meter{height:3px;border-radius:2px;background:#2f333c;overflow:hidden}
 .tab .meter i{display:block;height:100%;width:0;background:var(--ch-fg,#8aa);transition:width .25s}
 .tab.rx .meter i{background:#ff6b6b}
-.tab .tst{display:none;font-size:11px;font-variant-numeric:tabular-nums}
+/* 状態の文字(受信中 n秒 / 最終受信 / 待機中)は長さが変わるので、常に 1 行分の高さで折り返さない(レイアウトを動かさない) */
+.tab .tst{display:none;font-size:11px;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-height:1.5em;line-height:1.5em}
 .tab .tx{margin-left:auto;font-size:10px;font-weight:600;padding:0 5px;border-radius:6px;background:#333842;color:#778}
 .tab .tx.on{background:#1a4a2a;color:#9f9}
 .tab .tx.err{background:#4a1a1a;color:#f99}
@@ -84,7 +85,9 @@ body{
 .live .lbl{font-size:11px;color:var(--muted);flex-shrink:0}
 .live .chips{flex:1;margin:0;padding:0 0 4px}
 .lp{
-  flex-shrink:0;border:none;border-radius:14px;padding:6px 12px;min-height:30px;
+  /* 表示(▶ 聞く / ■ 停止 0.3秒 / 接続中…)が変わっても幅を変えない */
+  flex-shrink:0;width:7.5em;white-space:nowrap;font-variant-numeric:tabular-nums;
+  border:none;border-radius:14px;padding:6px 8px;min-height:30px;
   background:#2a4060;color:#fff;font-size:12px;font-weight:600;cursor:pointer;font-family:inherit;
 }
 .lp.on{background:#a33;}
@@ -307,7 +310,7 @@ function drawAllTab(){
   var t=tabsBox.querySelector("[data-all]");
   if(!t)return;
   var n=0;for(var c in chs)if(chs[c].r)n++;
-  t.textContent=n?"受信中 "+n+" ch":"";
+  t.textContent=n?"受信中 "+n+" ch":"待機中";
   t.closest(".tab").classList.toggle("rx",n>0);
 }
 // 経過秒の表示を進める(通信なし)
@@ -421,8 +424,9 @@ var liveWanted=false,liveRetry=0,liveWaitSince=0,liveLag=0,liveEngine=null;
 var LIVE_FAST_LAG=3,LIVE_JUMP_LAG=5,LIVE_STALL_MS=10000;
 function liveUi(state){
   lplay.className="lp"+(state==="on"?" on":state==="wait"?" wait":"");
-  var lag=liveEngine==="ll"||liveLag>LIVE_FAST_LAG?"(遅延 "+liveLag.toFixed(1)+"秒)":"";
+  var lag=liveEngine==="ll"||liveLag>LIVE_FAST_LAG?" "+liveLag.toFixed(1)+"秒":"";
   lplay.textContent=state==="on"?"■ 停止"+lag:state==="wait"?"接続中…":"▶ 聞く";
+  lplay.title=lag?"遅延"+lag:"";
 }
 // "audio" エンジン: 溜まった分を測り、多ければ速く再生するか今の音まで飛ぶ
 function catchUpLive(){
