@@ -39,15 +39,18 @@
 //! Config::write_default("config.toml").unwrap();
 //! ```
 
+pub mod aac;
 pub mod audio_input;
 pub mod audio_output;
 pub mod aws_transcribe;
 pub mod buffer;
 pub mod channel_processor;
 pub mod config;
+pub mod live;
 pub mod flac_encoder;
 pub mod opus_encoder;
 pub mod remote_server;
+pub mod segment_recorder;
 pub mod transcribe;
 pub mod transcribe_backend;
 pub mod tui_state;

@@ -61,6 +61,8 @@ pub struct AwsTranscribeBackend {
     config: TranscribeConfig,
     channel_id: usize,
     start_time: SystemTime,
+    /// 次のストリームの先頭サンプルが録音された時刻(未設定なら start_time)
+    stream_origin: Option<SystemTime>,
     /// 再接続回数（メトリクス収集用）
     reconnection_count: u32,
     /// 現在実行中のタスクハンドル（リソースリーク防止用）
@@ -79,6 +81,7 @@ impl AwsTranscribeBackend {
             config,
             channel_id,
             start_time,
+            stream_origin: None,
             reconnection_count: 0,
             task_handle: None,
         })
@@ -118,6 +121,14 @@ impl TranscribeBackend for AwsTranscribeBackend {
         let sample_rate = self.config.sample_rate;
         let channel_id = self.channel_id;
         let start_time = self.start_time;
+        // AWS の音声タイムスタンプはストリーム先頭からの秒数なので、
+        // ストリーム先頭が start_time から何秒後かを足して start_time 基準に直す
+        let stream_offset_secs = self
+            .stream_origin
+            .take()
+            .and_then(|origin| origin.duration_since(start_time).ok())
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
 
         // 古いタスクがあれば明示的に abort する。
         // 注: tokio の JoinHandle は drop しても task は止まらない(detach されるだけ)。
@@ -343,10 +354,10 @@ impl TranscribeBackend for AwsTranscribeBackend {
                                             // 【切り分けポイント2】AWS Transcribeの音声タイムスタンプを取得
                                             let audio_start_time = alt.items.as_ref()
                                                 .and_then(|items| items.first())
-                                                .map(|item| item.start_time);
+                                                .map(|item| item.start_time + stream_offset_secs);
                                             let audio_end_time = alt.items.as_ref()
                                                 .and_then(|items| items.last())
-                                                .map(|item| item.end_time);
+                                                .map(|item| item.end_time + stream_offset_secs);
 
                                             let transcript = if let Some(start_secs) = audio_start_time {
                                                 // AWS Transcribe の実際の音声タイムスタンプを使用
@@ -433,6 +444,10 @@ impl TranscribeBackend for AwsTranscribeBackend {
         self.task_handle = Some(handle);
 
         Ok((audio_tx, result_rx))
+    }
+
+    fn set_stream_origin(&mut self, origin: SystemTime) {
+        self.stream_origin = Some(origin);
     }
 
     fn channel_id(&self) -> usize {

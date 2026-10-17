@@ -3,6 +3,7 @@
 
 use crate::aws_transcribe::AwsTranscribeBackend;
 use crate::buffer::AudioBuffer;
+use crate::segment_recorder::{SegmentInfo, SegmentRecorder};
 use crate::config::{BufferConfig, ChannelConfig, OutputConfig, TranscribeBackendType, TranscribeConfig, VadConfig, WhisperConfig};
 use crate::transcribe::TranscribeClient;
 use crate::transcribe_backend::TranscribeBackend;
@@ -110,6 +111,10 @@ pub struct ChannelProcessor {
     send_buffered_on_reconnect: bool,
     /// 再接続バックオフ管理
     reconnect_backoff: ReconnectBackoff,
+    /// 発話区間ごとの録音(無効なら None)
+    segment_recorder: Option<SegmentRecorder>,
+    /// 録音を終えてまだ取り出されていない区間
+    finished_segments: Vec<SegmentInfo>,
 }
 
 impl ChannelProcessor {
@@ -187,6 +192,8 @@ impl ChannelProcessor {
                 RECONNECT_BACKOFF_INITIAL_MS,
                 RECONNECT_BACKOFF_MAX_MS,
             ),
+            segment_recorder: None,
+            finished_segments: Vec::new(),
         })
     }
 
@@ -197,6 +204,21 @@ impl ChannelProcessor {
             channel.set_vad_threshold(self.vad_threshold_db);
         });
         self.tui_state = Some(tui_state);
+    }
+
+    /// 発話区間ごとの録音を有効にする
+    pub fn set_segment_recorder(&mut self, recorder: SegmentRecorder) {
+        self.segment_recorder = Some(recorder);
+    }
+
+    /// 録音を終えた区間を取り出す
+    pub fn take_finished_segments(&mut self) -> Vec<SegmentInfo> {
+        std::mem::take(&mut self.finished_segments)
+    }
+
+    /// 直近に開始した録音区間の ID(文字起こし結果のひも付け用)
+    pub fn last_segment_id(&self) -> Option<u64> {
+        self.segment_recorder.as_ref().and_then(|r| r.last_segment_id())
     }
 
     /// 音声出力用Senderを設定
@@ -226,7 +248,8 @@ impl ChannelProcessor {
                 "チャンネル {}: 起動時にTranscribe接続を開始",
                 self.channel_id
             );
-            self.reconnect_transcribe().await?;
+            // 最初のチャンクは接続後に届くので、今をストリーム先頭とみなす
+            self.reconnect_transcribe(std::time::SystemTime::now()).await?;
         } else {
             log::info!(
                 "チャンネル {}: 音声検出まで接続を待機",
@@ -262,6 +285,22 @@ impl ChannelProcessor {
         // 3. VADで音声区間を判定
         let is_voice = self.vad.process(samples);
         let volume_db = self.vad.get_last_volume_db();
+
+        // 3.5 発話区間ごとの録音(失敗しても文字起こしは止めない)
+        if let Some(recorder) = &mut self.segment_recorder {
+            match recorder.process(samples, volume_db, chunk.timestamp_ns) {
+                Ok(Some(info)) => self.finished_segments.push(info),
+                Ok(None) => {}
+                Err(e) => {
+                    log::error!(
+                        "チャンネル {}: 区間録音に失敗したため無効化します: {}",
+                        self.channel_id,
+                        e
+                    );
+                    self.segment_recorder = None;
+                }
+            }
+        }
 
         // 4. TUI状態を更新
         if let Some(tui_state) = &self.tui_state {
@@ -312,8 +351,20 @@ impl ChannelProcessor {
                     return Ok(());
                 }
 
+                // ストリーム先頭 = 先に送る切断中バッファの頭(無ければこのチャンクの頭)。
+                // timestamp_ns はチャンクを受け取った時刻なので、チャンク長ぶん戻す
+                let lead_ms = chunk_duration_ms as u64
+                    + if self.send_buffered_on_reconnect {
+                        buffered_duration_ms as u64
+                    } else {
+                        0
+                    };
+                let stream_origin = std::time::UNIX_EPOCH
+                    + std::time::Duration::from_nanos(chunk.timestamp_ns as u64)
+                    - std::time::Duration::from_millis(lead_ms);
+
                 // 再接続を試みる
-                if let Err(e) = self.reconnect_transcribe().await {
+                if let Err(e) = self.reconnect_transcribe(stream_origin).await {
                     self.reconnect_backoff.record_failure(now);
                     log::warn!(
                         "チャンネル {}: 再接続失敗(次回まで {}ms)、サンプルを切断中バッファへ蓄積({} 件目): {}",
@@ -521,7 +572,9 @@ impl ChannelProcessor {
     }
 
     /// Transcribe APIに再接続
-    async fn reconnect_transcribe(&mut self) -> Result<()> {
+    ///
+    /// `stream_origin` はこのストリームに最初に送るサンプルが録音された時刻
+    async fn reconnect_transcribe(&mut self, stream_origin: std::time::SystemTime) -> Result<()> {
         // 既に接続中の場合は何もしない
         if self.connection_state == TranscribeConnectionState::Connected {
             return Ok(());
@@ -531,6 +584,7 @@ impl ChannelProcessor {
 
         // バックエンドから新しいストリームを開始
         if let Some(mut backend) = self.transcribe_backend.take() {
+            backend.set_stream_origin(stream_origin);
             match backend.start_stream().await {
                 Ok((tx, rx)) => {
                     self.transcribe_tx = Some(tx);
@@ -629,6 +683,13 @@ impl ChannelProcessor {
 
         // WAVファイルを終了
         self.wav_writer.finalize()?;
+
+        // 録音中の区間を閉じる
+        if let Some(recorder) = &mut self.segment_recorder {
+            if let Some(info) = recorder.finish()? {
+                self.finished_segments.push(info);
+            }
+        }
 
         Ok(())
     }
@@ -1061,5 +1122,94 @@ mod tests {
         b.record_failure(t0);
         // u64::MAX を超えない
         assert!(b.current_ms <= u64::MAX);
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // ストリーム先頭時刻の受け渡し
+    // ─────────────────────────────────────────────────────────────────
+
+    /// 渡された stream_origin を記録するだけのバックエンド
+    struct OriginRecorder {
+        origins: std::sync::Arc<std::sync::Mutex<Vec<std::time::SystemTime>>>,
+        // 受信側を保持しておかないと送信がクローズ扱いになる
+        audio_rx: Option<mpsc::Receiver<Vec<i16>>>,
+        _result_tx: Option<mpsc::Sender<TranscriptResult>>,
+    }
+
+    #[async_trait::async_trait]
+    impl TranscribeBackend for OriginRecorder {
+        async fn start_stream(
+            &mut self,
+        ) -> Result<(mpsc::Sender<Vec<i16>>, mpsc::Receiver<TranscriptResult>)> {
+            let (atx, arx) = mpsc::channel(64);
+            let (rtx, rrx) = mpsc::channel(8);
+            self.audio_rx = Some(arx);
+            self._result_tx = Some(rtx);
+            Ok((atx, rrx))
+        }
+
+        fn set_stream_origin(&mut self, origin: std::time::SystemTime) {
+            self.origins.lock().unwrap().push(origin);
+        }
+
+        fn channel_id(&self) -> usize {
+            0
+        }
+    }
+
+    #[tokio::test]
+    async fn reconnect_passes_chunk_start_as_stream_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut proc = ChannelProcessor::new(
+            &ChannelConfig { id: 0, name: "t".into(), enabled: true },
+            &VadConfig {
+                threshold_db: -40.0,
+                hangover_duration_ms: 500,
+                silence_disconnect_threshold_ms: 10000,
+            },
+            &BufferConfig {
+                capacity_seconds: 30,
+                drop_policy: crate::types::DropPolicy::DropOldest,
+            },
+            &TranscribeConfig::default(),
+            None,
+            &OutputConfig {
+                wav_output_dir: dir.path().to_string_lossy().into_owned(),
+                log_level: "info".into(),
+            },
+            16000,
+            std::time::SystemTime::now(),
+        )
+        .await
+        .unwrap();
+        let origins = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        proc.transcribe_backend = Some(Box::new(OriginRecorder {
+            origins: origins.clone(),
+            audio_rx: None,
+            _result_tx: None,
+        }));
+
+        // 100ms (1600 サンプル) のチャンク。timestamp_ns はチャンクを受け取った時刻
+        let received_ns: u128 = 1_700_000_000_000_000_000;
+        let silence = AudioChunk {
+            samples: vec![0; 1600],
+            format: crate::types::AudioFormat { sample_rate: 16000, channels: 1 },
+            timestamp_ns: received_ns - 100_000_000,
+        };
+        proc.process_chunk(silence).await.unwrap();
+        assert!(origins.lock().unwrap().is_empty());
+
+        let voice = AudioChunk {
+            samples: (0..1600).map(|i| ((i as f32 * 0.1).sin() * 10000.0) as i16).collect(),
+            format: crate::types::AudioFormat { sample_rate: 16000, channels: 1 },
+            timestamp_ns: received_ns,
+        };
+        proc.process_chunk(voice).await.unwrap();
+
+        let got = origins.lock().unwrap().clone();
+        assert_eq!(got.len(), 1);
+        let expected = std::time::UNIX_EPOCH
+            + std::time::Duration::from_nanos((received_ns - 100_000_000) as u64);
+        assert_eq!(got[0], expected);
     }
 }

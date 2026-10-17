@@ -594,9 +594,9 @@ pub enum TranscribeStatus {
 
 ## Remote Server モジュール
 
-**責務**: HTTP/SSE による文字起こし結果のリアルタイム配信(ngrok 経由でモバイル端末から閲覧)
+**責務**: HTTP/SSE による文字起こし結果のリアルタイム配信と、発話ごとの録音の再生(Cloudflare Tunnel 経由でモバイル端末から閲覧)
 
-**ファイル**: `src/remote_server.rs`, `static/index.html`
+**ファイル**: `src/remote_server.rs`, `src/segment_recorder.rs`, `src/live.rs`, `src/aac.rs`, `static/index.html`
 
 **設計目標**:
 - スマートフォンからの閲覧を主対象とする
@@ -608,19 +608,25 @@ pub enum TranscribeStatus {
 
 ```
 [transcript task]
-    │ state.push(&result)  (同期、Mutex は µs レベル)
+    │ state.push_with_segment(&result, segment_id)  (同期、Mutex は µs レベル)
+    │ state.push_segment(&segment)                  (区間録音が閉じたとき)
     v
 [RemoteState]
     ├── next_id: AtomicU64                              (単調増加 ID)
     ├── history: Mutex<VecDeque<StoredEvent {id,event}>>(再接続時の欠損補完用)
-    └── broadcaster: broadcast::Sender<StoredEvent>     (既存接続へのライブ配信、cap=256)
+    ├── broadcaster: broadcast::Sender<StoredEvent>     (既存接続へのライブ配信、cap=256)
+    └── segments: SegmentStore                          (録音区間の一覧 最大 1000 件 + 配信)
     v
 [axum HTTP/SSE handlers]
-    ├── GET /          → モバイル対応 HTML(gzip 後 ~3KB)
-    ├── GET /stream    → SSE: hello + 履歴(Last-Event-ID 以降) + ライブ
-    └── GET /healthz   → "ok"
+    ├── GET /            → モバイル対応 HTML
+    ├── GET /stream      → SSE: hello + 履歴(Last-Event-ID 以降) + ライブ(msg / seg)
+    ├── GET /history     → 過去の文字起こし
+    ├── GET /segments    → 録音区間の一覧(?after=<id> で差分)
+    ├── GET /audio/{id}  → 録音区間の AAC / WAV(Range 対応)
+    ├── GET /live?c=..   → 選んだチャンネルのミックス(AAC/ADTS の連続ストリーム)
+    └── GET /healthz     → "ok"
     v
-[127.0.0.1:8765] ←── ngrok ──→ [モバイルブラウザ N 台]
+[127.0.0.1:8765] ←── cloudflared (名前付きトンネル) ──→ [モバイルブラウザ N 台]
 ```
 
 **多クライアント・スロークライアント対策**:
@@ -656,10 +662,41 @@ pub enum TranscribeStatus {
 - viewport-fit=cover + `env(safe-area-inset-*)` で notch / ホームインジケータ回避
 - システムフォント (`-apple-system`, `Hiragino Sans`, `Yu Gothic UI`) で日本語綺麗
 - スティッキーヘッダにチャンネルフィルタチップ(タップで表示/非表示、localStorage 永続化)
-- 「最新へ」FAB(スクロール上方時に新着件数を表示)
+- 新しい順(新着が上)。各行に時刻 `data-k` を持たせて降順に挿入するので、遅れて届いた結果も時刻の位置に入る
+- 見ている位置より上に行が入ったらその分スクロールして表示を保つ(`overflow-anchor: none` で自前補正)
+- 「最新へ」FAB(下へスクロール中に新着件数を表示)、過去分は下端で `/history` から読み込む
+- 録音の連続再生: 再生し終えたら録音時刻が次に新しい区間へ。最新まで来たら `seg` イベントを待って続ける
 - 接続状態を可視化(接続中/再接続中…/切断 を色付きピルで表示)
 
-詳細なセットアップ手順は [README.md](README.md#リモート閲覧-httpsse--ngrok) を参照。
+**発話ごとの録音** (`SegmentRecorder`、`[segments]`):
+
+- `ChannelProcessor::process_chunk` で VAD と同じ音量値を受け取り、`threshold_db` 超えで区間開始、`silence_split_ms` の無音で区間終了
+- VAD のハングオーバー(Transcribe 接続維持用で長い)とは独立に判定するので、発話の切れ目ごとに区切れる
+- 無音中のサンプルはメモリに保留し、発話が再開したら書き出す → 末尾の無音を `tail_ms` に切り詰めつつストリーミング書き込み
+- 区間 ID はプロセス内で単調増加。文字起こし結果は受信時点で録音中(または直前)の区間 ID `g` を持つ
+  (Transcribe のタイムスタンプはストリームごとに 0 から始まるので、時刻での突き合わせはしない)
+- 区間は SSE `event: seg` (ID なし) で通知。再接続時はクライアントが `/segments?after=<既知の最大 ID>` で取りこぼしを回収
+- `/audio/{id}` は登録済み ID のみ受け付け(任意パスは読ませない)、iOS Safari のため Range に対応、`Cache-Control: private`
+- 保存形式は AAC-LC / ADTS (`src/aac.rs`、fdk-aac) が既定。ADTS はコンテナ不要で、書き込み途中でも先頭から再生できる
+
+**ライブ再生** (`LiveHub`、`[live]`):
+
+```
+[AudioInput callback] ── 聞いている人がいる間だけ ──> LiveFrame {全有効 ch のサンプル}
+        │ try_send (mpsc 64、詰まったら捨てる)
+        v
+[LiveHub::run] 各ミックス(ch の組み合わせ)ごとに 合算 → AacEncoder → broadcast<Bytes>
+        v
+[GET /live?c=2,3] → broadcast::Receiver → chunked レスポンス (audio/aac)
+```
+
+- ミックスは同じコールバック由来のサンプルを足すので、チャンネル間の時間ずれが無い
+- 同じ組み合わせの聴取者はエンコーダを共有。受信者ゼロになったミックスは次のフレームで破棄
+- どのミックスも無ければ `active` フラグが落ち、コールバックはサンプルを複製しない
+- 遅れた聴取者は `Lagged` で古いフレームを飛ばす(SSE と違い切断しない。音は途切れるが遅延は溜めない)
+- ADTS はフレーム単位で同期できるので、途中から購読しても復号できる
+
+詳細なセットアップ手順は [README.md](README.md#リモート閲覧-httpsse--cloudflare-tunnel) を参照。
 
 ## 今後の拡張性
 

@@ -1,6 +1,6 @@
 //! リモート閲覧用の HTTP/SSE サーバ
 //!
-//! `axum` で軽量サーバを localhost に立て、`ngrok http <port>` で公開する想定。
+//! `axum` で軽量サーバを localhost に立て、Cloudflare Tunnel (`cloudflared`) で公開する想定。
 //!
 //! # エンドポイント
 //!
@@ -9,6 +9,11 @@
 //!     - 接続時に `event: hello` で anchor 時刻とチャンネル一覧を送信
 //!     - 続いて `event: msg` で履歴(直近 N 件、または `Last-Event-ID` 以降)を流す
 //!     - 以降、新規イベントを `event: msg` で順次配信
+//!     - 発話区間の録音が閉じるたびに `event: seg` を配信(ID なし、再接続時は `/segments` で回収)
+//! - `GET /history` - 過去の文字起こし
+//! - `GET /segments?after=<id>` - 録音区間の一覧(`after` より新しいもの)
+//! - `GET /live?c=<id>,<id>` - 選んだチャンネルをミックスしたライブ音声(AAC/ADTS の連続ストリーム)
+//! - `GET /audio/{id}` - 録音区間の AAC / WAV(Range リクエスト対応、iOS Safari の再生に必須)
 //! - `GET /healthz` - "ok" 返却
 //!
 //! # 多クライアント・スロークライアント耐性
@@ -32,9 +37,12 @@
 //! - サーバタスクが落ちても他に波及しない
 
 use crate::config::{ChannelConfig, RemoteConfig};
+use crate::live::LiveHub;
+use crate::segment_recorder::SegmentInfo;
 use crate::types::TranscriptResult;
 use anyhow::{Context, Result};
-use axum::extract::{Query, State};
+use axum::body::Body;
+use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -54,6 +62,8 @@ const HTML_PAGE: &str = include_str!("../static/index.html");
 /// broadcast バッファ容量。スロークライアントが本数ぶん遅れた時点で Lagged として切断される。
 /// 小さいほどスロークライアントを早く切るが、瞬間的なバースト時の誤切断も増える。
 const BROADCAST_CAPACITY: usize = 256;
+/// メモリに保持する録音区間の最大数。古いものは一覧から消える(ファイルは残る)
+const MAX_SEGMENTS: usize = 1000;
 
 /// SSE で配信する1イベント(転送量最小化のため短いキー)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,6 +77,50 @@ struct WireEvent {
     /// partial フラグ。false なら省略
     #[serde(default, skip_serializing_if = "is_false")]
     p: bool,
+    /// 録音区間 ID。区間録音が無効なら省略
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    g: Option<u64>,
+}
+
+/// `event: seg` / `/segments` で配信する録音区間
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct WireSegment {
+    /// segment id
+    i: u64,
+    /// channel id
+    c: usize,
+    /// 開始時刻(UNIX ミリ秒)
+    t: u64,
+    /// 長さ(ミリ秒)
+    d: u64,
+}
+
+/// 録音区間の一覧と配信
+struct SegmentStore {
+    enabled: bool,
+    items: Mutex<VecDeque<(WireSegment, std::path::PathBuf)>>,
+    broadcaster: broadcast::Sender<WireSegment>,
+}
+
+impl SegmentStore {
+    fn new(enabled: bool) -> Self {
+        let (tx, _rx) = broadcast::channel(BROADCAST_CAPACITY);
+        Self {
+            enabled,
+            items: Mutex::new(VecDeque::new()),
+            broadcaster: tx,
+        }
+    }
+
+    fn after(&self, after: u64) -> Vec<WireSegment> {
+        let items = self.items.lock().unwrap();
+        items.iter().filter(|(w, _)| w.i > after).map(|(w, _)| w.clone()).collect()
+    }
+
+    fn path(&self, id: u64) -> Option<std::path::PathBuf> {
+        let items = self.items.lock().unwrap();
+        items.iter().find(|(w, _)| w.i == id).map(|(_, p)| p.clone())
+    }
 }
 
 fn is_false(v: &bool) -> bool {
@@ -92,6 +146,12 @@ struct Hello {
     /// anchor 時刻(ISO 8601)。クライアントは `s` と組み合わせて壁時計時刻を計算
     anchor: String,
     channels: Vec<ChannelInfo>,
+    /// 区間録音が有効か(クライアントは true のとき `/segments` を取りに行く)
+    #[serde(skip_serializing_if = "is_false")]
+    seg: bool,
+    /// ライブ再生が使えるか
+    #[serde(skip_serializing_if = "is_false")]
+    live: bool,
 }
 
 #[derive(Deserialize)]
@@ -119,6 +179,30 @@ fn default_history_limit() -> usize {
     50
 }
 
+#[derive(Deserialize)]
+struct SegmentsQuery {
+    #[serde(default)]
+    t: Option<String>,
+    /// この ID より新しい区間を返す
+    #[serde(default)]
+    after: u64,
+}
+
+#[derive(Deserialize)]
+struct LiveQuery {
+    #[serde(default)]
+    t: Option<String>,
+    /// カンマ区切りのチャンネル ID
+    #[serde(default)]
+    c: String,
+}
+
+#[derive(Deserialize)]
+struct TokenQuery {
+    #[serde(default)]
+    t: Option<String>,
+}
+
 /// `subscribe` への mode 指定
 #[derive(Debug, Clone, Copy)]
 enum SubscribeMode {
@@ -144,11 +228,19 @@ pub struct RemoteState {
     basic_auth_pass: String,
     anchor: String,
     channels: Vec<ChannelInfo>,
+    segments: SegmentStore,
+    live: Option<Arc<LiveHub>>,
 }
 
 impl RemoteState {
     /// 文字起こし結果を投入(同期、ノンブロッキング)
+    #[allow(dead_code)] // バイナリ側は push_with_segment を使う。テストとライブラリ利用向け
     pub fn push(&self, result: &TranscriptResult) {
+        self.push_with_segment(result, None);
+    }
+
+    /// 録音区間 ID 付きで文字起こし結果を投入
+    pub fn push_with_segment(&self, result: &TranscriptResult, segment: Option<u64>) {
         if result.is_partial {
             if !self.include_partials {
                 return;
@@ -169,6 +261,7 @@ impl RemoteState {
             s: result.timestamp_seconds,
             x: result.text.clone(),
             p: result.is_partial,
+            g: segment,
         };
 
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -181,6 +274,22 @@ impl RemoteState {
             hist.pop_front();
         }
         let _ = self.broadcaster.send(stored); // 受信者ゼロでもエラーにしない
+    }
+
+    /// 録音を終えた区間を登録して配信(同期、ノンブロッキング)
+    pub fn push_segment(&self, info: &SegmentInfo) {
+        let wire = WireSegment {
+            i: info.id,
+            c: info.channel,
+            t: info.start_unix_ms,
+            d: info.duration_ms,
+        };
+        let mut items = self.segments.items.lock().unwrap();
+        items.push_back((wire.clone(), info.path.clone()));
+        while items.len() > MAX_SEGMENTS {
+            items.pop_front();
+        }
+        let _ = self.segments.broadcaster.send(wire);
     }
 
     /// SSE 接続用に「履歴のスナップショット」と「新規イベント受信用 Receiver」を atomic に取得。
@@ -263,6 +372,8 @@ pub async fn start(
     config: RemoteConfig,
     channels_config: &[ChannelConfig],
     start_time: SystemTime,
+    segments_enabled: bool,
+    live: Option<Arc<LiveHub>>,
 ) -> Result<Arc<RemoteState>> {
     let anchor = chrono::DateTime::<chrono::Utc>::from(start_time).to_rfc3339();
     let channels: Vec<ChannelInfo> = channels_config
@@ -289,14 +400,11 @@ pub async fn start(
         basic_auth_pass: config.basic_auth_pass.clone(),
         anchor,
         channels,
+        segments: SegmentStore::new(segments_enabled),
+        live,
     });
 
-    let app = Router::new()
-        .route("/", get(serve_index))
-        .route("/stream", get(serve_stream))
-        .route("/history", get(serve_history))
-        .route("/healthz", get(serve_health))
-        .with_state(state.clone());
+    let app = router(state.clone());
 
     let listener = tokio::net::TcpListener::bind(&config.listen)
         .await
@@ -328,6 +436,18 @@ pub async fn start(
     });
 
     Ok(state)
+}
+
+fn router(state: Arc<RemoteState>) -> Router {
+    Router::new()
+        .route("/", get(serve_index))
+        .route("/stream", get(serve_stream))
+        .route("/history", get(serve_history))
+        .route("/segments", get(serve_segments))
+        .route("/audio/{id}", get(serve_audio))
+        .route("/live", get(serve_live))
+        .route("/healthz", get(serve_health))
+        .with_state(state)
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -436,15 +556,175 @@ async fn serve_history(
         .into_response()
 }
 
+async fn serve_segments(
+    State(state): State<Arc<RemoteState>>,
+    Query(q): Query<SegmentsQuery>,
+    headers: HeaderMap,
+) -> Response {
+    if !state.check_basic_auth(&headers) {
+        return unauthorized_basic();
+    }
+    if !state.check_token(q.t.as_deref()) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }
+    let body = serde_json::json!({ "items": state.segments.after(q.after) }).to_string();
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+/// 録音区間のファイルを返す。一覧に登録済みの ID だけを受け付ける(任意パスは読ませない)
+async fn serve_audio(
+    State(state): State<Arc<RemoteState>>,
+    Path(id): Path<u64>,
+    Query(q): Query<TokenQuery>,
+    headers: HeaderMap,
+) -> Response {
+    if !state.check_basic_auth(&headers) {
+        return unauthorized_basic();
+    }
+    if !state.check_token(q.t.as_deref()) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }
+    let Some(path) = state.segments.path(id) else {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    };
+    let data = match tokio::fs::read(&path).await {
+        Ok(d) => d,
+        Err(e) => {
+            log::warn!("Remote: 区間 WAV の読み込みに失敗 {:?}: {}", path, e);
+            return (StatusCode::NOT_FOUND, "not found").into_response();
+        }
+    };
+    let content_type = match path.extension().and_then(|e| e.to_str()) {
+        Some("wav") => "audio/wav",
+        _ => "audio/aac",
+    };
+    audio_response(data, content_type, headers.get(header::RANGE).and_then(|v| v.to_str().ok()))
+}
+
+/// 選んだチャンネルのミックスを AAC (ADTS) で流し続ける。
+///
+/// 長さの決まらない 1 本のレスポンスなので、ブラウザは `<audio src>` でネットラジオと同じように再生する。
+/// 遅れたクライアントは古いフレームを飛ばして追いつかせる(音は途切れるが遅延は溜めない)。
+async fn serve_live(
+    State(state): State<Arc<RemoteState>>,
+    Query(q): Query<LiveQuery>,
+    headers: HeaderMap,
+) -> Response {
+    if !state.check_basic_auth(&headers) {
+        return unauthorized_basic();
+    }
+    if !state.check_token(q.t.as_deref()) {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }
+    let Some(hub) = &state.live else {
+        return (StatusCode::NOT_FOUND, "live disabled").into_response();
+    };
+    let channels: Option<Vec<usize>> = q.c.split(',').map(|s| s.trim().parse().ok()).collect();
+    let mut rx = match channels.map(|c| hub.subscribe(&c)) {
+        Some(Ok(rx)) => rx,
+        Some(Err(e)) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        None => return (StatusCode::BAD_REQUEST, "invalid channel list").into_response(),
+    };
+    let stream = async_stream::stream! {
+        loop {
+            match rx.recv().await {
+                Ok(bytes) => yield Ok::<_, Infallible>(bytes),
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    log::debug!("Remote live: 遅れたクライアントのフレームを {} 個飛ばした", n);
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    };
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "audio/aac"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        Body::from_stream(stream),
+    )
+        .into_response()
+}
+
+/// 音声ファイル本体を Range 指定に従って返す。
+///
+/// iOS Safari は `<audio>` 再生時に必ず Range リクエストを送り、206 が返らないと再生しない。
+/// 区間ファイルは数 MB 程度なので、全体を読んでからスライスする。
+fn audio_response(data: Vec<u8>, content_type: &'static str, range: Option<&str>) -> Response {
+    let len = data.len() as u64;
+    // 認証付きなので Cloudflare 等の共有キャッシュには載せない
+    let cache = (header::CACHE_CONTROL, "private, max-age=86400");
+    let accept = (header::ACCEPT_RANGES, "bytes");
+    let ctype = (header::CONTENT_TYPE, content_type);
+
+    let Some(range) = range else {
+        return (StatusCode::OK, [ctype, accept, cache], data).into_response();
+    };
+    match parse_range(range, len) {
+        Some((start, end)) => {
+            let content_range = format!("bytes {}-{}/{}", start, end, len);
+            let body = data[start as usize..=end as usize].to_vec();
+            (
+                StatusCode::PARTIAL_CONTENT,
+                [ctype, accept, cache],
+                [(header::CONTENT_RANGE, content_range)],
+                body,
+            )
+                .into_response()
+        }
+        None => (
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            [(header::CONTENT_RANGE, format!("bytes */{}", len))],
+        )
+            .into_response(),
+    }
+}
+
+/// `bytes=a-b` / `bytes=a-` / `bytes=-n` を [start, end] (両端含む) に変換。
+/// 複数範囲には対応しない(ブラウザの音声再生では使われない)。
+fn parse_range(header: &str, len: u64) -> Option<(u64, u64)> {
+    let spec = header.trim().strip_prefix("bytes=")?;
+    if spec.contains(',') || len == 0 {
+        return None;
+    }
+    let (a, b) = spec.split_once('-')?;
+    let (start, end) = if a.is_empty() {
+        let n: u64 = b.parse().ok()?;
+        if n == 0 {
+            return None;
+        }
+        (len.saturating_sub(n), len - 1)
+    } else {
+        let start: u64 = a.parse().ok()?;
+        let end = if b.is_empty() { len - 1 } else { b.parse::<u64>().ok()?.min(len - 1) };
+        (start, end)
+    };
+    (start <= end && start < len).then_some((start, end))
+}
+
 fn build_stream(
     state: Arc<RemoteState>,
     mode: SubscribeMode,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
     async_stream::stream! {
+        // hello より前に購読しておく(hello を受けたクライアントが /segments を取るまでの取りこぼし防止)
+        let mut seg_rx = state.segments.broadcaster.subscribe();
+
         // 1. hello イベント(anchor + チャンネル名)
         let hello = Hello {
             anchor: state.anchor.clone(),
             channels: state.channels.clone(),
+            seg: state.segments.enabled,
+            live: state.live.is_some(),
         };
         let hello_data = serde_json::to_string(&hello).unwrap_or_else(|_| "{}".into());
         yield Ok(Event::default().event("hello").data(hello_data));
@@ -464,25 +744,38 @@ fn build_stream(
 
         // 4. ライブ配信
         loop {
-            match rx.recv().await {
-                Ok(stored) => {
-                    if let Ok(s) = serde_json::to_string(&stored.event) {
-                        yield Ok(Event::default()
-                            .event("msg")
-                            .id(stored.id.to_string())
-                            .data(s));
+            tokio::select! {
+                r = rx.recv() => match r {
+                    Ok(stored) => {
+                        if let Ok(s) = serde_json::to_string(&stored.event) {
+                            yield Ok(Event::default()
+                                .event("msg")
+                                .id(stored.id.to_string())
+                                .data(s));
+                        }
                     }
-                }
-                Err(broadcast::error::RecvError::Lagged(n)) => {
-                    // スロークライアントは即切断。
-                    // ブラウザは Last-Event-ID で再接続して history から欠損分を回収する。
-                    log::warn!(
-                        "Remote SSE: スロークライアントを切断 ({} events behind)",
-                        n
-                    );
-                    break;
-                }
-                Err(broadcast::error::RecvError::Closed) => break,
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        // スロークライアントは即切断。
+                        // ブラウザは Last-Event-ID で再接続して history から欠損分を回収する。
+                        log::warn!(
+                            "Remote SSE: スロークライアントを切断 ({} events behind)",
+                            n
+                        );
+                        break;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
+                r = seg_rx.recv() => match r {
+                    // 区間は ID を付けずに送る(lastEventId を文字起こし側の ID のまま保つため)
+                    Ok(seg) => {
+                        if let Ok(s) = serde_json::to_string(&seg) {
+                            yield Ok(Event::default().event("seg").data(s));
+                        }
+                    }
+                    // 区間は再接続時に /segments で回収できるので、文字起こしと同様に切断する
+                    Err(broadcast::error::RecvError::Lagged(_)) => break,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
             }
         }
     }
@@ -508,6 +801,8 @@ mod tests {
             basic_auth_pass: String::new(),
             anchor: "2025-01-01T00:00:00Z".to_string(),
             channels: vec![],
+            segments: SegmentStore::new(false),
+            live: None,
         })
     }
 
@@ -665,12 +960,7 @@ mod tests {
     use std::net::SocketAddr;
 
     async fn boot(state: Arc<RemoteState>) -> SocketAddr {
-        let app = Router::new()
-            .route("/", get(serve_index))
-            .route("/stream", get(serve_stream))
-            .route("/history", get(serve_history))
-            .route("/healthz", get(serve_health))
-            .with_state(state);
+        let app = router(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -1026,6 +1316,8 @@ mod tests {
             basic_auth_pass: String::new(),
             anchor: "2025-01-01T00:00:00Z".to_string(),
             channels: vec![],
+            segments: SegmentStore::new(false),
+            live: None,
         });
 
         // build_stream を直接駆動して、Lagged で break することを検証
@@ -1079,6 +1371,7 @@ mod tests {
             s: 2.5,
             x: "hi".to_string(),
             p: false,
+            g: None,
         };
         let json = serde_json::to_string(&ev).unwrap();
         assert!(!json.contains("\"p\""));
@@ -1092,6 +1385,7 @@ mod tests {
             s: 2.5,
             x: "hi".to_string(),
             p: true,
+            g: None,
         };
         let json = serde_json::to_string(&ev).unwrap();
         assert!(json.contains("\"p\":true"));
@@ -1209,5 +1503,255 @@ mod tests {
         assert_eq!(res.len(), 10);
         assert_eq!(res[0].id, 41);
         assert_eq!(res[9].id, 50);
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // 録音区間
+    // ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_range_variants() {
+        assert_eq!(parse_range("bytes=0-1", 10), Some((0, 1)));
+        assert_eq!(parse_range("bytes=0-", 10), Some((0, 9)));
+        assert_eq!(parse_range("bytes=4-100", 10), Some((4, 9)));
+        assert_eq!(parse_range("bytes=-3", 10), Some((7, 9)));
+        assert_eq!(parse_range("bytes=-30", 10), Some((0, 9)));
+        assert_eq!(parse_range("bytes=10-", 10), None);
+        assert_eq!(parse_range("bytes=5-2", 10), None);
+        assert_eq!(parse_range("bytes=-0", 10), None);
+        assert_eq!(parse_range("bytes=0-1,3-4", 10), None);
+        assert_eq!(parse_range("items=0-1", 10), None);
+        assert_eq!(parse_range("bytes=0-", 0), None);
+    }
+
+    fn state_with_segment(dir: &std::path::Path) -> Arc<RemoteState> {
+        let mut s = make_state(false, 10);
+        Arc::get_mut(&mut s).unwrap().segments = SegmentStore::new(true);
+        let path = dir.join("seg.aac");
+        std::fs::write(&path, b"0123456789").unwrap();
+        s.push_segment(&SegmentInfo {
+            id: 7,
+            channel: 2,
+            start_unix_ms: 1000,
+            duration_ms: 500,
+            path,
+        });
+        s
+    }
+
+    #[test]
+    fn transcript_carries_segment_id() {
+        let s = make_state(false, 10);
+        s.push_with_segment(&make_result(0, "a", false), Some(3));
+        s.push(&make_result(0, "b", false));
+        let (snap, _) = s.subscribe(SubscribeMode::All);
+        assert_eq!(snap[0].event.g, Some(3));
+        assert_eq!(snap[1].event.g, None);
+        assert!(!serde_json::to_string(&snap[1].event).unwrap().contains("\"g\""));
+    }
+
+    #[test]
+    fn segment_store_capped() {
+        let s = make_state(false, 10);
+        for i in 1..=(MAX_SEGMENTS as u64 + 5) {
+            s.push_segment(&SegmentInfo {
+                id: i,
+                channel: 0,
+                start_unix_ms: 0,
+                duration_ms: 0,
+                path: "x.wav".into(),
+            });
+        }
+        let all = s.segments.after(0);
+        assert_eq!(all.len(), MAX_SEGMENTS);
+        assert_eq!(all[0].i, 6);
+        assert_eq!(s.segments.after(MAX_SEGMENTS as u64).len(), 5);
+    }
+
+    #[tokio::test]
+    async fn http_segments_lists_after() {
+        let dir = tempfile::tempdir().unwrap();
+        let addr = boot(state_with_segment(dir.path())).await;
+        let body: serde_json::Value = reqwest::get(format!("http://{}/segments", addr))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            body["items"],
+            serde_json::json!([{ "i": 7, "c": 2, "t": 1000, "d": 500 }])
+        );
+        let body: serde_json::Value = reqwest::get(format!("http://{}/segments?after=7", addr))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(body["items"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn http_audio_full_and_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let addr = boot(state_with_segment(dir.path())).await;
+        let client = reqwest::Client::new();
+
+        let resp = client.get(format!("http://{}/audio/7", addr)).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers()["content-type"], "audio/aac");
+        assert_eq!(resp.headers()["accept-ranges"], "bytes");
+        assert!(resp.headers()["cache-control"].to_str().unwrap().starts_with("private"));
+        assert_eq!(resp.bytes().await.unwrap().as_ref(), b"0123456789");
+
+        let resp = client
+            .get(format!("http://{}/audio/7", addr))
+            .header("Range", "bytes=0-1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 206);
+        assert_eq!(resp.headers()["content-range"], "bytes 0-1/10");
+        assert_eq!(resp.bytes().await.unwrap().as_ref(), b"01");
+
+        let resp = client
+            .get(format!("http://{}/audio/7", addr))
+            .header("Range", "bytes=20-")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 416);
+    }
+
+    #[tokio::test]
+    async fn http_audio_unknown_id_is_404() {
+        let dir = tempfile::tempdir().unwrap();
+        let addr = boot(state_with_segment(dir.path())).await;
+        let resp = reqwest::get(format!("http://{}/audio/8", addr)).await.unwrap();
+        assert_eq!(resp.status(), 404);
+    }
+
+    #[tokio::test]
+    async fn http_audio_requires_auth() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = state_with_segment(dir.path());
+        let m = Arc::get_mut(&mut s).unwrap();
+        m.basic_auth_user = "alice".to_string();
+        m.basic_auth_pass = "secret".to_string();
+        m.auth_token = "tok".to_string();
+        let addr = boot(s).await;
+        let client = reqwest::Client::new();
+
+        let resp = client.get(format!("http://{}/audio/7?t=tok", addr)).send().await.unwrap();
+        assert_eq!(resp.status(), 401);
+        let resp = client
+            .get(format!("http://{}/audio/7", addr))
+            .basic_auth("alice", Some("secret"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+        let resp = client
+            .get(format!("http://{}/audio/7?t=tok", addr))
+            .basic_auth("alice", Some("secret"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn sse_delivers_seg_event() {
+        use futures_util::StreamExt;
+        let dir = tempfile::tempdir().unwrap();
+        let s = state_with_segment(dir.path());
+        let mut stream = Box::pin(build_stream(s.clone(), SubscribeMode::All));
+        // hello を受けた時点で区間の購読は始まっている
+        let _hello = stream.next().await.unwrap();
+        s.push_segment(&SegmentInfo {
+            id: 8,
+            channel: 0,
+            start_unix_ms: 0,
+            duration_ms: 1,
+            path: "x.wav".into(),
+        });
+        let ev = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let text = format!("{:?}", ev);
+        assert!(text.contains("seg"), "{}", text);
+        assert!(text.contains("\\\"i\\\":8"), "{}", text);
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // ライブ再生
+    // ─────────────────────────────────────────────────────────────────
+
+    fn state_with_live() -> (Arc<RemoteState>, Arc<LiveHub>) {
+        let hub = LiveHub::new(48000, 48000, vec![2, 3]);
+        let mut s = make_state(false, 10);
+        Arc::get_mut(&mut s).unwrap().live = Some(hub.clone());
+        (s, hub)
+    }
+
+    #[tokio::test]
+    async fn http_live_streams_aac() {
+        use futures_util::StreamExt;
+        let (s, hub) = state_with_live();
+        let addr = boot(s).await;
+
+        let resp = reqwest::get(format!("http://{}/live?c=2,3", addr)).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers()["content-type"], "audio/aac");
+        assert_eq!(resp.headers()["cache-control"], "no-store");
+
+        // 購読後に入力を流す(実際は入力側のタスクが呼ぶ)
+        let feeder = tokio::spawn(async move {
+            for _ in 0..200 {
+                hub.process(&crate::live::LiveFrame {
+                    channels: vec![(2, vec![1000; 480]), (3, vec![-500; 480])],
+                });
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        });
+        let mut body = resp.bytes_stream();
+        let first = tokio::time::timeout(Duration::from_secs(2), body.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(first[0], 0xFF);
+        assert_eq!(first[1] & 0xF0, 0xF0);
+        feeder.abort();
+    }
+
+    #[tokio::test]
+    async fn http_live_rejects_bad_channels() {
+        let (s, _hub) = state_with_live();
+        let addr = boot(s).await;
+        for q in ["", "c=", "c=1", "c=2,x", "c=2,9"] {
+            let resp = reqwest::get(format!("http://{}/live?{}", addr, q)).await.unwrap();
+            assert_eq!(resp.status(), 400, "query {:?}", q);
+        }
+    }
+
+    #[tokio::test]
+    async fn http_live_disabled_is_404() {
+        let addr = boot(make_state(false, 10)).await;
+        let resp = reqwest::get(format!("http://{}/live?c=0", addr)).await.unwrap();
+        assert_eq!(resp.status(), 404);
+    }
+
+    #[tokio::test]
+    async fn http_live_requires_auth() {
+        let (mut s, _hub) = state_with_live();
+        let m = Arc::get_mut(&mut s).unwrap();
+        m.basic_auth_user = "alice".to_string();
+        m.basic_auth_pass = "secret".to_string();
+        let addr = boot(s).await;
+        let resp = reqwest::get(format!("http://{}/live?c=2", addr)).await.unwrap();
+        assert_eq!(resp.status(), 401);
     }
 }

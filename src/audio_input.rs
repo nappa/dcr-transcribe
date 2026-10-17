@@ -1,10 +1,11 @@
 use crate::config::AudioConfig;
+use crate::live::LiveFrame;
 use crate::types::{AudioChunk, AudioFormat};
 use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Sample, SizedSample};
 use regex_lite::Regex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
@@ -15,6 +16,14 @@ pub struct AudioInput {
     config: cpal::StreamConfig,
     stream: Option<cpal::Stream>,
     num_channels: u16,
+    live_tap: Option<LiveTap>,
+}
+
+/// ライブ配信への分岐。聞いている人がいる間だけ全チャンネル分をまとめて送る
+#[derive(Clone)]
+struct LiveTap {
+    tx: mpsc::Sender<LiveFrame>,
+    active: Arc<AtomicBool>,
 }
 
 impl AudioInput {
@@ -62,7 +71,13 @@ impl AudioInput {
             config: stream_config,
             stream: None,
             num_channels: config.channels,
+            live_tap: None,
         })
+    }
+
+    /// ライブ配信用の分岐を設定する(`start` より前に呼ぶ)
+    pub fn set_live_tap(&mut self, tx: mpsc::Sender<LiveFrame>, active: Arc<AtomicBool>) {
+        self.live_tap = Some(LiveTap { tx, active });
     }
 
     /// ストリームを開始
@@ -124,7 +139,13 @@ impl AudioInput {
         let channel_senders = Arc::new(channel_senders);
 
         let drop_counters_cb = drop_counters.clone();
+        let live_tap = self.live_tap.clone();
         let data_callback = move |data: &[T], _info: &cpal::InputCallbackInfo| {
+            let live_on = live_tap
+                .as_ref()
+                .is_some_and(|t| t.active.load(Ordering::Relaxed));
+            let mut live_channels = Vec::new();
+
             // タイムスタンプを取得（全チャンネルで共有）
             let timestamp_ns = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -154,6 +175,10 @@ impl AudioInput {
                         let i16_sample = (clamped * i16::MAX as f32) as i16;
                         channel_samples.push(i16_sample);
                     }
+                }
+
+                if live_on {
+                    live_channels.push((ch, channel_samples.clone()));
                 }
 
                 // チャンクを作成
@@ -188,6 +213,13 @@ impl AudioInput {
                         log::warn!("チャンネル {} への送信失敗: チャンネルクローズ", ch);
                     }
                 }
+            }
+
+            // ライブ配信へ(詰まっていたら捨てる。RT コールバックなので待たない)
+            if let (Some(tap), false) = (&live_tap, live_channels.is_empty()) {
+                let _ = tap.tx.try_send(LiveFrame {
+                    channels: live_channels,
+                });
             }
         };
 

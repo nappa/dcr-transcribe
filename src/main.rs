@@ -1,12 +1,15 @@
+mod aac;
 mod audio_input;
 mod audio_output;
 mod aws_transcribe;
 mod buffer;
 mod channel_processor;
 mod config;
+mod live;
 mod flac_encoder;
 mod opus_encoder;
 mod remote_server;
+mod segment_recorder;
 mod transcribe;
 mod transcribe_backend;
 mod tui;
@@ -146,12 +149,32 @@ async fn main() -> Result<()> {
     // 全チャンネル共通の start_time を作成(以降で使用)
     let start_time = std::time::SystemTime::now();
 
+    // ライブ再生(Remote サーバが有効なときだけ)
+    let remote_enabled = config.remote.as_ref().is_some_and(|r| r.enabled);
+    let live_hub = (remote_enabled && config.live.enabled).then(|| {
+        live::LiveHub::new(
+            config.audio.sample_rate,
+            config.live.bitrate,
+            config.channels.iter().filter(|c| c.enabled).map(|c| c.id).collect(),
+        )
+    });
+
     // Remote サーバ(SSE)を起動
+    let mut live_hub_for_input = None;
     let remote_state: Option<Arc<remote_server::RemoteState>> = match config.remote.clone() {
-        Some(cfg) if cfg.enabled => match remote_server::start(cfg, &config.channels, start_time)
-            .await
+        Some(cfg) if cfg.enabled => match remote_server::start(
+            cfg,
+            &config.channels,
+            start_time,
+            config.segments.enabled,
+            live_hub.clone(),
+        )
+        .await
         {
-            Ok(state) => Some(state),
+            Ok(state) => {
+                live_hub_for_input = live_hub;
+                Some(state)
+            }
             Err(e) => {
                 log::error!("Remote サーバ起動失敗(無効化して続行): {}", e);
                 None
@@ -170,6 +193,16 @@ async fn main() -> Result<()> {
 
     // TUI状態を作成
     let tui_state = TuiState::new();
+
+    // 区間録音は起動ごとに日時名のディレクトリへまとめる
+    let segment_dir = std::path::Path::new(&config.segments.dir).join(
+        chrono::DateTime::<chrono::Local>::from(start_time)
+            .format("%Y%m%d_%H%M%S")
+            .to_string(),
+    );
+    if config.segments.enabled {
+        log::info!("区間録音: {:?}", segment_dir);
+    }
 
     // チャンネルプロセッサを作成
     let mut processors = Vec::new();
@@ -217,6 +250,17 @@ async fn main() -> Result<()> {
         // TUI状態を設定
         processor.set_tui_state(tui_state.clone());
 
+        if config.segments.enabled {
+            let recorder = segment_recorder::SegmentRecorder::new(
+                channel_config.id,
+                &segment_dir,
+                config.audio.sample_rate,
+                config.vad.threshold_db,
+                &config.segments,
+            )?;
+            processor.set_segment_recorder(recorder);
+        }
+
         processors.push((rx, processor));
     }
 
@@ -227,6 +271,13 @@ async fn main() -> Result<()> {
 
     // AudioInputを作成して開始
     let mut audio_input = AudioInput::new(&config.audio)?;
+    if let Some(hub) = live_hub_for_input {
+        // 1 要素 = 1 コールバック(4096 フレーム ≒ 85 ms)。詰まったら入力側で捨てる
+        let (live_tx, live_rx) = mpsc::channel(64);
+        audio_input.set_live_tap(live_tx, hub.active_flag());
+        tokio::spawn(hub.run(live_rx));
+        log::info!("ライブ再生: 有効 ({} bps)", config.live.bitrate);
+    }
     audio_input.start(channel_senders)?;
 
     // AudioOutputを作成して開始
@@ -313,8 +364,17 @@ async fn main() -> Result<()> {
                 let mut proc = processor_clone.lock().await;
                 let channel_id = proc.channel_id();
 
+                // 録音を終えた区間を Remote サーバへ
+                for segment in proc.take_finished_segments() {
+                    if let Some(state) = &remote_state_clone {
+                        state.push_segment(&segment);
+                    }
+                }
+
                 // 文字起こし結果をポーリング
                 let results = proc.poll_transcripts().await;
+                // 結果は受信時点で録音中(または直前)の区間にひも付ける
+                let segment_id = proc.last_segment_id();
                 if !results.is_empty() {
                     log::debug!("チャンネル {}: 文字起こし結果取得 {} 件", channel_id, results.len());
                     for mut result in results {
@@ -333,12 +393,12 @@ async fn main() -> Result<()> {
 
                                 // Remote サーバへ転送(同期、ブロックしない)
                                 if let Some(state) = &remote_state_clone {
-                                    state.push(&result);
+                                    state.push_with_segment(&result, segment_id);
                                 }
                             }
                         } else if let Some(state) = &remote_state_clone {
                             // partial も(設定で有効な場合のみ内部で振り分け)
-                            state.push(&result);
+                            state.push_with_segment(&result, segment_id);
                         }
                     }
                 }

@@ -21,18 +21,22 @@ pub struct Config {
     pub flac: FlacConfig,
     pub remote: Option<RemoteConfig>,
     #[serde(default)]
+    pub segments: SegmentConfig,
+    #[serde(default)]
+    pub live: LiveConfig,
+    #[serde(default)]
     pub channels: Vec<ChannelConfig>,
 }
 
 /// リモート閲覧用 HTTP/SSE サーバ設定
 ///
-/// `axum` ベースの軽量サーバを localhost で起動し、ngrok 経由で公開する想定。
+/// `axum` ベースの軽量サーバを localhost で起動し、Cloudflare Tunnel 経由で公開する想定。
 /// 確定結果のみリアルタイム配信(転送量最小化のため)。
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RemoteConfig {
     #[serde(default = "default_remote_enabled")]
     pub enabled: bool,
-    /// listen アドレス。ngrok 経由のみ想定なので 127.0.0.1 推奨
+    /// listen アドレス。トンネル経由のみ想定なので 127.0.0.1 推奨
     #[serde(default = "default_remote_listen")]
     pub listen: String,
     /// 新規クライアントへ初期送信する履歴件数
@@ -53,6 +57,118 @@ pub struct RemoteConfig {
     /// HTTP Basic 認証のパスワード
     #[serde(default)]
     pub basic_auth_pass: String,
+}
+
+/// 発話区間ごとの録音設定
+///
+/// 無音で区切った短い WAV をチャンネル毎に保存し、リモート閲覧画面から再生できるようにする。
+/// 区間の開始・終了は VAD の閾値(`[vad] threshold_db`)で判定する。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SegmentConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// 保存先。起動ごとにこの下へ日時名のディレクトリを作る
+    #[serde(default = "default_segment_dir")]
+    pub dir: String,
+    /// 保存形式。aac (ADTS、配信向けで小さい) か wav
+    #[serde(default)]
+    pub format: SegmentFormat,
+    /// AAC のビットレート(bps)
+    #[serde(default = "default_segment_bitrate")]
+    pub bitrate: u32,
+    /// この長さ以上無音が続いたら区間を閉じる(ms)
+    #[serde(default = "default_segment_silence_split_ms")]
+    pub silence_split_ms: u64,
+    /// 区間の頭に含める、発話直前の音声(ms)
+    #[serde(default = "default_segment_pre_roll_ms")]
+    pub pre_roll_ms: u64,
+    /// 区間の末尾に残す無音(ms)
+    #[serde(default = "default_segment_tail_ms")]
+    pub tail_ms: u64,
+    /// 発話がこれ未満の区間はノイズとして破棄(ms)
+    #[serde(default = "default_segment_min_voice_ms")]
+    pub min_voice_ms: u64,
+    /// 1 区間の最大長(秒)。超えたら区切って次の区間に続ける
+    #[serde(default = "default_segment_max_duration_secs")]
+    pub max_duration_secs: u64,
+}
+
+/// リモート閲覧画面からのライブ再生設定
+///
+/// 選ばれたチャンネルをサーバ側でミックスし、AAC (ADTS) で配信する。`[remote]` が有効なときだけ動く。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct LiveConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// AAC のビットレート(bps)。聞いている間はこの帯域を使い続ける
+    #[serde(default = "default_live_bitrate")]
+    pub bitrate: u32,
+}
+
+fn default_live_bitrate() -> u32 {
+    48000
+}
+
+impl Default for LiveConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bitrate: default_live_bitrate(),
+        }
+    }
+}
+
+/// 区間録音の保存形式
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SegmentFormat {
+    #[default]
+    Aac,
+    Wav,
+}
+
+fn default_segment_bitrate() -> u32 {
+    64000
+}
+
+fn default_segment_dir() -> String {
+    "./recordings/segments".to_string()
+}
+
+fn default_segment_silence_split_ms() -> u64 {
+    2000
+}
+
+fn default_segment_pre_roll_ms() -> u64 {
+    300
+}
+
+fn default_segment_tail_ms() -> u64 {
+    300
+}
+
+fn default_segment_min_voice_ms() -> u64 {
+    300
+}
+
+fn default_segment_max_duration_secs() -> u64 {
+    300
+}
+
+impl Default for SegmentConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            dir: default_segment_dir(),
+            format: SegmentFormat::default(),
+            bitrate: default_segment_bitrate(),
+            silence_split_ms: default_segment_silence_split_ms(),
+            pre_roll_ms: default_segment_pre_roll_ms(),
+            tail_ms: default_segment_tail_ms(),
+            min_voice_ms: default_segment_min_voice_ms(),
+            max_duration_secs: default_segment_max_duration_secs(),
+        }
+    }
 }
 
 fn default_remote_enabled() -> bool {
@@ -378,6 +494,8 @@ impl Default for Config {
             output: OutputConfig::default(),
             flac: FlacConfig::default(),
             remote: None, // デフォルトでは Remote サーバ無効
+            segments: SegmentConfig::default(),
+            live: LiveConfig::default(),
 
             channels: vec![
                 ChannelConfig {

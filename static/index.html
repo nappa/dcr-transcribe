@@ -19,6 +19,8 @@
 html,body{margin:0;padding:0;min-height:100%}
 body{
   background:var(--bg);color:var(--fg);
+  /* 上に行を足したときの位置補正は自前で行う(ブラウザの補正と二重にならないように) */
+  overflow-anchor:none;
   font-family:-apple-system,BlinkMacSystemFont,"Hiragino Sans","Yu Gothic UI","Noto Sans JP",sans-serif;
   font-size:15px;line-height:1.5;
   -webkit-text-size-adjust:100%;
@@ -35,6 +37,8 @@ header{
 .s.on{background:#1a4a2a;color:#9f9}
 .s.off{background:#4a1a1a;color:#f99}
 .s.reco{background:#4a3a1a;color:#fc6}
+.s.chain{background:#1a3a4a;color:#8cf;cursor:pointer}
+.s.chain[hidden]{display:none}
 .chips{
   display:flex;gap:6px;overflow-x:auto;-webkit-overflow-scrolling:touch;
   margin:0 -12px;padding:0 12px 4px;scrollbar-width:none;
@@ -47,20 +51,40 @@ header{
   min-height:30px;display:flex;align-items:center;
 }
 .chip.on{background:var(--ch-bg);color:var(--ch-fg);border-color:var(--ch-fg)}
+.live{display:flex;align-items:center;gap:8px;margin-top:4px}
+.live[hidden]{display:none}
+.live .lbl{font-size:11px;color:var(--muted);flex-shrink:0}
+.live .chips{flex:1;margin:0;padding:0 0 4px}
+.lp{
+  flex-shrink:0;border:none;border-radius:14px;padding:6px 12px;min-height:30px;
+  background:#2a4060;color:#fff;font-size:12px;font-weight:600;cursor:pointer;font-family:inherit;
+}
+.lp.on{background:#a33;}
+.lp.wait{background:#665;}
 #older{
   padding:10px;text-align:center;font-size:13px;color:var(--muted);
-  cursor:pointer;border-bottom:1px solid var(--border);user-select:none;
+  cursor:pointer;border-top:1px solid var(--border);user-select:none;
   display:none;
 }
 #older.show{display:block}
 #older:active{background:var(--bg2)}
-#log{padding:0 0 calc(80px + var(--safe-bot))}
+#log{padding:0}
+#older{margin-bottom:calc(80px + var(--safe-bot))}
+.r.now{box-shadow:inset 3px 0 0 var(--ch-fg)}
 .r{padding:9px 12px;border-bottom:1px solid var(--border);background:var(--ch-bg)}
 .r .meta{display:flex;gap:8px;font-size:11px;color:var(--muted);margin-bottom:3px}
 .r .name{color:var(--ch-fg);font-weight:600}
 .r .ts{font-variant-numeric:tabular-nums}
 .r .x{font-size:15px;word-break:break-word}
 .p{opacity:.55;font-style:italic}
+.pl{
+  margin-left:auto;flex-shrink:0;border:1px solid var(--ch-fg);background:transparent;color:var(--ch-fg);
+  border-radius:12px;font-size:11px;padding:1px 9px;min-width:56px;cursor:pointer;
+  font-family:inherit;font-variant-numeric:tabular-nums;font-style:normal;
+}
+.pl:disabled{opacity:.4;cursor:default}
+.pl.on{background:var(--ch-fg);color:var(--ch-bg)}
+.sg .x{color:var(--muted);font-size:13px}
 .gap{
   padding:6px 12px;background:#2a2030;color:#fc6;font-size:11px;text-align:center;
   border-bottom:1px solid var(--border);
@@ -94,27 +118,37 @@ header{
 <header>
   <div class="tr">
     <h1>dcr-transcribe</h1>
+    <span class="s chain" id="chain" hidden></span>
     <span class="s off" id="s">未接続</span>
   </div>
   <div class="chips" id="chips"></div>
+  <div class="live" id="live" hidden>
+    <span class="lbl">ライブ</span>
+    <div class="chips" id="lchips"></div>
+    <button class="lp" id="lplay">▶ 聞く</button>
+  </div>
 </header>
-<div id="older">↑ もっと前を読み込む</div>
 <div id="log"></div>
-<button class="fab" id="fab">↓ 最新へ</button>
+<div id="older">↓ もっと前を読み込む</div>
+<button class="fab" id="fab">↑ 最新へ</button>
 <script>
 (function(){
+var liveBar=document.getElementById("live"),lchips=document.getElementById("lchips"),lplay=document.getElementById("lplay");
 var log=document.getElementById("log"),stat=document.getElementById("s"),chipsBox=document.getElementById("chips"),fab=document.getElementById("fab"),older=document.getElementById("older");
 var p=new URLSearchParams(location.search);
 var token=p.get("t")||"";
 var wantP=p.get("p")==="1";
 var HIDE="dcr-hide";
 var hidden=new Set(JSON.parse(localStorage.getItem(HIDE)||"[]"));
+var LIVE="dcr-live";
+var liveSel=new Set(JSON.parse(localStorage.getItem(LIVE)||"[]"));
 
 // 状態
+// 行は新しいものが上。各行の data-k に時刻(ms)を持たせ、時刻の降順に挿入する
 var es=null;
 var anchorMs=0;
 var names={};
-var stick=true;
+var stick=true;            // 最上部(最新)を見ているか
 var newCount=0;
 var firstShownId=0;        // DOM 上で最も古いイベント ID(0 = まだ何もない)
 var lastSeenId=0;          // 受信済みの最大 ID
@@ -123,17 +157,25 @@ var hiddenAt=0;
 var wasStickyOnHide=true;
 var FAST_THRESHOLD_MS=30000; // この時間以上 hidden だったらファストロード
 var FAST_HEAD=20;            // ファストロード時に取得する件数
+var segs={};               // 録音区間 id -> {c,t,d}
+var maxSegId=0;
+var audio=null,playingId=0;
+var chainEl=document.getElementById("chain");
 
 function pad(n){return n<10?"0"+n:""+n}
-function fmt(s){if(!anchorMs)return"";var d=new Date(anchorMs+s*1000);return pad(d.getHours())+":"+pad(d.getMinutes())+":"+pad(d.getSeconds())}
+function msOf(s){return anchorMs+s*1000}
+function fmtMs(ms){if(!ms)return"";var d=new Date(ms);return pad(d.getHours())+":"+pad(d.getMinutes())+":"+pad(d.getSeconds())}
 function esc(s){return s.replace(/[&<>]/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;"}[c]})}
-function atBottom(){return(window.innerHeight+window.scrollY)>=document.documentElement.scrollHeight-80}
-function scrollBottom(){window.scrollTo(0,document.documentElement.scrollHeight)}
+function withToken(url){return token?url+(url.indexOf("?")<0?"?":"&")+"t="+encodeURIComponent(token):url}
+function atTop(){return window.scrollY<80}
+function nearBottom(){return(window.innerHeight+window.scrollY)>=document.documentElement.scrollHeight-200}
+function scrollTop(){window.scrollTo(0,0)}
 
 function applyHidden(){
   var st=document.getElementById("hs");
   if(!st){st=document.createElement("style");st.id="hs";document.head.appendChild(st)}
-  st.textContent=Array.from(hidden).map(function(c){return".c"+c+"{display:none}"}).join("");
+  // ログの行だけを隠す(チップまで隠すと戻せなくなる)
+  st.textContent=Array.from(hidden).map(function(c){return"#log .c"+c+"{display:none}"}).join("");
 }
 function persist(){localStorage.setItem(HIDE,JSON.stringify(Array.from(hidden)))}
 applyHidden();
@@ -155,47 +197,224 @@ function makeRow(id,e){
   d.className="r c"+e.c+(e.p?" p":"");
   if(id)d.dataset.id=id;
   var n=names[e.c]!==undefined?names[e.c]:"ch"+e.c;
-  d.innerHTML='<div class="meta"><span class="name">'+esc(n)+'</span><span class="ts">'+fmt(e.s)+'</span></div><div class="x">'+esc(e.x)+'</div>';
+  d.innerHTML='<div class="meta"><span class="name">'+esc(n)+'</span><span class="ts">'+fmtMs(msOf(e.s))+'</span></div><div class="x">'+esc(e.x)+'</div>';
+  if(e.g)d.querySelector(".meta").appendChild(makePlay(e.g));
   return d;
+}
+
+// 時刻の降順(新しいものが上)を保って挿入する。同時刻なら後から来たものを下に置く。
+// 見ている位置より上に入ったら、そのぶんスクロールして表示がずれないようにする。
+function insertSorted(d,k){
+  d.dataset.k=k;
+  var before=null;
+  for(var c=log.firstChild;c;c=c.nextSibling){
+    if(+c.dataset.k<k){before=c;break}
+  }
+  var prevH=document.documentElement.scrollHeight;
+  log.insertBefore(d,before);
+  if(!stick&&d.getBoundingClientRect().top<0){
+    window.scrollBy(0,document.documentElement.scrollHeight-prevH);
+  }
+  return d;
+}
+
+// ── 録音区間の再生 ──
+function makePlay(g){
+  var b=document.createElement("button");
+  b.className="pl";b.dataset.g=g;
+  setPlay(b);
+  b.onclick=function(){togglePlay(g)};
+  return b;
+}
+function setPlay(b){
+  var g=+b.dataset.g,sg=segs[g];
+  b.disabled=!sg;
+  b.classList.toggle("on",g===playingId);
+  // 一覧に無いのは、まだ録音中か、サーバの保持件数を超えて消えたもの
+  b.textContent=!sg?(g<=maxSegId?"録音なし":"録音中"):g===playingId?"■ 停止":"▶ "+(sg.d/1000).toFixed(1)+"秒";
+  var row=b.closest(".r");
+  if(row)row.classList.toggle("now",g===playingId);
+}
+function refreshPlay(g){
+  log.querySelectorAll('.pl[data-g="'+g+'"]').forEach(setPlay);
+}
+
+// ── ライブ再生(選んだチャンネルをサーバでミックスした AAC ストリーム) ──
+var liveAudio=null,liveWanted=false,liveRetry=0,resumeLive=false;
+function liveUi(state){
+  lplay.className="lp"+(state==="on"?" on":state==="wait"?" wait":"");
+  lplay.textContent=state==="on"?"■ 停止":state==="wait"?"接続中…":"▶ 聞く";
+}
+function startLive(){
+  var chs=Array.from(liveSel).sort(function(a,b){return a-b});
+  if(!chs.length){lplay.textContent="ch を選択";setTimeout(function(){liveUi("off")},1200);return}
+  liveWanted=true;
+  clearTimeout(liveRetry);
+  if(!liveAudio){
+    liveAudio=new Audio();
+    liveAudio.onplaying=function(){if(liveWanted)liveUi("on")};
+    liveAudio.onwaiting=function(){if(liveWanted)liveUi("wait")};
+    // 回線断などで止まったら少し待ってつなぎ直す
+    liveAudio.onerror=liveAudio.onended=function(){
+      if(!liveWanted)return;
+      liveUi("wait");
+      clearTimeout(liveRetry);
+      liveRetry=setTimeout(function(){if(liveWanted)startLive()},2000);
+    };
+  }
+  // 毎回 URL を変えて、溜まった古い音ではなく今の音から聞く
+  liveAudio.src=withToken("/live?c="+chs.join(",")+"&_="+Date.now());
+  liveUi("wait");
+  liveAudio.play().catch(function(){if(liveWanted){liveWanted=false;liveUi("off")}});
+}
+function stopLive(){
+  liveWanted=false;
+  clearTimeout(liveRetry);
+  if(liveAudio){liveAudio.pause();liveAudio.removeAttribute("src");liveAudio.load()}
+  liveUi("off");
+}
+lplay.onclick=function(){
+  resumeLive=false;
+  if(liveWanted){stopLive();return}
+  // ライブを聞くなら録音の連続再生は止める(音が重ならないように)
+  if(chainOn)stopChain();
+  startLive();
+};
+function makeLiveChip(id,name){
+  var b=document.createElement("div");
+  b.className="chip c"+id+(liveSel.has(id)?" on":"");
+  b.textContent=name;
+  b.onclick=function(){
+    if(liveSel.has(id)){liveSel.delete(id);b.classList.remove("on")}
+    else{liveSel.add(id);b.classList.add("on")}
+    localStorage.setItem(LIVE,JSON.stringify(Array.from(liveSel)));
+    // 再生中なら選択に合わせてつなぎ直す
+    if(liveWanted){if(liveSel.size)startLive();else stopLive()}
+  };
+  return b;
+}
+
+// ── 連続再生 ──
+// ▶ を押した録音から、録音時刻の新しい方へ順に再生する。最新まで聞き終えたら新着を待って続ける。
+// ライブを聞いていた場合は、最新まで追いついたところでライブに戻る(新着は既にライブで聞こえるため)。
+var chainOn=false,waitingNext=false,lastPlayed=0;
+function chainUi(){
+  chainEl.hidden=!chainOn;
+  chainEl.textContent=waitingNext?"新着待ち ✕":"連続再生 ✕";
+}
+chainEl.onclick=function(){stopChain()};
+function stopChain(){
+  chainOn=false;waitingNext=false;
+  if(audio){audio.pause();audio=null}
+  var prev=playingId;playingId=0;
+  if(prev)refreshPlay(prev);
+  chainUi();
+  if(resumeLive){resumeLive=false;startLive()}
+}
+function togglePlay(g){
+  if(playingId===g){stopChain();return}
+  chainOn=true;
+  playClip(g);
+}
+function playClip(g){
+  waitingNext=false;
+  if(audio){audio.pause();audio=null}
+  var prev=playingId;playingId=0;
+  if(prev)refreshPlay(prev);
+  // 録音を聞く間はライブを止め、連続再生が終わったら再開する
+  if(liveWanted){resumeLive=true;stopLive()}
+  audio=new Audio(withToken("/audio/"+g));
+  playingId=g;lastPlayed=g;
+  audio.onended=function(){if(playingId===g)clipEnded(g)};
+  // 読み込めない録音で止まり続けないよう、失敗したら連続再生ごと止める
+  audio.onerror=function(){if(playingId===g)stopChain()};
+  audio.play().catch(function(){if(playingId===g)stopChain()});
+  refreshPlay(g);
+  chainUi();
+  var b=log.querySelector('.pl[data-g="'+g+'"]');
+  if(b)b.closest(".r").scrollIntoView({block:"nearest"});
+}
+function clipEnded(g){
+  playingId=0;audio=null;refreshPlay(g);
+  if(!chainOn)return;
+  var n=nextSeg(g);
+  if(n){playClip(n);return}
+  if(resumeLive){chainOn=false;chainUi();resumeLive=false;startLive();return}
+  waitingNext=true;chainUi();
+}
+// 録音時刻が g の次に新しい区間(非表示のチャンネルは飛ばす)
+function nextSeg(g){
+  var cur=segs[g],best=0,bt=Infinity;
+  if(!cur)return 0;
+  for(var id in segs){
+    var sg=segs[id],i=+id;
+    if(hidden.has(sg.c))continue;
+    var later=sg.t>cur.t||(sg.t===cur.t&&i>g);
+    if(later&&(sg.t<bt||(sg.t===bt&&i<best))){best=i;bt=sg.t}
+  }
+  return best;
+}
+
+function addSeg(sg,live){
+  if(segs[sg.i])return;
+  segs[sg.i]={c:sg.c,t:sg.t,d:sg.d};
+  if(sg.i>maxSegId)maxSegId=sg.i;
+  if(log.querySelector('.pl[data-g="'+sg.i+'"]'))refreshPlay(sg.i);
+  else if(live){
+    // 文字起こしが(まだ)ない区間は録音だけの行として出す。後から文字起こしが来たら消す
+    var d=document.createElement("div");
+    d.className="r sg c"+sg.c;d.dataset.sg=sg.i;
+    var n=names[sg.c]!==undefined?names[sg.c]:"ch"+sg.c;
+    d.innerHTML='<div class="meta"><span class="name">'+esc(n)+'</span><span class="ts">'+fmtMs(sg.t)+'</span></div><div class="x">(文字起こしなし)</div>';
+    d.querySelector(".meta").appendChild(makePlay(sg.i));
+    insertSorted(d,sg.t);
+    noteNew();
+  }
+  // 連続再生が新着待ちなら続けて再生(行を作った後に呼ぶとその行が再生中表示になる)
+  if(waitingNext&&!hidden.has(sg.c)&&nextSeg(lastPlayed)===sg.i)playClip(sg.i);
+}
+function loadSegs(){
+  fetch(withToken("/segments?after="+maxSegId)).then(function(r){
+    if(!r.ok)throw new Error("HTTP "+r.status);
+    return r.json();
+  }).then(function(data){
+    ((data&&data.items)||[]).forEach(function(sg){addSeg(sg,false)});
+  }).catch(function(){});
 }
 
 function makeGapNote(n){
   var d=document.createElement("div");
   d.className="gap";
-  d.textContent="… "+n+" 件スキップ(↑タップで読み込み)";
+  d.textContent="… "+n+" 件スキップ(↓下端で読み込み)";
   return d;
 }
 
+// 見ていない間に上へ新着が入ったら件数を出す
+function noteNew(){
+  if(stick)return;
+  newCount++;fab.textContent="↑ 新着 "+newCount+" 件";fab.classList.add("show");
+}
+
 function append(id,e){
-  var d=makeRow(id,e);
-  log.appendChild(d);
+  if(e.g){var only=log.querySelector('[data-sg="'+e.g+'"]');if(only)log.removeChild(only)}
+  insertSorted(makeRow(id,e),msOf(e.s));
   if(id){
     if(id>lastSeenId)lastSeenId=id;
     if(firstShownId===0||id<firstShownId)firstShownId=id;
   }
-  while(log.children.length>500)log.removeChild(log.firstChild);
+  // 古い(下端の)行から捨てる
+  while(log.children.length>500)log.removeChild(log.lastChild);
   updateOlderUI();
-  if(stick){requestAnimationFrame(scrollBottom)}
-  else{newCount++;fab.textContent="↓ 新着 "+newCount+" 件";fab.classList.add("show")}
+  noteNew();
 }
 
-function prepend(items){
+function appendOlder(items){
   if(!items||!items.length)return;
-  // id 昇順に並べる(server から既にそうだが念のため)
-  items.sort(function(a,b){return a.id-b.id});
-  // スクロール位置の保持: 追加前後の高さ差ぶんスクロール
-  var prevHeight=document.documentElement.scrollHeight;
-  var prevY=window.scrollY;
-  // 古い順に DOM 先頭へ insert(insertBefore で前から挿入)
-  var anchor=log.firstChild;
   for(var i=0;i<items.length;i++){
     var it=items[i];
-    log.insertBefore(makeRow(it.id,it),anchor);
+    insertSorted(makeRow(it.id,it),msOf(it.s));
+    if(it.id<firstShownId||firstShownId===0)firstShownId=it.id;
   }
-  firstShownId=items[0].id;
-  // 高さが増えたぶん下にスクロールして、見ている位置を保つ
-  var newHeight=document.documentElement.scrollHeight;
-  window.scrollTo(0,prevY+(newHeight-prevHeight));
   updateOlderUI();
 }
 
@@ -221,25 +440,25 @@ function loadOlder(){
       firstShownId=1; // 再 fetch を抑止
       setTimeout(function(){older.classList.remove("show")},1500);
     }else{
-      prepend(items);
-      older.textContent="↑ もっと前を読み込む";
+      appendOlder(items);
+      older.textContent="↓ もっと前を読み込む";
     }
     loadingOlder=false;
   }).catch(function(){
-    older.textContent="↑ もっと前を読み込む(失敗・タップで再試行)";
+    older.textContent="↓ もっと前を読み込む(失敗・タップで再試行)";
     loadingOlder=false;
   });
 }
 older.onclick=loadOlder;
 
 addEventListener("scroll",function(){
-  stick=atBottom();
+  stick=atTop();
   if(stick){newCount=0;fab.classList.remove("show")}
-  // 上端近くで自動的にさかのぼり
-  if(!loadingOlder&&window.scrollY<200&&firstShownId>1)loadOlder();
+  // 下端近くで自動的にさかのぼり
+  if(!loadingOlder&&nearBottom()&&firstShownId>1)loadOlder();
 },{passive:true});
 
-fab.onclick=function(){scrollBottom();newCount=0;fab.classList.remove("show")};
+fab.onclick=function(){scrollTop();newCount=0;fab.classList.remove("show")};
 
 function buildStreamUrl(opts){
   var qs=[];
@@ -262,18 +481,28 @@ function connect(opts){
         d.channels.forEach(function(c){
           names[c.id]=c.name;
           chipsBox.appendChild(makeChip(c.id,c.name));
+          if(d.live)lchips.appendChild(makeLiveChip(c.id,c.name));
         });
+        if(d.live)liveBar.hidden=false;
+        // 以前の選択に今は無いチャンネルが残っていたら落とす
+        liveSel.forEach(function(id){if(names[id]===undefined)liveSel.delete(id)});
       }
+      // 切断中に閉じた区間もここで回収する
+      if(d.seg)loadSegs();
     }catch(_){}
+  });
+  es.addEventListener("seg",function(ev){
+    try{addSeg(JSON.parse(ev.data),true)}catch(_){}
   });
   es.addEventListener("msg",function(ev){
     try{
       var id=parseInt(ev.lastEventId,10)||0;
       var data=JSON.parse(ev.data);
-      // ファストロード後の最初のイベントで、前回 lastSeenId と差があれば「N 件スキップ」表示
+      // ファストロード後の最初のイベントで、前回 lastSeenId と差があれば「N 件スキップ」表示。
+      // 取得した最新分のすぐ下(それより古い位置)に置く
       if(opts&&opts.gapFrom&&id>opts.gapFrom+1){
         var skipped=id-opts.gapFrom-1;
-        log.appendChild(makeGapNote(skipped));
+        insertSorted(makeGapNote(skipped),msOf(data.s)-0.001);
         opts.gapFrom=null; // 一度だけ
       }
       append(id,data);
@@ -297,7 +526,7 @@ function fastReload(){
   newCount=0;
   fab.classList.remove("show");
   stick=true;
-  scrollBottom();
+  scrollTop();
   connect({head:FAST_HEAD,gapFrom:prevLast});
 }
 
@@ -308,7 +537,7 @@ document.addEventListener("visibilitychange",function(){
   }else{
     var elapsed=hiddenAt?Date.now()-hiddenAt:0;
     hiddenAt=0;
-    // 末尾を見ていた人だけファストロード(さかのぼって読んでいた人の位置は壊さない)
+    // 最新を見ていた人だけファストロード(さかのぼって読んでいた人の位置は壊さない)
     if(elapsed>FAST_THRESHOLD_MS&&wasStickyOnHide){
       fastReload();
     }

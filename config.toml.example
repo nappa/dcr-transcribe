@@ -54,18 +54,35 @@ send_buffered_on_reconnect = true
 # Directory for WAV file output
 wav_output_dir = "./recordings"
 
-# Remote viewer (HTTP/SSE server, expose via ngrok)
+# Remote viewer (HTTP/SSE server, expose via Cloudflare Tunnel)
 # Tail-style live view of confirmed transcripts in any browser.
-# Run `ngrok http 8765` separately to expose to remote viewers.
+# Run a named tunnel with `cloudflared` separately (see README). Quick Tunnels do not support SSE.
 # [remote]
 # enabled = true
-# listen = "127.0.0.1:8765"     # bind address (keep on loopback; ngrok reaches localhost)
+# listen = "127.0.0.1:8765"     # bind address (keep on loopback; cloudflared reaches localhost)
 # history_size = 200            # entries kept for new clients on reconnect
 # include_partials = false      # also stream partial results (more bandwidth)
 # partial_throttle_ms = 500     # throttle partials per channel (only used if include_partials=true)
 # auth_token = ""               # shared secret; clients pass `?t=...` (empty = no auth)
 # basic_auth_user = ""          # HTTP Basic 認証ユーザー名(空なら Basic 認証無効)
 # basic_auth_pass = ""          # HTTP Basic 認証パスワード
+
+# Per-utterance recording (split on silence), playable from the remote viewer
+# [segments]
+# enabled = true
+# dir = "./recordings/segments"  # a timestamped subdirectory is created per run
+# format = "aac"                 # "aac" (ADTS, small, streaming-friendly) or "wav"
+# bitrate = 64000                # AAC bitrate (bps)
+# silence_split_ms = 2000        # close a segment after this much silence
+# pre_roll_ms = 300              # audio kept before the voice onset
+# tail_ms = 300                  # silence kept after the last voice
+# min_voice_ms = 300             # discard segments with less voice than this (noise)
+# max_duration_secs = 300        # split segments longer than this
+
+# Live listening from the remote viewer: pick channels, the server mixes them and streams AAC
+# [live]
+# enabled = true
+# bitrate = 48000                # AAC bitrate (bps) per listened mix
 
 [flac]
 # Enable FLAC compression for AWS Transcribe

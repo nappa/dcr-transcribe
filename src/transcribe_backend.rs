@@ -4,6 +4,7 @@
 use crate::types::TranscriptResult;
 use anyhow::Result;
 use async_trait::async_trait;
+use std::time::SystemTime;
 use tokio::sync::mpsc;
 
 /// 文字起こしバックエンドの共通トレイト
@@ -18,6 +19,12 @@ pub trait TranscribeBackend: Send {
     async fn start_stream(
         &mut self,
     ) -> Result<(mpsc::Sender<Vec<i16>>, mpsc::Receiver<TranscriptResult>)>;
+
+    /// 次に開始するストリームの先頭サンプルが録音された時刻を設定する。
+    ///
+    /// 音声の再生位置でタイムスタンプを返すバックエンド(Amazon Transcribe)は、
+    /// これを使ってストリーム内の秒数を `start_time` からの秒数に直す。
+    fn set_stream_origin(&mut self, _origin: SystemTime) {}
 
     /// チャンネルIDを取得
     fn channel_id(&self) -> usize;
