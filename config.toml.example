@@ -84,6 +84,13 @@ wav_output_dir = "./recordings"
 # min_voice_ms = 300             # discard segments with less voice than this (noise)
 # max_duration_secs = 300        # split segments longer than this
 
+# Run cloudflared as a child process (started/restarted/stopped with the app)
+# [tunnel]
+# enabled = true
+# cloudflared = "cloudflared"                   # executable name or absolute path
+# config = "~/.cloudflared/dcr-transcribe.yml"  # locally-managed tunnel, or:
+# token_file = ""                               # file containing a dashboard-managed tunnel token
+
 # Live listening from the remote viewer: pick channels, the server mixes them and streams AAC
 # [live]
 # enabled = true

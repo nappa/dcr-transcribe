@@ -10,6 +10,9 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
+/// 入力コールバック 1 回あたりのフレーム数
+const INPUT_BUFFER_FRAMES: u32 = 1024;
+
 /// デバイスの表示名(cpal 0.17 以降は `description()` 経由)
 pub fn cpal_device_name(device: &cpal::Device) -> Result<String> {
     Ok(device.description()?.name().to_string())
@@ -88,7 +91,8 @@ impl AudioInput {
         let stream_config = cpal::StreamConfig {
             channels: device_channels,
             sample_rate: config.sample_rate,
-            buffer_size: cpal::BufferSize::Fixed(4096),
+            // 1 コールバック ≒ 21 ms(48 kHz)。ライブ再生の遅延に直結するので小さめにする
+            buffer_size: cpal::BufferSize::Fixed(INPUT_BUFFER_FRAMES),
         };
 
         Ok(Self {

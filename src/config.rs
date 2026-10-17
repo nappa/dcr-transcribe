@@ -26,6 +26,8 @@ pub struct Config {
     #[serde(default)]
     pub live: LiveConfig,
     #[serde(default)]
+    pub tunnel: TunnelConfig,
+    #[serde(default)]
     pub channels: Vec<ChannelConfig>,
 }
 
@@ -112,6 +114,40 @@ pub struct SegmentConfig {
     /// 1 区間の最大長(秒)。超えたら区切って次の区間に続ける
     #[serde(default = "default_segment_max_duration_secs")]
     pub max_duration_secs: u64,
+}
+
+/// cloudflared を本体の子プロセスとして管理する設定
+///
+/// 有効にすると、本体の起動と一緒に `cloudflared tunnel ... run` を立ち上げ、落ちたら起動し直し、
+/// 本体の終了時に止める。`config`(ローカル管理のトンネル)か `token_file`(ダッシュボード管理)のどちらかを指定する。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TunnelConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// cloudflared の実行ファイル(PATH から探す名前か絶対パス)
+    #[serde(default = "default_tunnel_cloudflared")]
+    pub cloudflared: String,
+    /// cloudflared の設定ファイル(例: "~/.cloudflared/dcr-transcribe.yml")
+    #[serde(default)]
+    pub config: String,
+    /// トンネルのトークンを書いたファイル(ダッシュボードで作ったトンネル用)
+    #[serde(default)]
+    pub token_file: String,
+}
+
+fn default_tunnel_cloudflared() -> String {
+    "cloudflared".to_string()
+}
+
+impl Default for TunnelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            cloudflared: default_tunnel_cloudflared(),
+            config: String::new(),
+            token_file: String::new(),
+        }
+    }
 }
 
 /// リモート閲覧画面からのライブ再生設定
@@ -522,6 +558,7 @@ impl Default for Config {
             remote: None, // デフォルトでは Remote サーバ無効
             segments: SegmentConfig::default(),
             live: LiveConfig::default(),
+            tunnel: TunnelConfig::default(),
 
             channels: vec![
                 ChannelConfig {

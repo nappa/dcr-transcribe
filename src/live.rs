@@ -7,6 +7,9 @@
 //! - 聞く人がいなくなったミックスは次のフレームで捨てる
 //! - どのミックスも無いときは `active` フラグを落とし、入力側はフレームを作らない
 //! - 同じコールバック由来のサンプルを足すので、チャンネル間の時間ずれは起きない
+//! - 接続直後に無音の AAC を `PREFILL_BYTES` 分まとめて送る(`prefill`)。
+//!   Chrome は受信データを 32KB 単位で扱うため、低ビットレートでは再生開始まで十数秒待たされる。
+//!   先に 32KB 渡してすぐ再生を始めさせ、溜まった無音はブラウザ側が飛ばして今の音に追いつく
 
 use crate::aac::{AacEncoder, AacProfile};
 use anyhow::{bail, Result};
@@ -19,6 +22,8 @@ use tokio::sync::{broadcast, mpsc};
 /// 1 ミックスあたりの配信バッファ(1 要素 ≒ AAC 1 フレーム ≒ 21 ms)。
 /// これ以上遅れたクライアントは古いフレームを飛ばして追いつかせる。
 const LIVE_BROADCAST_CAPACITY: usize = 256;
+/// 接続直後に送る無音の量。Chrome のメディア読み込みの単位(32KB)に合わせる
+const PREFILL_BYTES: usize = 32 * 1024;
 
 /// 1 回のオーディオコールバック分のサンプル(チャンネル ID とモノラルサンプル)
 #[derive(Debug, Clone)]
@@ -41,6 +46,8 @@ pub struct LiveHub {
     /// キーは昇順・重複なしのチャンネル ID 列
     mixes: Mutex<HashMap<Vec<usize>, Mix>>,
     active: Arc<AtomicBool>,
+    /// 接続直後に送る無音(初回に作って使い回す)
+    prefill: std::sync::OnceLock<Bytes>,
 }
 
 impl LiveHub {
@@ -52,7 +59,26 @@ impl LiveHub {
             channels,
             mixes: Mutex::new(HashMap::new()),
             active: Arc::new(AtomicBool::new(false)),
+            prefill: std::sync::OnceLock::new(),
         })
+    }
+
+    /// 接続直後に送る無音の AAC(ADTS)。エンコーダを作れなければ空
+    pub fn prefill(&self) -> Bytes {
+        self.prefill
+            .get_or_init(|| {
+                let mut out = Vec::with_capacity(PREFILL_BYTES + 1024);
+                if let Ok(mut enc) = AacEncoder::new(self.sample_rate, self.bitrate, self.profile) {
+                    let silence = vec![0i16; crate::aac::FRAME_SAMPLES * 8];
+                    while out.len() < PREFILL_BYTES {
+                        if enc.encode(&silence, &mut out).is_err() {
+                            break;
+                        }
+                    }
+                }
+                Bytes::from(out)
+            })
+            .clone()
     }
 
     /// 聞いている人がいるか(入力側がフレームを作るかどうかの判定に使う)
@@ -180,6 +206,19 @@ mod tests {
         let _b = hub.subscribe(&[3, 2]).unwrap();
         let _c = hub.subscribe(&[2]).unwrap();
         assert_eq!(hub.mixes.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn prefill_is_decodable_silence_of_chrome_block_size() {
+        let hub = LiveHub::new(48000, 16000, AacProfile::He, vec![0]);
+        let p = hub.prefill();
+        assert!(p.len() >= PREFILL_BYTES && p.len() < PREFILL_BYTES + 4096, "{}", p.len());
+        assert_eq!(p[0], 0xFF);
+        let pcm = crate::aac::tests::decode(&p);
+        assert!(!pcm.is_empty());
+        assert!(pcm.iter().all(|&s| s.abs() < 50));
+        // 2 回目は作り直さない
+        assert_eq!(hub.prefill().as_ptr(), p.as_ptr());
     }
 
     #[test]

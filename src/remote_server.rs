@@ -278,6 +278,9 @@ struct SegmentsQuery {
 struct LiveQuery {
     #[serde(default)]
     t: Option<String>,
+    /// 0 なら接続直後の無音(プリフィル)を送らない
+    #[serde(default)]
+    prefill: Option<u8>,
     /// カンマ区切りのチャンネル ID
     #[serde(default)]
     c: String,
@@ -645,6 +648,12 @@ pub async fn start(
         config.include_partials
     );
 
+    // 小さな書き込み(SSE の 1 イベント、ライブの AAC 1 フレーム)を溜めずにすぐ送る(Nagle 無効)
+    let listener = axum::serve::ListenerExt::tap_io(listener, |tcp: &mut tokio::net::TcpStream| {
+        if let Err(e) = tcp.set_nodelay(true) {
+            log::debug!("Remote: TCP_NODELAY の設定に失敗: {}", e);
+        }
+    });
     tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app).await {
             log::error!("Remote サーバが終了: {}", e);
@@ -887,7 +896,12 @@ async fn serve_live(
         Some(Err(e)) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
         None => return (StatusCode::BAD_REQUEST, "invalid channel list").into_response(),
     };
+    let prefill = (q.prefill != Some(0)).then(|| hub.prefill());
     let stream = async_stream::stream! {
+        // ブラウザがすぐ再生を始められるよう、先に無音をまとめて送る(LiveHub::prefill)
+        if let Some(p) = prefill {
+            yield Ok::<_, Infallible>(p);
+        }
         loop {
             match rx.recv().await {
                 Ok(bytes) => yield Ok::<_, Infallible>(bytes),

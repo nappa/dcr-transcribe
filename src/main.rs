@@ -15,6 +15,7 @@ mod transcribe;
 mod transcribe_backend;
 mod tui;
 mod tui_state;
+mod tunnel;
 mod types;
 mod vad;
 mod wav_writer;
@@ -185,6 +186,18 @@ async fn main() -> Result<()> {
         _ => None,
     };
 
+    // cloudflared(Remote サーバが立ち上がってから。サーバ無しでは公開するものが無い)
+    let tunnel = if config.tunnel.enabled {
+        if remote_state.is_some() {
+            Some(tunnel::Tunnel::start(&config.tunnel).context("トンネルの設定が不正です")?)
+        } else {
+            log::warn!("トンネル: Remote サーバが無効なので cloudflared は起動しません");
+            None
+        }
+    } else {
+        None
+    };
+
     // Ctrl+C ハンドラを設定
     let running = Arc::new(AtomicBool::new(true));
     let running_clone = running.clone();
@@ -274,8 +287,8 @@ async fn main() -> Result<()> {
     // AudioInputを作成して開始
     let mut audio_input = AudioInput::new(&config.audio)?;
     if let Some(hub) = live_hub_for_input {
-        // 1 要素 = 1 コールバック(4096 フレーム ≒ 85 ms)。詰まったら入力側で捨てる
-        let (live_tx, live_rx) = mpsc::channel(64);
+        // 1 要素 = 1 コールバック(1024 フレーム ≒ 21 ms)。詰まったら入力側で捨てる
+        let (live_tx, live_rx) = mpsc::channel(256);
         audio_input.set_live_tap(live_tx, hub.active_flag());
         tokio::spawn(hub.run(live_rx));
         log::info!("ライブ再生: 有効 ({:?}, {} bps)", config.live.profile, config.live.bitrate);
@@ -504,6 +517,9 @@ async fn main() -> Result<()> {
 
     audio_input.stop();
     audio_output.stop();
+    if let Some(t) = tunnel {
+        t.stop().await;
+    }
 
     // TUIタスクの完了を待つ
     let _ = tui_task.await;

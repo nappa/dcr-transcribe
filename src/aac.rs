@@ -157,6 +157,33 @@ pub(crate) mod tests {
         assert!(rms > 1000.0, "rms={}", rms);
     }
 
+    /// エンコード + デコードの遅延(サンプル数)を測る。`cargo test -- --ignored --nocapture codec_delay`
+    #[test]
+    #[ignore]
+    fn codec_delay() {
+        for (name, br, prof) in [
+            ("LC 32k", 32000, AacProfile::Lc),
+            ("LC 48k", 48000, AacProfile::Lc),
+            ("HE 16k", 16000, AacProfile::He),
+            ("HE 24k", 24000, AacProfile::He),
+        ] {
+            let mut enc = AacEncoder::new(48000, br, prof).unwrap();
+            // 1 秒無音 → 10 ms のバースト → 無音
+            let mut input = vec![0i16; 48000 * 2];
+            for (i, s) in input[48000..48480].iter_mut().enumerate() {
+                *s = ((i as f32 * 0.3).sin() * 20000.0) as i16;
+            }
+            let mut out = Vec::new();
+            enc.encode(&input, &mut out).unwrap();
+            enc.flush(&mut out).unwrap();
+            let pcm = decode(&out);
+            // HE は 2ch で出てくることがあるので、出力長から ch 数を推定
+            let ch = if pcm.len() > input.len() * 3 / 2 { 2 } else { 1 };
+            let first = pcm.iter().position(|&s| s.abs() > 3000).unwrap() / ch;
+            println!("{}: 遅延 {} サンプル = {:.1} ms", name, first - 48000, (first - 48000) as f64 / 48.0);
+        }
+    }
+
     #[test]
     fn bitrate_is_roughly_honored() {
         let mut enc = AacEncoder::new(48000, 48000, AacProfile::Lc).unwrap();

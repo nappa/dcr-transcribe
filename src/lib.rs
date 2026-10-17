@@ -55,6 +55,7 @@ pub mod segment_recorder;
 pub mod transcribe;
 pub mod transcribe_backend;
 pub mod tui_state;
+pub mod tunnel;
 pub mod types;
 pub mod vad;
 pub mod wav_writer;

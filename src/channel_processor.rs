@@ -25,9 +25,9 @@ enum TranscribeConnectionState {
 }
 
 /// 切断中の音声バッファに蓄積する最大チャンク数。
-/// 100ms チャンクで運用していると 1000 件 ≒ 100 秒分。
+/// 入力は 1024 フレーム(48 kHz で約 21 ms)ごとに届くので 5000 件 ≒ 107 秒分。
 /// 超過時は最古から破棄(DropOldest 相当)してメモリ膨張を防ぐ。
-const MAX_BUFFERED_DISCONNECT_CHUNKS: usize = 1000;
+const MAX_BUFFERED_DISCONNECT_CHUNKS: usize = 5000;
 
 /// 再接続失敗時の指数バックオフ管理。
 ///

@@ -227,7 +227,7 @@ var FAST_THRESHOLD_MS=30000; // この時間以上 hidden だったらファス�
 var FAST_HEAD=20;            // ファストロード時に取得する件数
 var segs={};               // 録音区間 id -> {c,t,d}
 var maxSegId=0;
-var audio=null,playingId=0;
+var playingId=0;
 var chainEl=document.getElementById("chain");
 
 function pad(n){return n<10?"0"+n:""+n}
@@ -382,129 +382,351 @@ function regroupAround(d){
   for(var g in gs)groupSeg(+g);
 }
 
+// ── 再生(録音とライブで 1 つの audio 要素を使い回す) ──
+// iOS などは画面ロック中・別アプリ表示中に「新しい」audio 要素の再生を始められない。
+// 同じ要素の src を切り替えて続けることで、バックグラウンドでも連続再生 → ライブへ移れるようにする。
+// ロック画面・通知の操作は Media Session で出す。
+var player=null,mode=null;   // mode: "clip"(録音) | "live" | null
+var liveAvailable=false;
+function getPlayer(){
+  if(player)return player;
+  player=new Audio();
+  player.preload="auto";
+  player.addEventListener("ended",function(){
+    if(mode==="clip"&&playingId)clipEnded(playingId);
+    else if(mode==="live"&&liveEngine==="audio")liveBroken();
+  });
+  player.addEventListener("error",function(){
+    // 読み込めない録音で止まり続けないよう、失敗したら連続再生ごと止める
+    if(mode==="clip"&&playingId)stopChain();
+    else if(mode==="live"&&liveEngine==="audio")liveBroken();
+  });
+  player.addEventListener("playing",function(){if(mode==="live"&&liveEngine==="audio"){liveWaitSince=0;catchUpLive();liveUi("on")}});
+  player.addEventListener("waiting",function(){if(mode==="live"&&liveEngine==="audio"){if(!liveWaitSince)liveWaitSince=Date.now();liveUi("wait")}});
+  return player;
+}
+function stopPlayer(){
+  mode=null;
+  if(player){player.pause();player.removeAttribute("src");player.load()}
+  updateMediaSession();
+}
+
 // ── ライブ再生(選んだチャンネルをサーバでミックスした AAC ストリーム) ──
-// 細い・揺れる回線向けに、ブラウザ内に溜まった分(=遅延)を監視して追いつかせる:
-//   1.5 秒超: 少し速く再生 / 4 秒超: 今の音まで飛ぶ / 6 秒以上止まったまま: つなぎ直す
-var liveAudio=null,liveWanted=false,liveRetry=0,resumeLive=false,liveWaitSince=0,liveLag=0;
-var LIVE_FAST_LAG=1.5,LIVE_JUMP_LAG=4,LIVE_STALL_MS=6000;
+// 再生エンジンは 2 つ:
+//   "ll"   : 低遅延。fetch で ADTS を受け取り WebCodecs でデコード、Web Audio で再生時刻を自分で管理する。
+//            溜める量(jitter バッファ)を 0.15〜1 秒で回線に合わせて自動調整する
+//   "audio": <audio> に任せる。WebCodecs 非対応のブラウザと、画面が隠れている間(バックグラウンド再生)に使う。
+//            Chrome は再生を続けるのに約 2.3 秒溜めるので遅延は大きい。溜まりすぎたら速く再生・飛ばす:
+//            3 秒超: 少し速く / 5 秒超: 今の音まで飛ぶ。接続直後のサーバの無音(プリフィル)も飛ばす
+// どちらも 10 秒以上音が届かなければつなぎ直す
+var liveWanted=false,liveRetry=0,liveWaitSince=0,liveLag=0,liveEngine=null;
+var LIVE_FAST_LAG=3,LIVE_JUMP_LAG=5,LIVE_STALL_MS=10000;
 function liveUi(state){
   lplay.className="lp"+(state==="on"?" on":state==="wait"?" wait":"");
-  lplay.textContent=state==="on"?"■ 停止"+(liveLag>1?"(遅延 "+liveLag.toFixed(1)+"秒)":""):state==="wait"?"接続中…":"▶ 聞く";
+  var lag=liveEngine==="ll"||liveLag>LIVE_FAST_LAG?"(遅延 "+liveLag.toFixed(1)+"秒)":"";
+  lplay.textContent=state==="on"?"■ 停止"+lag:state==="wait"?"接続中…":"▶ 聞く";
 }
-setInterval(function(){
-  if(!liveWanted||!liveAudio)return;
-  var a=liveAudio;
-  if(liveWaitSince&&Date.now()-liveWaitSince>LIVE_STALL_MS){startLive();return}
-  if(!a.buffered.length||a.paused)return;
+// "audio" エンジン: 溜まった分を測り、多ければ速く再生するか今の音まで飛ぶ
+function catchUpLive(){
+  var a=player;
+  if(liveEngine!=="audio"||!a||!a.buffered.length||a.paused)return;
   var end=a.buffered.end(a.buffered.length-1);
   liveLag=Math.max(0,end-a.currentTime);
   if(liveLag>LIVE_JUMP_LAG){
     try{a.currentTime=end-0.5}catch(_){}
     a.playbackRate=1;
+    liveLag=0.5;
   }else{
     a.playbackRate=liveLag>LIVE_FAST_LAG?1.1:1;
   }
-  if(!liveWaitSince)liveUi("on");
+}
+setInterval(function(){
+  if(!liveWanted||mode!=="live")return;
+  var since=liveEngine==="ll"?(LL.lastAt||liveWaitSince):liveWaitSince;
+  if(since&&Date.now()-since>LIVE_STALL_MS){startLive();return}
+  catchUpLive();
+  llWatch();
+  if(!liveWanted)return;
+  if(liveEngine==="ll"&&LL.lastAt)liveLag=Math.max(0,LL.next-LL.ctx.currentTime);
+  if(liveEngine==="ll"?LL.lastAt:!liveWaitSince)liveUi("on");
 },1000);
+
+// ── 低遅延エンジン(WebCodecs + Web Audio) ──
+var LL={ok:null,ctx:null,abort:null,dec:null,next:0,target:0.25,stableAt:0,ts:0,lastAt:0,frameUs:0,fedAt:0,idleTicks:0,blocked:false,queue:[],queued:0};
+var LL_MIN=0.15,LL_MAX=1.0,LL_DROP=0.6;   // target + LL_DROP を超えて溜まったら古いフレームを捨てる
+// LL.blocked: iOS などで AudioContext が止まったまま戻らないとき、次のユーザー操作まで <audio> を使う
+function llSupported(){
+  if(LL.blocked)return Promise.resolve(false);
+  if(LL.ok!==null)return Promise.resolve(LL.ok);
+  if(!window.AudioDecoder||!window.EncodedAudioChunk||!(window.AudioContext||window.webkitAudioContext)){LL.ok=false;return Promise.resolve(false)}
+  return AudioDecoder.isConfigSupported({codec:"mp4a.40.2",sampleRate:24000,numberOfChannels:1})
+    .then(function(r){LL.ok=!!r.supported;return LL.ok})
+    .catch(function(){LL.ok=false;return false});
+}
+// AudioContext と <audio> の再生許可は、ユーザー操作の中で取っておく(iOS などの自動再生制限)
+var SILENT_WAV="data:audio/wav;base64,UklGRsQAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YaAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+function unlockAudio(){
+  if(!LL.ctx&&(window.AudioContext||window.webkitAudioContext)){
+    try{LL.ctx=new (window.AudioContext||window.webkitAudioContext)({latencyHint:"interactive"})}catch(_){}
+  }
+  // iOS はバックグラウンドや割り込みのあと "interrupted" のまま止まることがある
+  if(LL.ctx&&LL.ctx.state!=="running")LL.ctx.resume().catch(function(){});
+  LL.blocked=false;
+  var a=getPlayer();
+  if(!mode){a.src=SILENT_WAV;a.play().then(function(){if(!mode)a.pause()}).catch(function(){})}
+}
+var ADTS_RATES=[96000,88200,64000,48000,44100,32000,24000,22050,16000,12000,11025,8000,7350];
+function llStart(sel){
+  llStop();
+  if(!LL.ctx)unlockAudio();
+  var ctx=LL.ctx;
+  if(!ctx){llFail();return}
+  if(ctx.state!=="running")ctx.resume().catch(function(){});
+  var ac=new AbortController();
+  LL.abort=ac;LL.next=0;LL.ts=0;LL.lastAt=0;LL.fedAt=0;LL.idleTicks=0;LL.stableAt=ctx.currentTime;
+  fetch(withToken("/live?c="+sel.join(",")+"&prefill=0&_="+Date.now()),{signal:ac.signal,cache:"no-store"})
+    .then(function(r){
+      if(!r.ok)throw new Error("HTTP "+r.status);
+      var reader=r.body.getReader(),pend=new Uint8Array(0);
+      function pump(){
+        return reader.read().then(function(x){
+          if(x.done)throw new Error("end");
+          var b=new Uint8Array(pend.length+x.value.length);
+          b.set(pend);b.set(x.value,pend.length);
+          pend=llFeed(b);
+          return pump();
+        });
+      }
+      return pump();
+    })
+    .catch(function(){if(!ac.signal.aborted&&LL.abort===ac)liveBroken()});
+}
+// 受信バイト列から ADTS フレームを切り出してデコーダへ。残り(次のフレームの途中)を返す
+function llFeed(b){
+  var i=0;
+  while(b.length-i>=7){
+    if(b[i]!==0xFF||(b[i+1]&0xF0)!==0xF0){i++;continue}
+    var len=((b[i+3]&3)<<11)|(b[i+4]<<3)|(b[i+5]>>5);
+    if(len<7){i++;continue}
+    if(b.length-i<len)break;
+    if(!LL.dec){
+      var rate=ADTS_RATES[(b[i+2]>>2)&15],chn=((b[i+2]&1)<<2)|(b[i+3]>>6);
+      LL.frameUs=1024/rate*1e6;
+      // デコードできない(ADTS を受け付けない実装など)なら <audio> に切り替える
+      LL.dec=new AudioDecoder({output:llOutput,error:function(){llFail()}});
+      LL.dec.configure({codec:"mp4a.40.2",sampleRate:rate,numberOfChannels:chn||1});
+    }
+    if(LL.dec.state==="configured"){
+      LL.dec.decode(new EncodedAudioChunk({type:"key",timestamp:LL.ts,data:b.slice(i,i+len)}));
+      LL.ts+=LL.frameUs;
+      if(!LL.fedAt)LL.fedAt=Date.now();
+    }
+    i+=len;
+  }
+  return b.slice(i);
+}
+// デコードした音を、前の音のすぐ後ろに隙間なく予約する。
+// 開始時と途切れた後は、目標の量(LL.target)まで溜めてからまとめて予約する
+// (AudioContext の時計の動き出しやデコーダの初期遅延で、余裕が削られないように)
+function llOutput(ad){
+  var ctx=LL.ctx,n=ad.numberOfFrames;
+  if(!liveWanted||liveEngine!=="ll"||!n){ad.close();return}
+  var pcm=new Float32Array(n);
+  try{ad.copyTo(pcm,{planeIndex:0,format:"f32-planar"})}catch(_){ad.close();return}
+  var buf=ctx.createBuffer(1,n,ad.sampleRate);
+  ad.close();
+  buf.copyToChannel(pcm,0);
+  var now=ctx.currentTime;
+  LL.lastAt=Date.now();
+  if(LL.next&&LL.next<now){
+    // 途切れた(回線が詰まった)→ 溜める量を増やして溜め直す
+    LL.target=Math.min(LL_MAX,LL.target*1.5+0.05);
+    LL.stableAt=now;LL.next=0;
+  }
+  if(!LL.next){
+    LL.queue.push(buf);LL.queued+=buf.duration;
+    if(LL.queued<LL.target)return;
+    LL.next=now+0.02;
+    LL.queue.forEach(llPlay);
+    LL.queue=[];LL.queued=0;
+    if(liveWaitSince){liveWaitSince=0;liveLag=LL.next-now;liveUi("on")}
+    return;
+  }
+  // 溜まりすぎ → このフレームを捨てて追いつく
+  if(LL.next-now>LL.target+LL_DROP)return;
+  // 30 秒途切れなければ溜める量を少し減らす
+  if(now-LL.stableAt>30&&LL.target>LL_MIN){LL.target=Math.max(LL_MIN,LL.target-0.05);LL.stableAt=now}
+  llPlay(buf);
+}
+function llPlay(buf){
+  var src=LL.ctx.createBufferSource();
+  src.buffer=buf;src.connect(LL.ctx.destination);src.start(LL.next);
+  LL.next+=buf.duration;
+}
+function llStop(){
+  if(LL.abort){LL.abort.abort();LL.abort=null}
+  if(LL.dec){try{LL.dec.close()}catch(_){}LL.dec=null}
+  LL.next=0;LL.lastAt=0;LL.fedAt=0;LL.idleTicks=0;LL.queue=[];LL.queued=0;
+}
+function llFail(){
+  if(LL.abort===null&&!LL.dec)return;
+  LL.ok=false;llStop();
+  if(liveWanted)startLive();
+}
+// 低遅延エンジンの見張り(1 秒ごと):
+//  - フレームを渡して 3 秒たっても音が出てこない → デコーダが使えないとみなして <audio> へ
+//  - AudioContext が 2 秒以上動いていない(iOS のバックグラウンド・割り込み後など)→ 次の操作まで <audio> へ
+function llWatch(){
+  if(liveEngine!=="ll"||!LL.ctx)return;
+  if(LL.fedAt&&!LL.lastAt&&Date.now()-LL.fedAt>3000){llFail();return}
+  if(LL.ctx.state!=="running"){
+    LL.ctx.resume().catch(function(){});
+    if(++LL.idleTicks>2){LL.blocked=true;llStop();startLive()}
+  }else{
+    LL.idleTicks=0;
+  }
+}
+
+// "audio" エンジンでの開始
+function audioLiveStart(sel){
+  var a=getPlayer();
+  liveEngine="audio";
+  // 毎回 URL を変えて、溜まった古い音ではなく今の音から聞く
+  a.playbackRate=1;
+  a.src=withToken("/live?c="+sel.join(",")+"&_="+Date.now());
+  return a.play();
+}
 function startLive(){
   var sel=Array.from(liveSel).sort(function(a,b){return a-b});
   if(!sel.length){lplay.textContent="ch を選択";setTimeout(function(){liveUi("off")},1200);return}
+  // ライブを聞くなら録音の連続再生は終える(同じ audio 要素を切り替える)
+  if(chainOn)endChain();
   liveWanted=true;
   clearTimeout(liveRetry);
-  if(!liveAudio){
-    liveAudio=new Audio();
-    liveAudio.onplaying=function(){liveWaitSince=0;if(liveWanted)liveUi("on")};
-    liveAudio.onwaiting=function(){if(!liveWaitSince)liveWaitSince=Date.now();if(liveWanted)liveUi("wait")};
-    // 回線断などで止まったら少し待ってつなぎ直す
-    liveAudio.onerror=liveAudio.onended=function(){
-      if(!liveWanted)return;
-      liveUi("wait");
-      clearTimeout(liveRetry);
-      liveRetry=setTimeout(function(){if(liveWanted)startLive()},2000);
-    };
-  }
-  // 毎回 URL を変えて、溜まった古い音ではなく今の音から聞く
   liveWaitSince=Date.now();liveLag=0;
-  liveAudio.playbackRate=1;
-  liveAudio.src=withToken("/live?c="+sel.join(",")+"&_="+Date.now());
   liveUi("wait");
-  liveAudio.play().catch(function(){if(liveWanted){liveWanted=false;liveUi("off")}});
+  llSupported().then(function(ok){
+    if(!liveWanted)return;
+    llStop();
+    if(mode==="clip"||liveEngine==="audio"){if(player){player.pause();player.removeAttribute("src");player.load()}}
+    mode="live";
+    if(ok&&!document.hidden){
+      liveEngine="ll";
+      llStart(sel);
+    }else{
+      audioLiveStart(sel).catch(function(){if(liveWanted){liveWanted=false;liveEngine=null;liveUi("off")}});
+    }
+    updateMediaSession();
+  });
 }
 function stopLive(){
   liveWanted=false;
   liveWaitSince=0;liveLag=0;
   clearTimeout(liveRetry);
-  if(liveAudio){liveAudio.pause();liveAudio.removeAttribute("src");liveAudio.load()}
+  llStop();
+  if(mode==="live")stopPlayer();
+  liveEngine=null;
   liveUi("off");
 }
-lplay.onclick=function(){
-  resumeLive=false;
-  if(liveWanted){stopLive();return}
-  // ライブを聞くなら録音の連続再生は止める(音が重ならないように)
-  if(chainOn)stopChain();
-  startLive();
-};
+// 回線断などで止まったら少し待ってつなぎ直す
+function liveBroken(){
+  if(!liveWanted)return;
+  liveUi("wait");
+  clearTimeout(liveRetry);
+  liveRetry=setTimeout(function(){if(liveWanted)startLive()},2000);
+}
+// 画面が隠れたら <audio> に切り替えて(バックグラウンド再生)、戻ったら低遅延に戻す
+document.addEventListener("visibilitychange",function(){
+  if(!liveWanted||mode!=="live")return;
+  if(document.hidden&&liveEngine==="ll"){
+    var sel=Array.from(liveSel).sort(function(a,b){return a-b});
+    llStop();
+    audioLiveStart(sel).catch(function(){
+      // バックグラウンドで <audio> を始められない環境では低遅延のまま続ける
+      liveEngine="ll";llStart(sel);
+    });
+  }else if(!document.hidden&&liveEngine==="audio"&&LL.ok){
+    startLive();
+  }
+});
+lplay.onclick=function(){if(liveWanted)stopLive();else{unlockAudio();startLive()}};
 function makeLiveChip(id,name){
   var b=document.createElement("div");
   b.className="chip c"+id+(liveSel.has(id)?" on":"");
+  b.dataset.c=id;
   b.textContent=name;
   b.onclick=function(){
     if(liveSel.has(id)){liveSel.delete(id);b.classList.remove("on")}
     else{liveSel.add(id);b.classList.add("on")}
-    localStorage.setItem(LIVE,JSON.stringify(Array.from(liveSel)));
+    saveLiveSel();
     // 再生中なら選択に合わせてつなぎ直す
     if(liveWanted){if(liveSel.size)startLive();else stopLive()}
   };
   return b;
 }
+function saveLiveSel(){try{localStorage.setItem(LIVE,JSON.stringify(Array.from(liveSel)))}catch(_){}}
+// ライブで聞くチャンネルが未選択なら、今表示しているタブのチャンネルを選ぶ
+function ensureLiveSel(){
+  if(liveSel.size)return true;
+  Object.keys(names).forEach(function(c){if(visible(+c))liveSel.add(+c)});
+  lchips.querySelectorAll(".chip").forEach(function(b){b.classList.toggle("on",liveSel.has(+b.dataset.c))});
+  saveLiveSel();
+  return liveSel.size>0;
+}
 
 // ── 連続再生 ──
-// ▶ を押した録音から、録音時刻の新しい方へ順に再生する。最新まで聞き終えたら新着を待って続ける。
-// ライブを聞いていた場合は、最新まで追いついたところでライブに戻る(新着は既にライブで聞こえるため)。
-var chainOn=false,waitingNext=false,lastPlayed=0;
+// ▶ を押した録音から、録音時刻の新しい方へ順に再生する。
+// 最新まで聞き終えたらリアルタイム再生(ライブ)に切り替える(以降の新着はライブで聞こえる)。
+var chainOn=false,lastPlayed=0;
 function chainUi(){
   chainEl.hidden=!chainOn;
-  chainEl.textContent=waitingNext?"新着待ち ✕":"連続再生 ✕";
+  chainEl.textContent="連続再生 ✕";
 }
 chainEl.onclick=function(){stopChain()};
-function stopChain(){
-  chainOn=false;waitingNext=false;
-  if(audio){audio.pause();audio=null}
+// 連続再生の状態だけを終える(audio 要素はそのまま。ライブへ切り替えるとき用)
+function endChain(){
+  chainOn=false;
   var prev=playingId;playingId=0;
   if(prev)refreshPlay(prev);
   chainUi();
-  if(resumeLive){resumeLive=false;startLive()}
+}
+function stopChain(){
+  endChain();
+  if(mode==="clip")stopPlayer();
 }
 function togglePlay(g){
   if(playingId===g){stopChain();return}
+  // 最新まで聞いたらライブ(低遅延は Web Audio)へ移るので、ここで再生許可を取っておく
+  unlockAudio();
   chainOn=true;
   playClip(g);
 }
 function playClip(g){
-  waitingNext=false;
-  if(audio){audio.pause();audio=null}
   var prev=playingId;playingId=0;
   if(prev)refreshPlay(prev);
-  // 録音を聞く間はライブを止め、連続再生が終わったら再開する
-  if(liveWanted){resumeLive=true;stopLive()}
-  audio=new Audio(withToken("/audio/"+g));
+  // ライブ中なら止めて録音に切り替える(同じ audio 要素)
+  if(liveWanted){liveWanted=false;clearTimeout(liveRetry);llStop();liveEngine=null;liveUi("off")}
+  var a=getPlayer();
+  mode="clip";
+  a.playbackRate=1;
+  a.src=withToken("/audio/"+g);
   playingId=g;lastPlayed=g;
-  audio.onended=function(){if(playingId===g)clipEnded(g)};
-  // 読み込めない録音で止まり続けないよう、失敗したら連続再生ごと止める
-  audio.onerror=function(){if(playingId===g)stopChain()};
-  audio.play().catch(function(){if(playingId===g)stopChain()});
+  a.play().catch(function(){if(playingId===g)stopChain()});
   refreshPlay(g);
   chainUi();
+  updateMediaSession();
   var b=log.querySelector('.pl[data-g="'+g+'"]');
-  if(b)b.closest(".r").scrollIntoView({block:"nearest"});
+  if(b&&!document.hidden)b.closest(".r").scrollIntoView({block:"nearest"});
 }
 function clipEnded(g){
-  playingId=0;audio=null;refreshPlay(g);
-  if(!chainOn)return;
+  playingId=0;refreshPlay(g);
+  if(!chainOn){stopPlayer();return}
   var n=nextSeg(g);
   if(n){playClip(n);return}
-  if(resumeLive){chainOn=false;chainUi();resumeLive=false;startLive();return}
-  waitingNext=true;chainUi();
+  // 最新まで追いついた → リアルタイム再生へ
+  endChain();
+  if(liveAvailable&&ensureLiveSel())startLive();
+  else stopPlayer();
 }
 // 録音時刻が g の次に新しい区間(タブで表示していないチャンネルは飛ばす)
 function nextSeg(g){
@@ -517,6 +739,32 @@ function nextSeg(g){
     if(later&&(sg.t<bt||(sg.t===bt&&i<best))){best=i;bt=sg.t}
   }
   return best;
+}
+
+// ── ロック画面・通知の表示と操作(Media Session) ──
+function updateMediaSession(){
+  if(!("mediaSession" in navigator))return;
+  var ms=navigator.mediaSession;
+  try{
+    if(mode==="live"){
+      var sel=Array.from(liveSel).map(function(c){return names[c]!==undefined?names[c]:"ch"+c});
+      ms.metadata=new MediaMetadata({title:"ライブ: "+sel.join(" + "),artist:"dcr-transcribe"});
+      ms.playbackState="playing";
+    }else if(mode==="clip"&&segs[playingId]){
+      var sg=segs[playingId];
+      ms.metadata=new MediaMetadata({title:(names[sg.c]!==undefined?names[sg.c]:"ch"+sg.c)+" "+fmtMs(sg.t),artist:"dcr-transcribe 録音"});
+      ms.playbackState="playing";
+    }else{
+      ms.playbackState="none";
+    }
+  }catch(_){}
+}
+if("mediaSession" in navigator){
+  var msAction=function(name,fn){try{navigator.mediaSession.setActionHandler(name,fn)}catch(_){}};
+  msAction("pause",function(){if(mode==="clip")stopChain();else if(mode==="live")stopLive()});
+  msAction("stop",function(){if(mode==="clip")stopChain();else if(mode==="live")stopLive()});
+  msAction("play",function(){if(!mode&&liveAvailable&&ensureLiveSel())startLive()});
+  msAction("nexttrack",function(){if(mode==="clip"&&playingId)clipEnded(playingId)});
 }
 
 function addSeg(sg,live){
@@ -536,8 +784,6 @@ function addSeg(sg,live){
     updateEmpty();
     noteNew();
   }
-  // 連続再生が新着待ちなら続けて再生(行を作った後に呼ぶとその行が再生中表示になる)
-  if(waitingNext&&visible(sg.c)&&nextSeg(lastPlayed)===sg.i)playClip(sg.i);
 }
 function loadSegs(){
   // 初回は新しい側だけ(細い回線で全件取らない)。再接続時は取りこぼし分だけ
@@ -656,7 +902,7 @@ function connect(opts){
         // 以前選んでいたタブが今は無ければ「すべて」に戻す
         if(view!=="all"&&names[+view]===undefined)view="all";
         applyView();
-        if(d.live)liveBar.hidden=false;
+        if(d.live){liveBar.hidden=false;liveAvailable=true}
         // 以前の選択に今は無いチャンネルが残っていたら落とす
         liveSel.forEach(function(id){if(names[id]===undefined)liveSel.delete(id)});
       }
