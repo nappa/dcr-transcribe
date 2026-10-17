@@ -115,6 +115,23 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // ログイン URL の表示(キーはログに残さないので、必要なときにこれで確かめる)
+    if args.len() > 1 && args[1] == "--show-login-url" {
+        let config_path = args.get(2).map(String::as_str).unwrap_or("config.toml");
+        let config = Config::load_or_default(config_path)?;
+        let remote = config.remote.unwrap_or_else(|| {
+            toml::from_str("").expect("RemoteConfig の既定値")
+        });
+        let key = access::load_or_create_login_key(&remote.login_key, &remote.login_key_file)?;
+        if key.is_empty() {
+            println!("ログインキーが設定されていません(login_key / login_key_file が空)");
+        } else {
+            println!("ローカル:   http://{}/?k={}", remote.listen, key);
+            println!("公開 URL:   https://<トンネルのホスト名>/?k={}", key);
+        }
+        return Ok(());
+    }
+
     // 設定ファイル生成モード
     if args.len() > 1 && args[1] == "--generate-config" {
         let config_path = if args.len() > 2 {

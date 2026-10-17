@@ -213,7 +213,7 @@ listen = "127.0.0.1:8765"   # loopback で listen、cloudflared が公開
 history_size = 200          # 新規クライアントへ送信する履歴件数
 include_partials = false    # partial も配信するか(転送量増)
 partial_throttle_ms = 500   # partial の throttle(include_partials=true 時のみ有効)
-auth_token = ""             # 共有トークン。設定すると `?t=...` 必須
+login_key_file = "./secrets/login_key"   # ログインキー(/?k=...)。無ければ初回起動時に生成
 ```
 
 ### 2. 発話ごとの録音を有効にする(任意)
@@ -342,28 +342,25 @@ cloudflared tunnel --config ~/.cloudflared/dcr-transcribe.yml run
 
 ### セキュリティ
 
-外部公開する場合、以下のいずれかで認証してください:
+外部公開する場合は、以下を組み合わせて守る:
 
-**A. アプリ側で HTTP Basic 認証** (推奨)
+**A. ログイン URL(本体側、推奨)**
+
 ```toml
 [remote]
-basic_auth_user = "viewer"
-basic_auth_pass = "ランダムな長いパスワード"
+login_key_file = "./secrets/login_key"   # 既定値。無ければ初回起動時に生成して保存(パーミッション 600)
+# login_key = "..."                      # 直接書くこともできる(こちらが優先)
 ```
 
-ブラウザでアクセスすると認証ダイアログが出ます。一度入力すればブラウザがキャッシュし、
-SSE 接続(EventSource)も自動的に同じ認証情報を送信します。
+- `https://transcribe.example.com/?k=<ログインキー>` を開くとセッションクッキー(HttpOnly / Secure / SameSite=Lax)が発行され、
+  キーを消した `/` に転送される(キーがアドレスバーや履歴に残らない)。以降はクッキーで使える
+- キーは再起動しても変わらない(ファイルに保存)。URL は `dcr-transcribe --show-login-url` で表示する(キーはログに出さない)
+- キーを変えたいときは `secrets/login_key` を消して起動し直す(新しいキーが生成される。以前のクッキーも再起動で無効になる)
+- キー無しで開くと「ログイン用の URL を開いてください」(401)、違うキーは 403
+- 旧版の `basic_auth_user` / `basic_auth_pass` / `auth_token` は廃止。設定に残っていると起動時にエラーになる
+  (気付かずに認証無しで公開されるのを防ぐため)
 
-**B. アプリ側でトークン認証**
-```toml
-[remote]
-auth_token = "ランダムな長い文字列"
-```
-
-クライアントは `https://transcribe.example.com/?t=<token>` でアクセス。
-ブックマーク等で URL に埋め込めるので「リンク 1 つで開ける」用途に向く。
-
-**C. 国内 IP に限定 + bot 確認(本体側)**
+**B. 国内 IP に限定 + bot 確認(本体側)**
 
 ```toml
 [remote]
@@ -378,6 +375,7 @@ session_hours = 12                  # 確認を通ったあと再確認なしで
   Cloudflare ダッシュボードの Network → **IP Geolocation** が有効であること(既定で有効)。
   海外の VPN や iCloud プライベートリレー経由だと国外扱いになることがある
 - **bot 確認**: 閲覧画面を開くと Turnstile の確認画面が出て、通過するとセッションクッキー(HttpOnly / Secure)が発行される。
+  ログイン URL と併用すると、キーが正しい人だけに確認画面が出る(キーを知らない人には Turnstile も見せない)。
   SSE・録音・ライブなどのデータ系はこのクッキーが無いと 403。期限が切れたら画面が自動で確認画面に戻る。
   Cloudflare のチャレンジ画面と違い、SSE や音声の読み込みが期限切れで黙って止まることはない。
   セッションはメモリに持つので、本体を再起動すると確認し直しになる
@@ -385,21 +383,20 @@ session_hours = 12                  # 確認を通ったあと再確認なしで
   動作確認だけなら Cloudflare 公開のテスト用キー(サイトキー `1x00000000000000000000AA`、シークレット `1x0000000000000000000000000000000AA`、常に通る)が使える
 - ゾーンで Cloudflare のチャレンジ(「Just a moment...」)が有効になっている場合は、このホスト名では外しておく(SSE や音声の読み込みが止まるため)
 
-**D. Cloudflare Access**
+**C. Cloudflare Access**
 
 Zero Trust ダッシュボードの Access → Applications で `transcribe.example.com` を Self-hosted アプリとして登録し、
 メールアドレスのワンタイムコードなどで閲覧者を絞る。アプリ側の認証と違い、トンネルの手前で弾ける。
 
-A〜D はすべて併用可能(全てを通過する必要あり、二段階以上のゲート構成)。
-Basic 認証・トークンは `/`, `/stream`, `/history`, `/segments`, `/audio/{id}`, `/live` に適用(トークンは `/` 以外)、`/healthz` は常に認証不要(外部監視用)。
+A〜C はすべて併用可能(全てを通過する必要あり、二段階以上のゲート構成)。
+データ系(`/stream`, `/history`, `/segments`, `/audio/{id}`, `/live`)は有効なセッションが必須、`/healthz` は常に認証不要(外部監視用)。
 
 ### URL クエリパラメータ
 
 | パラメータ | 説明 |
 |---|---|
-| `?t=<token>` | `auth_token` 設定時に必須 |
+| `?k=<ログインキー>` | ログイン(クッキーを発行して `/` へ転送) |
 | `?p=1` | partial 結果も表示(`include_partials=true` で送信されている場合のみ) |
-| `?t=X&p=1` | 両方併用 |
 
 ### 転送量の目安
 
@@ -462,7 +459,7 @@ curl -s --max-time 10 -o live.aac "http://127.0.0.1:8765/live?c=2,3"; ffprobe li
 | 症状 | 対処 |
 |------|------|
 | ブラウザで「切断」のまま | サーバが起動しているか確認: `curl http://127.0.0.1:8765/healthz` |
-| 公開 URL で "401 Unauthorized" | Basic 認証設定済みなら正しい user:pass を入力(またはブラウザのキャッシュをクリア)。token 設定済みならクエリ `?t=<token>` を付ける |
+| 「ログイン用の URL を開いてください」 | `dcr-transcribe --show-login-url` で表示した URL を開く。本体を再起動するとクッキーが無効になるので開き直す |
 | 履歴が表示されない | F12 開発者ツールで `/stream` の SSE 受信状況を確認 |
 | 表示にラグがある | トンネル経由は中継分のレイテンシがある。LAN 直結なら遅延ほぼゼロ |
 | 公開 URL で「接続中」にならない | Quick Tunnel を使っていないか確認(SSE 非対応)。名前付きトンネルが必要 |

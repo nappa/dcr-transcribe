@@ -1256,7 +1256,6 @@ dependencies = [
  "aws-sdk-transcribestreaming",
  "aws-smithy-types",
  "axum",
- "base64 0.23.1",
  "brotli",
  "chrono",
  "claxon",

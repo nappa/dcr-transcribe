@@ -203,7 +203,6 @@ body{
 var liveBar=document.getElementById("live"),lchips=document.getElementById("lchips"),lplay=document.getElementById("lplay");
 var log=document.getElementById("log"),stat=document.getElementById("s"),tabsBox=document.getElementById("tabs"),fab=document.getElementById("fab"),older=document.getElementById("older"),emptyEl=document.getElementById("empty");
 var p=new URLSearchParams(location.search);
-var token=p.get("t")||"";
 var wantP=p.get("p")==="1";
 var TAB="dcr-tab";
 // 表示するチャンネル("all" かチャンネル ID)
@@ -234,7 +233,6 @@ function pad(n){return n<10?"0"+n:""+n}
 function msOf(s){return anchorMs+s*1000}
 function fmtMs(ms){if(!ms)return"";var d=new Date(ms);return pad(d.getHours())+":"+pad(d.getMinutes())+":"+pad(d.getSeconds())}
 function esc(s){return s.replace(/[&<>]/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;"}[c]})}
-function withToken(url){return token?url+(url.indexOf("?")<0?"?":"&")+"t="+encodeURIComponent(token):url}
 function atTop(){return window.scrollY<80}
 function nearBottom(){return(window.innerHeight+window.scrollY)>=document.documentElement.scrollHeight-200}
 function scrollTop(){window.scrollTo(0,0)}
@@ -484,7 +482,7 @@ function llStart(sel){
   if(ctx.state!=="running")ctx.resume().catch(function(){});
   var ac=new AbortController();
   LL.abort=ac;LL.next=0;LL.ts=0;LL.lastAt=0;LL.fedAt=0;LL.idleTicks=0;LL.stableAt=ctx.currentTime;
-  fetch(withToken("/live?c="+sel.join(",")+"&prefill=0&_="+Date.now()),{signal:ac.signal,cache:"no-store"})
+  fetch("/live?c="+sel.join(",")+"&prefill=0&_="+Date.now(),{signal:ac.signal,cache:"no-store"})
     .then(function(r){
       if(!r.ok)throw new Error("HTTP "+r.status);
       var reader=r.body.getReader(),pend=new Uint8Array(0);
@@ -593,7 +591,7 @@ function audioLiveStart(sel){
   liveEngine="audio";
   // 毎回 URL を変えて、溜まった古い音ではなく今の音から聞く
   a.playbackRate=1;
-  a.src=withToken("/live?c="+sel.join(",")+"&_="+Date.now());
+  a.src="/live?c="+sel.join(",")+"&_="+Date.now();
   return a.play();
 }
 function startLive(){
@@ -709,7 +707,7 @@ function playClip(g){
   var a=getPlayer();
   mode="clip";
   a.playbackRate=1;
-  a.src=withToken("/audio/"+g);
+  a.src="/audio/"+g;
   playingId=g;lastPlayed=g;
   a.play().catch(function(){if(playingId===g)stopChain()});
   refreshPlay(g);
@@ -787,7 +785,7 @@ function addSeg(sg,live){
 }
 function loadSegs(){
   // 初回は新しい側だけ(細い回線で全件取らない)。再接続時は取りこぼし分だけ
-  fetch(withToken("/segments?after="+maxSegId+(maxSegId?"":"&limit=300"))).then(function(r){
+  fetch("/segments?after="+maxSegId+(maxSegId?"":"&limit=300")).then(function(r){
     if(!r.ok)throw new Error("HTTP "+r.status);
     return r.json();
   }).then(function(data){
@@ -843,7 +841,6 @@ function loadOlder(){
   loadingOlder=true;
   older.textContent="読み込み中…";
   var url="/history?before="+firstShownId+"&limit=50";
-  if(token)url+="&t="+encodeURIComponent(token);
   fetch(url).then(function(r){
     if(!r.ok)throw new Error("HTTP "+r.status);
     return r.json();
@@ -877,7 +874,6 @@ fab.onclick=function(){scrollTop();newCount=0;fab.classList.remove("show")};
 
 function buildStreamUrl(opts){
   var qs=[];
-  if(token)qs.push("t="+encodeURIComponent(token));
   if(wantP)qs.push("p=1");
   if(opts&&opts.head)qs.push("head="+opts.head);
   return "/stream"+(qs.length?"?"+qs.join("&"):"");

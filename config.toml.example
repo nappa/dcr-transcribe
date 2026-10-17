@@ -63,9 +63,8 @@ wav_output_dir = "./recordings"
 # history_size = 200            # entries kept for new clients on reconnect
 # include_partials = false      # also stream partial results (more bandwidth)
 # partial_throttle_ms = 500     # throttle partials per channel (only used if include_partials=true)
-# auth_token = ""               # shared secret; clients pass `?t=...` (empty = no auth)
-# basic_auth_user = ""          # HTTP Basic 認証ユーザー名(空なら Basic 認証無効)
-# basic_auth_pass = ""          # HTTP Basic 認証パスワード
+# login_key_file = "./secrets/login_key"  # open /?k=<key> to log in (cookie); generated on first start if missing
+# login_key = ""                # or set the key directly (takes precedence over the file)
 # allowed_countries = ["JP"]    # allow only these countries (Cloudflare CF-IPCountry); empty = no restriction
 # turnstile_site_key = ""       # Cloudflare Turnstile site key; set both keys to require a bot check
 # turnstile_secret_key = ""     # Cloudflare Turnstile secret key

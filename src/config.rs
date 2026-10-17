@@ -51,14 +51,20 @@ pub struct RemoteConfig {
     /// partial を配信する場合のチャンネル毎の throttle 間隔(ms)
     #[serde(default = "default_remote_partial_throttle_ms")]
     pub partial_throttle_ms: u64,
-    /// 共有トークン。空なら認証なし。クエリ文字列 `?t=...` で照合
+    /// ログインキー。`/?k=<キー>` を開くとセッションクッキーが発行される。
+    /// 空なら `login_key_file` のキーを使う
     #[serde(default)]
+    pub login_key: String,
+    /// ログインキーを保存するファイル。無ければ初回起動時に生成して保存する(再起動してもログイン URL が変わらない)。
+    /// `login_key` も `login_key_file` も空ならログイン無し
+    #[serde(default = "default_remote_login_key_file")]
+    pub login_key_file: String,
+    /// 廃止(Basic 認証・`?t=` トークン)。設定されていたら起動時にエラーにする(気付かず認証無しになるのを防ぐ)
+    #[serde(default, skip_serializing)]
     pub auth_token: String,
-    /// HTTP Basic 認証のユーザー名(空なら Basic 認証は無効)
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub basic_auth_user: String,
-    /// HTTP Basic 認証のパスワード
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub basic_auth_pass: String,
     /// アクセスを許可する国(ISO 3166 の 2 文字、例: ["JP"])。空なら制限なし。
     /// Cloudflare が付ける `CF-IPCountry` で判定する(ローカルからの直接アクセスは常に許可)
@@ -73,6 +79,10 @@ pub struct RemoteConfig {
     /// bot 確認を通ったあと、再確認なしで使える時間(時間)
     #[serde(default = "default_remote_session_hours")]
     pub session_hours: u64,
+}
+
+fn default_remote_login_key_file() -> String {
+    "./secrets/login_key".to_string()
 }
 
 fn default_remote_session_hours() -> u64 {

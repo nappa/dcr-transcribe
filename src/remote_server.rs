@@ -63,7 +63,6 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
-use base64::Engine as _;
 use futures_util::stream::Stream;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -239,8 +238,6 @@ struct Hello {
 
 #[derive(Deserialize)]
 struct StreamQuery {
-    #[serde(default)]
-    t: Option<String>,
     /// 直近の N 件のみを送信(Last-Event-ID が無いときのみ有効)。
     /// モバイルが長時間 hidden の後に再接続するとき、欠損を全部辿らずに最新だけ即取得するため。
     #[serde(default)]
@@ -249,8 +246,6 @@ struct StreamQuery {
 
 #[derive(Deserialize)]
 struct HistoryQuery {
-    #[serde(default)]
-    t: Option<String>,
     /// この ID より小さいイベントを返す
     before: u64,
     /// 最大件数(サーバ側で history_size を上限にクランプ)
@@ -264,8 +259,6 @@ fn default_history_limit() -> usize {
 
 #[derive(Deserialize)]
 struct SegmentsQuery {
-    #[serde(default)]
-    t: Option<String>,
     /// この ID より新しい区間を返す
     #[serde(default)]
     after: u64,
@@ -276,8 +269,6 @@ struct SegmentsQuery {
 
 #[derive(Deserialize)]
 struct LiveQuery {
-    #[serde(default)]
-    t: Option<String>,
     /// 0 なら接続直後の無音(プリフィル)を送らない
     #[serde(default)]
     prefill: Option<u8>,
@@ -287,9 +278,10 @@ struct LiveQuery {
 }
 
 #[derive(Deserialize)]
-struct TokenQuery {
+struct IndexQuery {
+    /// ログインキー
     #[serde(default)]
-    t: Option<String>,
+    k: Option<String>,
 }
 
 /// `subscribe` への mode 指定
@@ -312,9 +304,6 @@ pub struct RemoteState {
     history_size: usize,
     include_partials: bool,
     partial_throttle: Duration,
-    auth_token: String,
-    basic_auth_user: String,
-    basic_auth_pass: String,
     anchor: String,
     channels: Vec<ChannelInfo>,
     segments: SegmentStore,
@@ -524,54 +513,6 @@ impl RemoteState {
         let start = matching.len().saturating_sub(limit);
         matching[start..].to_vec()
     }
-
-    fn check_token(&self, token: Option<&str>) -> bool {
-        if self.auth_token.is_empty() {
-            return true;
-        }
-        token == Some(self.auth_token.as_str())
-    }
-
-    /// HTTP Basic 認証チェック。
-    ///
-    /// `basic_auth_user` が空なら無効化(常に true)。
-    /// それ以外は `Authorization: Basic <base64(user:pass)>` ヘッダを要求。
-    fn check_basic_auth(&self, headers: &HeaderMap) -> bool {
-        if self.basic_auth_user.is_empty() {
-            return true;
-        }
-        let raw = match headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) {
-            Some(s) => s,
-            None => return false,
-        };
-        let encoded = match raw.strip_prefix("Basic ") {
-            Some(s) => s.trim(),
-            None => return false,
-        };
-        let decoded = match base64::engine::general_purpose::STANDARD.decode(encoded) {
-            Ok(d) => d,
-            Err(_) => return false,
-        };
-        let creds = match std::str::from_utf8(&decoded) {
-            Ok(s) => s,
-            Err(_) => return false,
-        };
-        let (user, pass) = match creds.split_once(':') {
-            Some(p) => p,
-            None => return false,
-        };
-        user == self.basic_auth_user && pass == self.basic_auth_pass
-    }
-}
-
-/// 401 Unauthorized + WWW-Authenticate(ブラウザに Basic 認証プロンプトを出させる)
-fn unauthorized_basic() -> Response {
-    (
-        StatusCode::UNAUTHORIZED,
-        [(header::WWW_AUTHENTICATE, "Basic realm=\"dcr-transcribe\"")],
-        "Authentication required",
-    )
-        .into_response()
 }
 
 /// HTTP サーバを起動して `RemoteState` の Arc を返す
@@ -593,8 +534,16 @@ pub async fn start(
         .collect();
 
     let (tx, _rx) = broadcast::channel(BROADCAST_CAPACITY);
+    if !config.auth_token.is_empty() || !config.basic_auth_user.is_empty() || !config.basic_auth_pass.is_empty() {
+        anyhow::bail!(
+            "[remote] の basic_auth_user / basic_auth_pass / auth_token は廃止しました。\
+             代わりに login_key(または login_key_file)を設定し、/?k=<キー> でログインしてください"
+        );
+    }
+    let login_key = crate::access::load_or_create_login_key(&config.login_key, &config.login_key_file)?;
     let access = AccessControl::new(
         &config.allowed_countries,
+        &login_key,
         &config.turnstile_site_key,
         &config.turnstile_secret_key,
         Duration::from_secs(config.session_hours * 3600),
@@ -609,9 +558,6 @@ pub async fn start(
         history_size: config.history_size,
         include_partials: config.include_partials,
         partial_throttle: Duration::from_millis(config.partial_throttle_ms),
-        auth_token: config.auth_token.clone(),
-        basic_auth_user: config.basic_auth_user.clone(),
-        basic_auth_pass: config.basic_auth_pass.clone(),
         anchor,
         channels,
         segments: SegmentStore::new(segments_enabled),
@@ -629,24 +575,18 @@ pub async fn start(
         .with_context(|| format!("Remote サーバの bind に失敗: {}", config.listen))?;
 
     let actual_addr = listener.local_addr().ok();
-    let auth_desc = match (
-        !config.auth_token.is_empty(),
-        !config.basic_auth_user.is_empty(),
-    ) {
-        (false, false) => "off".to_string(),
-        (true, false) => "token".to_string(),
-        (false, true) => "basic".to_string(),
-        (true, true) => "basic+token".to_string(),
-    };
     log::info!(
-        "Remote サーバ起動: http://{} (auth={}, {}, partials={})",
+        "Remote サーバ起動: http://{} ({}, partials={})",
         actual_addr
             .map(|a| a.to_string())
             .unwrap_or_else(|| config.listen.clone()),
-        auth_desc,
         access_desc,
         config.include_partials
     );
+    if state.access.login_required() {
+        // キーそのものはログに残さない
+        log::info!("ログイン URL は `dcr-transcribe --show-login-url` で表示できます");
+    }
 
     // 小さな書き込み(SSE の 1 イベント、ライブの AAC 1 フレーム)を溜めずにすぐ送る(Nagle 無効)
     let listener = axum::serve::ListenerExt::tap_io(listener, |tcp: &mut tokio::net::TcpStream| {
@@ -699,21 +639,78 @@ async fn guard(State(state): State<Arc<RemoteState>>, req: Request, next: Next) 
 // Handlers
 // ─────────────────────────────────────────────────────────────────────────
 
+/// `/?k=<キー>` でログイン(クッキーを発行してキーを消した URL へ転送)。
+/// それ以外はセッションの段階に応じて、本画面・bot 確認画面・ログイン案内を返す
 async fn serve_index(
     State(state): State<Arc<RemoteState>>,
+    Query(q): Query<IndexQuery>,
     headers: HeaderMap,
 ) -> Response {
-    if !state.check_basic_auth(&headers) {
-        return unauthorized_basic();
+    use crate::access::SessionState;
+    let access = &state.access;
+    if let Some(key) = q.k.as_deref() {
+        if !access.check_login_key(key) {
+            log::warn!(
+                "Remote: ログインキーが違います (ip={:?})",
+                headers.get("cf-connecting-ip").and_then(|v| v.to_str().ok())
+            );
+            return login_page(StatusCode::FORBIDDEN, "ログインキーが違います");
+        }
+        let id = access.login();
+        return (
+            StatusCode::SEE_OTHER,
+            [
+                (header::SET_COOKIE, access.session_cookie(&id)),
+                (header::LOCATION, "/".to_string()),
+                (header::CACHE_CONTROL, "no-store".to_string()),
+                // キー付きの URL を他所へ送らない
+                (header::REFERRER_POLICY, "no-referrer".to_string()),
+            ],
+        )
+            .into_response();
     }
-    // bot 確認がまだなら確認画面(キャッシュさせない)
-    if let Some(gate) = &state.gate {
-        if !state.access.session_valid(&headers) {
-            return gate.respond(&headers, "no-store");
+    match access.session_state(&headers) {
+        SessionState::Full => {}
+        _ if access.is_open() => {}
+        SessionState::Pending => {
+            if let Some(gate) = &state.gate {
+                return gate.respond(&headers, "no-store");
+            }
+        }
+        SessionState::None => {
+            if access.login_required() {
+                return login_page(StatusCode::UNAUTHORIZED, "ログイン用の URL を開いてください");
+            }
+            if let Some(gate) = &state.gate {
+                return gate.respond(&headers, "no-store");
+            }
         }
     }
     // 毎回確認させるが、変わっていなければ 304 で本文を送らない
     state.index.respond(&headers, "private, no-cache")
+}
+
+/// ログインできていないときの案内(小さな HTML)
+fn login_page(status: StatusCode, message: &str) -> Response {
+    let html = format!(
+        "<!DOCTYPE html><html lang=\"ja\"><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+         <meta name=\"robots\" content=\"noindex,nofollow\"><title>dcr-transcribe</title>\
+         <style>body{{background:#0f1115;color:#e8eaed;font-family:-apple-system,sans-serif;\
+         display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;padding:16px}}\
+         p{{color:#888c95;font-size:14px}}</style></head>\
+         <body><div><h1 style=\"font-size:16px\">dcr-transcribe</h1><p>{}</p></div></body></html>",
+        message
+    );
+    (
+        status,
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        html,
+    )
+        .into_response()
 }
 
 #[derive(Deserialize)]
@@ -727,11 +724,8 @@ async fn serve_verify(
     headers: HeaderMap,
     axum::Json(body): axum::Json<VerifyBody>,
 ) -> Response {
-    if !state.check_basic_auth(&headers) {
-        return unauthorized_basic();
-    }
     let remote_ip = headers.get("cf-connecting-ip").and_then(|v| v.to_str().ok());
-    match state.access.verify(&body.token, remote_ip).await {
+    match state.access.verify(&body.token, remote_ip, &headers).await {
         Ok(id) => (
             StatusCode::NO_CONTENT,
             [
@@ -762,12 +756,6 @@ async fn serve_stream(
     Query(q): Query<StreamQuery>,
     headers: HeaderMap,
 ) -> Response {
-    if !state.check_basic_auth(&headers) {
-        return unauthorized_basic();
-    }
-    if !state.check_token(q.t.as_deref()) {
-        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
-    }
 
     // モード優先度: Last-Event-ID > head > 全件。
     //
@@ -797,12 +785,6 @@ async fn serve_history(
     Query(q): Query<HistoryQuery>,
     headers: HeaderMap,
 ) -> Response {
-    if !state.check_basic_auth(&headers) {
-        return unauthorized_basic();
-    }
-    if !state.check_token(q.t.as_deref()) {
-        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
-    }
     // history_size=0 の場合 clamp(1, 0) は panic するので分岐
     let limit = if state.history_size == 0 {
         0
@@ -832,12 +814,6 @@ async fn serve_segments(
     Query(q): Query<SegmentsQuery>,
     headers: HeaderMap,
 ) -> Response {
-    if !state.check_basic_auth(&headers) {
-        return unauthorized_basic();
-    }
-    if !state.check_token(q.t.as_deref()) {
-        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
-    }
     let body = serde_json::json!({ "items": state.segments.after(q.after, q.limit) }).to_string();
     json_response(body, &headers)
 }
@@ -846,15 +822,8 @@ async fn serve_segments(
 async fn serve_audio(
     State(state): State<Arc<RemoteState>>,
     Path(id): Path<u64>,
-    Query(q): Query<TokenQuery>,
     headers: HeaderMap,
 ) -> Response {
-    if !state.check_basic_auth(&headers) {
-        return unauthorized_basic();
-    }
-    if !state.check_token(q.t.as_deref()) {
-        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
-    }
     let Some(path) = state.segments.path(id) else {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     };
@@ -879,14 +848,7 @@ async fn serve_audio(
 async fn serve_live(
     State(state): State<Arc<RemoteState>>,
     Query(q): Query<LiveQuery>,
-    headers: HeaderMap,
 ) -> Response {
-    if !state.check_basic_auth(&headers) {
-        return unauthorized_basic();
-    }
-    if !state.check_token(q.t.as_deref()) {
-        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
-    }
     let Some(hub) = &state.live else {
         return (StatusCode::NOT_FOUND, "live disabled").into_response();
     };
@@ -1080,9 +1042,6 @@ mod tests {
             history_size,
             include_partials,
             partial_throttle: Duration::from_millis(100),
-            auth_token: String::new(),
-            basic_auth_user: String::new(),
-            basic_auth_pass: String::new(),
             anchor: "2025-01-01T00:00:00Z".to_string(),
             channels: vec![],
             segments: SegmentStore::new(false),
@@ -1092,17 +1051,6 @@ mod tests {
             access: AccessControl::disabled(),
             gate: None,
         })
-    }
-
-    fn basic_header(user: &str, pass: &str) -> HeaderMap {
-        let cred = format!("{}:{}", user, pass);
-        let encoded = base64::engine::general_purpose::STANDARD.encode(cred.as_bytes());
-        let mut h = HeaderMap::new();
-        h.insert(
-            header::AUTHORIZATION,
-            format!("Basic {}", encoded).parse().unwrap(),
-        );
-        h
     }
 
     fn make_result(channel: usize, text: &str, is_partial: bool) -> TranscriptResult {
@@ -1144,103 +1092,6 @@ mod tests {
         assert_eq!(hist[1].event.x, "q1");
     }
 
-    #[test]
-    fn auth_token_validates() {
-        let mut s = make_state(false, 10);
-        Arc::get_mut(&mut s).unwrap().auth_token = "secret".to_string();
-        assert!(s.check_token(Some("secret")));
-        assert!(!s.check_token(Some("wrong")));
-        assert!(!s.check_token(None));
-    }
-
-    #[test]
-    fn auth_disabled_when_token_empty() {
-        let s = make_state(false, 10);
-        assert!(s.check_token(None));
-        assert!(s.check_token(Some("anything")));
-    }
-
-    #[test]
-    fn basic_auth_disabled_when_user_empty() {
-        let s = make_state(false, 10);
-        // ヘッダなしでも、設定が空なら true
-        assert!(s.check_basic_auth(&HeaderMap::new()));
-        // 適当なヘッダでも true
-        assert!(s.check_basic_auth(&basic_header("anyone", "anything")));
-    }
-
-    #[test]
-    fn basic_auth_accepts_correct_creds() {
-        let mut s = make_state(false, 10);
-        let m = Arc::get_mut(&mut s).unwrap();
-        m.basic_auth_user = "alice".to_string();
-        m.basic_auth_pass = "secret".to_string();
-        assert!(s.check_basic_auth(&basic_header("alice", "secret")));
-    }
-
-    #[test]
-    fn basic_auth_rejects_wrong_password() {
-        let mut s = make_state(false, 10);
-        let m = Arc::get_mut(&mut s).unwrap();
-        m.basic_auth_user = "alice".to_string();
-        m.basic_auth_pass = "secret".to_string();
-        assert!(!s.check_basic_auth(&basic_header("alice", "wrong")));
-    }
-
-    #[test]
-    fn basic_auth_rejects_wrong_user() {
-        let mut s = make_state(false, 10);
-        let m = Arc::get_mut(&mut s).unwrap();
-        m.basic_auth_user = "alice".to_string();
-        m.basic_auth_pass = "secret".to_string();
-        assert!(!s.check_basic_auth(&basic_header("bob", "secret")));
-    }
-
-    #[test]
-    fn basic_auth_rejects_missing_header() {
-        let mut s = make_state(false, 10);
-        let m = Arc::get_mut(&mut s).unwrap();
-        m.basic_auth_user = "alice".to_string();
-        m.basic_auth_pass = "secret".to_string();
-        assert!(!s.check_basic_auth(&HeaderMap::new()));
-    }
-
-    #[test]
-    fn basic_auth_rejects_malformed_header() {
-        let mut s = make_state(false, 10);
-        let m = Arc::get_mut(&mut s).unwrap();
-        m.basic_auth_user = "alice".to_string();
-        m.basic_auth_pass = "secret".to_string();
-        let mut h = HeaderMap::new();
-        // "Basic" prefix なし
-        h.insert(header::AUTHORIZATION, "Bearer xyz".parse().unwrap());
-        assert!(!s.check_basic_auth(&h));
-
-        // base64 デコードできない
-        let mut h2 = HeaderMap::new();
-        h2.insert(header::AUTHORIZATION, "Basic !@#$%^".parse().unwrap());
-        assert!(!s.check_basic_auth(&h2));
-
-        // base64 はデコードできるが ":" が無い
-        let mut h3 = HeaderMap::new();
-        let no_colon = base64::engine::general_purpose::STANDARD.encode(b"justuser");
-        h3.insert(
-            header::AUTHORIZATION,
-            format!("Basic {}", no_colon).parse().unwrap(),
-        );
-        assert!(!s.check_basic_auth(&h3));
-    }
-
-    #[test]
-    fn basic_auth_handles_password_with_colon() {
-        // パスワードにコロンが含まれる場合(RFC 7617)
-        let mut s = make_state(false, 10);
-        let m = Arc::get_mut(&mut s).unwrap();
-        m.basic_auth_user = "alice".to_string();
-        m.basic_auth_pass = "pass:with:colons".to_string();
-        assert!(s.check_basic_auth(&basic_header("alice", "pass:with:colons")));
-    }
-
     // ─────────────────────────────────────────────────────────────────
     // HTTP 統合テスト(実サーバを 127.0.0.1:0 でバインド)
     // ─────────────────────────────────────────────────────────────────
@@ -1268,14 +1119,28 @@ mod tests {
         assert_eq!(resp.text().await.unwrap(), "ok");
     }
 
+    /// ログインキー "key123" を設定した状態にする
+    fn with_login_key(mut s: Arc<RemoteState>) -> Arc<RemoteState> {
+        Arc::get_mut(&mut s).unwrap().access =
+            AccessControl::new(&[], "key123", "", "", Duration::from_secs(60));
+        s
+    }
+
+    /// `/?k=key123` でログインしてセッションクッキー(`dcr_session=...`)を得る
+    async fn login_cookie(client: &reqwest::Client, addr: SocketAddr) -> String {
+        let resp = client.get(format!("http://{}/?k=key123", addr)).send().await.unwrap();
+        resp.headers()["set-cookie"].to_str().unwrap().split(';').next().unwrap().to_string()
+    }
+
+    /// 転送を追わないクライアント(303 を確かめるため)
+    fn no_redirect() -> reqwest::Client {
+        reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap()
+    }
+
     #[tokio::test]
-    async fn http_healthz_bypasses_basic_auth() {
-        // /healthz は外部監視用なので Basic 認証設定中でも 200 を返すべき
-        let mut s = make_state(false, 10);
-        let m = Arc::get_mut(&mut s).unwrap();
-        m.basic_auth_user = "alice".to_string();
-        m.basic_auth_pass = "secret".to_string();
-        let addr = boot(s).await;
+    async fn http_healthz_bypasses_login() {
+        // /healthz は外部監視用なのでログイン必須でも 200 を返すべき
+        let addr = boot(with_login_key(make_state(false, 10))).await;
 
         let resp = reqwest::get(format!("http://{}/healthz", addr))
             .await
@@ -1302,40 +1167,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_index_with_basic_auth_required() {
-        let mut s = make_state(false, 10);
-        let m = Arc::get_mut(&mut s).unwrap();
-        m.basic_auth_user = "alice".to_string();
-        m.basic_auth_pass = "secret".to_string();
-        let addr = boot(s).await;
+    async fn http_login_with_key_issues_cookie_and_redirects() {
+        let addr = boot(with_login_key(make_state(false, 10))).await;
+        let client = no_redirect();
 
-        // 認証なし → 401 + WWW-Authenticate
-        let resp = reqwest::get(format!("http://{}/", addr)).await.unwrap();
+        // キー無し → ログイン案内(401)
+        let resp = client.get(format!("http://{}/", addr)).send().await.unwrap();
         assert_eq!(resp.status(), 401);
-        let www = resp
-            .headers()
-            .get(reqwest::header::WWW_AUTHENTICATE)
-            .unwrap();
-        assert!(www.to_str().unwrap().starts_with("Basic"));
+        assert!(resp.text().await.unwrap().contains("ログイン用の URL"));
 
-        // 誤った creds → 401
-        let client = reqwest::Client::new();
-        let resp = client
-            .get(format!("http://{}/", addr))
-            .basic_auth("alice", Some("wrong"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 401);
+        // 違うキー → 403、クッキーは出ない
+        let resp = client.get(format!("http://{}/?k=wrong", addr)).send().await.unwrap();
+        assert_eq!(resp.status(), 403);
+        assert!(resp.headers().get("set-cookie").is_none());
 
-        // 正しい creds → 200
+        // 正しいキー → クッキー + キーを消した / へ転送
+        let resp = client.get(format!("http://{}/?k=key123", addr)).send().await.unwrap();
+        assert_eq!(resp.status(), 303);
+        assert_eq!(resp.headers()["location"], "/");
+        assert_eq!(resp.headers()["referrer-policy"], "no-referrer");
+        let set = resp.headers()["set-cookie"].to_str().unwrap();
+        assert!(set.starts_with("dcr_session=") && set.contains("HttpOnly"), "{}", set);
+        let cookie = set.split(';').next().unwrap();
+
+        // クッキーで本画面とデータ系が使える
+        let resp = client.get(format!("http://{}/", addr)).header("Cookie", cookie).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.text().await.unwrap(), HTML_PAGE);
         let resp = client
-            .get(format!("http://{}/", addr))
-            .basic_auth("alice", Some("secret"))
+            .get(format!("http://{}/history?before=999", addr))
+            .header("Cookie", cookie)
             .send()
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn http_data_endpoints_require_login() {
+        let dir = tempfile::tempdir().unwrap();
+        let addr = boot(with_login_key(state_with_segment(dir.path()))).await;
+        let client = no_redirect();
+        for path in ["/stream", "/history?before=1", "/segments", "/audio/7", "/session"] {
+            let r = client.get(format!("http://{}{}", addr, path)).send().await.unwrap();
+            assert_eq!(r.status(), 403, "{}", path);
+            // 偽のクッキーも通さない
+            let r = client
+                .get(format!("http://{}{}", addr, path))
+                .header("Cookie", "dcr_session=forged")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 403, "{}", path);
+        }
+        let cookie = login_cookie(&client, addr).await;
+        let r = client.get(format!("http://{}/audio/7", addr)).header("Cookie", &cookie).send().await.unwrap();
+        assert_eq!(r.status(), 200);
     }
 
     #[tokio::test]
@@ -1356,29 +1243,6 @@ mod tests {
         assert_eq!(items[4]["id"], 5);
         assert_eq!(items[0]["x"], "m0");
         assert_eq!(items[4]["x"], "m4");
-    }
-
-    #[tokio::test]
-    async fn http_history_token_auth() {
-        let mut s = make_state(false, 10);
-        let m = Arc::get_mut(&mut s).unwrap();
-        m.auth_token = "supersecret".to_string();
-        let addr = boot(s).await;
-
-        // トークンなし → 401
-        let resp = reqwest::get(format!("http://{}/history?before=999&limit=10", addr))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 401);
-
-        // 正しいトークン → 200
-        let resp = reqwest::get(format!(
-            "http://{}/history?before=999&limit=10&t=supersecret",
-            addr
-        ))
-        .await
-        .unwrap();
-        assert_eq!(resp.status(), 200);
     }
 
     #[tokio::test]
@@ -1599,9 +1463,6 @@ mod tests {
             history_size: 100,
             include_partials: false,
             partial_throttle: Duration::from_millis(100),
-            auth_token: String::new(),
-            basic_auth_user: String::new(),
-            basic_auth_pass: String::new(),
             anchor: "2025-01-01T00:00:00Z".to_string(),
             channels: vec![],
             segments: SegmentStore::new(false),
@@ -1924,35 +1785,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_audio_requires_auth() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut s = state_with_segment(dir.path());
-        let m = Arc::get_mut(&mut s).unwrap();
-        m.basic_auth_user = "alice".to_string();
-        m.basic_auth_pass = "secret".to_string();
-        m.auth_token = "tok".to_string();
-        let addr = boot(s).await;
-        let client = reqwest::Client::new();
-
-        let resp = client.get(format!("http://{}/audio/7?t=tok", addr)).send().await.unwrap();
-        assert_eq!(resp.status(), 401);
-        let resp = client
-            .get(format!("http://{}/audio/7", addr))
-            .basic_auth("alice", Some("secret"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 401);
-        let resp = client
-            .get(format!("http://{}/audio/7?t=tok", addr))
-            .basic_auth("alice", Some("secret"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), 200);
-    }
-
-    #[tokio::test]
     async fn sse_delivers_seg_event() {
         use futures_util::StreamExt;
         let dir = tempfile::tempdir().unwrap();
@@ -2038,14 +1870,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_live_requires_auth() {
-        let (mut s, _hub) = state_with_live();
-        let m = Arc::get_mut(&mut s).unwrap();
-        m.basic_auth_user = "alice".to_string();
-        m.basic_auth_pass = "secret".to_string();
-        let addr = boot(s).await;
+    async fn http_live_requires_login() {
+        let (s, _hub) = state_with_live();
+        let addr = boot(with_login_key(s)).await;
         let resp = reqwest::get(format!("http://{}/live?c=2", addr)).await.unwrap();
-        assert_eq!(resp.status(), 401);
+        assert_eq!(resp.status(), 403);
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -2194,7 +2023,7 @@ mod tests {
     async fn state_with_access(server: &mockito::ServerGuard) -> Arc<RemoteState> {
         let mut s = make_state(false, 10);
         let m = Arc::get_mut(&mut s).unwrap();
-        let mut access = AccessControl::new(&["JP".into()], "site-key-x", "secret", Duration::from_secs(60));
+        let mut access = AccessControl::new(&["JP".into()], "", "site-key-x", "secret", Duration::from_secs(60));
         access.set_verify_url(&server.url());
         m.gate = Page::gate(&access);
         m.access = access;
@@ -2291,5 +2120,61 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status(), 403);
+    }
+
+    #[tokio::test]
+    async fn http_login_key_then_turnstile() {
+        let mut server = mockito::Server::new_async().await;
+        server.mock("POST", "/").with_body(r#"{"success":true}"#).create_async().await;
+        let mut s = make_state(false, 10);
+        let m = Arc::get_mut(&mut s).unwrap();
+        let mut access = AccessControl::new(&[], "key123", "site-key-x", "secret", Duration::from_secs(60));
+        access.set_verify_url(&server.url());
+        m.gate = Page::gate(&access);
+        m.access = access;
+        let addr = boot(s).await;
+        let client = no_redirect();
+
+        // ログイン前は確認画面も出さない(キーを知らない人に Turnstile を見せない)
+        let r = client.get(format!("http://{}/", addr)).send().await.unwrap();
+        assert_eq!(r.status(), 401);
+        let r = client
+            .post(format!("http://{}/verify", addr))
+            .json(&serde_json::json!({ "token": "t" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 403);
+
+        // キーが通ると確認待ち: 本画面ではなく確認画面、データ系はまだ 403
+        let pending = login_cookie(&client, addr).await;
+        let r = client.get(format!("http://{}/", addr)).header("Cookie", &pending).send().await.unwrap();
+        assert!(r.text().await.unwrap().contains("site-key-x"));
+        let r = client.get(format!("http://{}/session", addr)).header("Cookie", &pending).send().await.unwrap();
+        assert_eq!(r.status(), 403);
+
+        // 確認を通ると有効なセッション
+        let r = client
+            .post(format!("http://{}/verify", addr))
+            .header("Cookie", &pending)
+            .json(&serde_json::json!({ "token": "t" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 204);
+        let full = r.headers()["set-cookie"].to_str().unwrap().split(';').next().unwrap().to_string();
+        let r = client.get(format!("http://{}/session", addr)).header("Cookie", &full).send().await.unwrap();
+        assert_eq!(r.status(), 204);
+        let r = client.get(format!("http://{}/", addr)).header("Cookie", &full).send().await.unwrap();
+        assert_eq!(r.text().await.unwrap(), HTML_PAGE);
+    }
+
+    #[tokio::test]
+    async fn start_refuses_legacy_basic_auth_settings() {
+        for legacy in ["basic_auth_user = \"a\"", "basic_auth_pass = \"b\"", "auth_token = \"t\""] {
+            let cfg: RemoteConfig = toml::from_str(&format!("listen = \"127.0.0.1:0\"\n{}", legacy)).unwrap();
+            let err = start(cfg, &[], SystemTime::now(), false, None).await.err().expect("起動しない");
+            assert!(err.to_string().contains("login_key"), "{}", err);
+        }
     }
 }

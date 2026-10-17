@@ -631,6 +631,8 @@ pub enum TranscribeStatus {
 
 **アクセス制限** (`src/access.rs`、axum の middleware `guard` で全リクエストに適用):
 
+- ログイン: `/?k=<キー>` で一定時間比較のうえセッションを作り、クッキーを発行してキーを消した `/` へ 303。キーは `login_key` か `login_key_file`(無ければ生成・600 で保存)
+- セッションは「確認待ち(Pending、ログインキーは通ったが Turnstile 未通過、10 分)」と「有効(Full)」の 2 段階。データ系は Full のみ
 - `/healthz` 以外は `CF-IPCountry` が `allowed_countries` に含まれるものだけ通す。ヘッダが無いのは Host が `localhost` / `127.0.0.1` のときだけ許可(トンネル経由なら Host は公開ホスト名)
 - Turnstile が有効なら、`/` はセッションが無いと確認画面(`static/gate.html`)を返す。`POST /verify` で siteverify に問い合わせ、通れば 32 バイト乱数のセッション ID をクッキー(HttpOnly / Secure / SameSite=Lax)で発行
 - データ系(`/stream` `/history` `/segments` `/audio` `/live` `/session`)はセッション必須。閲覧画面は SSE が閉じたら `/session` を確かめ、403 なら再読み込みして確認画面へ戻る
