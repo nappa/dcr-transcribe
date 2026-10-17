@@ -173,19 +173,28 @@ async fn main() -> Result<()> {
 
     // チャンネルプロセッサを作成
     let mut processors = Vec::new();
-    let mut channel_senders = Vec::new();
+    // デバイスのチャンネル番号 (= channel_config.id) で引けるように並べる。無効チャンネルは None
+    let mut channel_senders: Vec<Option<mpsc::Sender<_>>> =
+        (0..config.audio.channels).map(|_| None).collect();
 
     for channel_config in &config.channels {
         if !channel_config.enabled {
             log::info!("チャンネル {} は無効です", channel_config.id);
             continue;
         }
+        anyhow::ensure!(
+            channel_config.id < channel_senders.len(),
+            "チャンネル {} ({}) の id がデバイスのチャンネル数 ({}) を超えています",
+            channel_config.id,
+            channel_config.name,
+            config.audio.channels
+        );
 
         // TUI状態にチャンネルを追加
         tui_state.add_channel(channel_config.id, channel_config.name.clone());
 
         let (tx, rx) = mpsc::channel(128);
-        channel_senders.push(tx);
+        channel_senders[channel_config.id] = Some(tx);
 
         let mut processor = ChannelProcessor::new(
             channel_config,

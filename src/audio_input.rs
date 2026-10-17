@@ -68,11 +68,11 @@ impl AudioInput {
     /// ストリームを開始
     ///
     /// # Arguments
-    /// * `channel_senders` - 各チャンネル用の送信チャンネル
+    /// * `channel_senders` - デバイスのチャンネル番号で引く送信チャンネル(None のチャンネルは捨てる)
     ///
     /// # Returns
     /// Result<()>
-    pub fn start(&mut self, channel_senders: Vec<mpsc::Sender<AudioChunk>>) -> Result<()> {
+    pub fn start(&mut self, channel_senders: Vec<Option<mpsc::Sender<AudioChunk>>>) -> Result<()> {
         let num_channels = self.num_channels;
         let sample_rate = self.config.sample_rate.0;
 
@@ -106,7 +106,7 @@ impl AudioInput {
     /// ストリームを構築
     fn build_stream<T>(
         &self,
-        channel_senders: Vec<mpsc::Sender<AudioChunk>>,
+        channel_senders: Vec<Option<mpsc::Sender<AudioChunk>>>,
         num_channels: u16,
         sample_rate: u32,
     ) -> Result<cpal::Stream>
@@ -139,6 +139,9 @@ impl AudioInput {
                 if ch >= channel_senders.len() {
                     break;
                 }
+                let Some(sender) = channel_senders[ch].as_ref() else {
+                    continue;
+                };
 
                 // このチャンネルのサンプルを抽出
                 let mut channel_samples = Vec::with_capacity(samples_per_channel);
@@ -164,27 +167,25 @@ impl AudioInput {
                 };
 
                 // 非同期送信（ブロッキングしない）
-                if let Some(sender) = channel_senders.get(ch) {
-                    match sender.try_send(chunk) {
-                        Ok(_) => {
-                            // 成功時はログ出力しない（パフォーマンス重視）
+                match sender.try_send(chunk) {
+                    Ok(_) => {
+                        // 成功時はログ出力しない（パフォーマンス重視）
+                    }
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        // RT callback では過剰な log は致命的(I/O・アロケーション)。
+                        // 累積カウントを atomic で更新し、初回 + 100 件ごとに 1 度だけ警告。
+                        let prev = drop_counters_cb[ch].fetch_add(1, Ordering::Relaxed);
+                        if prev == 0 || (prev + 1) % 100 == 0 {
+                            log::warn!(
+                                "チャンネル {}: 入力バッファ満杯でサンプルドロップ(累計 {} 件)",
+                                ch,
+                                prev + 1
+                            );
                         }
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            // RT callback では過剰な log は致命的(I/O・アロケーション)。
-                            // 累積カウントを atomic で更新し、初回 + 100 件ごとに 1 度だけ警告。
-                            let prev = drop_counters_cb[ch].fetch_add(1, Ordering::Relaxed);
-                            if prev == 0 || (prev + 1) % 100 == 0 {
-                                log::warn!(
-                                    "チャンネル {}: 入力バッファ満杯でサンプルドロップ(累計 {} 件)",
-                                    ch,
-                                    prev + 1
-                                );
-                            }
-                        }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                            // クローズはシャットダウン時の 1 回限りなので毎回ログ出して OK
-                            log::warn!("チャンネル {} への送信失敗: チャンネルクローズ", ch);
-                        }
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        // クローズはシャットダウン時の 1 回限りなので毎回ログ出して OK
+                        log::warn!("チャンネル {} への送信失敗: チャンネルクローズ", ch);
                     }
                 }
             }
