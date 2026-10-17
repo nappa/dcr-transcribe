@@ -15,6 +15,13 @@
 //! - `GET /live?c=<id>,<id>` - 選んだチャンネルをミックスしたライブ音声(AAC/ADTS の連続ストリーム)
 //! - `GET /audio/{id}` - 録音区間の AAC / WAV(Range リクエスト対応、iOS Safari の再生に必須)
 //! - `GET /healthz` - "ok" 返却
+//! - `POST /verify` - Turnstile のトークンを検証してセッションクッキーを発行
+//! - `GET /session` - セッションが有効なら 204(期限切れを画面側で検知するため)
+//!
+//! # アクセス制限 (`crate::access`)
+//!
+//! - `/healthz` 以外は国の制限(`CF-IPCountry`)を通ったものだけ
+//! - Turnstile が有効なら、`/` はセッションが無いと確認画面を返し、データ系はセッション必須
 //!
 //! # 細い回線向けの転送量対策
 //!
@@ -42,17 +49,19 @@
 //! - 障害時(broadcast 容量溢れ、クライアント切断)もログ警告のみ
 //! - サーバタスクが落ちても他に波及しない
 
+use crate::access::AccessControl;
 use crate::config::{ChannelConfig, RemoteConfig};
 use crate::live::LiveHub;
 use crate::segment_recorder::SegmentInfo;
 use crate::types::TranscriptResult;
 use anyhow::{Context, Result};
 use axum::body::Body;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query, Request, State};
+use axum::middleware::{self, Next};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 use base64::Engine as _;
 use futures_util::stream::Stream;
@@ -65,6 +74,7 @@ use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::broadcast;
 
 const HTML_PAGE: &str = include_str!("../static/index.html");
+const GATE_PAGE: &str = include_str!("../static/gate.html");
 /// broadcast バッファ容量。スロークライアントが本数ぶん遅れた時点で Lagged として切断される。
 /// 小さいほどスロークライアントを早く切るが、瞬間的なバースト時の誤切断も増える。
 const BROADCAST_CAPACITY: usize = 256;
@@ -307,23 +317,62 @@ pub struct RemoteState {
     segments: SegmentStore,
     live: Option<Arc<LiveHub>>,
     status: StatusStore,
-    index: IndexPage,
+    index: Page,
+    access: AccessControl,
+    /// Turnstile の確認画面(Turnstile 無効なら None)
+    gate: Option<Page>,
 }
 
 /// 圧縮済みの HTML
-struct IndexPage {
+struct Page {
+    html: String,
     br: Vec<u8>,
     etag: String,
 }
 
-impl IndexPage {
-    fn new() -> Self {
+impl Page {
+    fn new(html: String) -> Self {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        HTML_PAGE.hash(&mut h);
+        html.hash(&mut h);
         Self {
-            br: brotli_compress(HTML_PAGE.as_bytes(), 11),
+            br: brotli_compress(html.as_bytes(), 11),
             etag: format!("\"{:016x}\"", h.finish()),
+            html,
+        }
+    }
+
+    fn index() -> Self {
+        Self::new(HTML_PAGE.to_string())
+    }
+
+    fn gate(access: &AccessControl) -> Option<Self> {
+        access
+            .turnstile()
+            .map(|ts| Self::new(GATE_PAGE.replace("__SITE_KEY__", &ts.site_key)))
+    }
+
+    /// `cache_control` を付けて返す。ETag が一致すれば 304、brotli 対応なら圧縮して返す
+    fn respond(&self, headers: &HeaderMap, cache_control: &'static str) -> Response {
+        let etag = self.etag.as_str();
+        let common = [
+            (header::CACHE_CONTROL, cache_control),
+            (header::ETAG, etag),
+            (header::VARY, "Accept-Encoding"),
+        ];
+        let not_modified = headers
+            .get(header::IF_NONE_MATCH)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.split(',').any(|t| t.trim() == etag));
+        if not_modified {
+            return (StatusCode::NOT_MODIFIED, common).into_response();
+        }
+        let ctype = (header::CONTENT_TYPE, "text/html; charset=utf-8");
+        if accepts_brotli(headers) {
+            (StatusCode::OK, common, [ctype, (header::CONTENT_ENCODING, "br")], self.br.clone())
+                .into_response()
+        } else {
+            (StatusCode::OK, common, [ctype], self.html.clone()).into_response()
         }
     }
 }
@@ -541,6 +590,13 @@ pub async fn start(
         .collect();
 
     let (tx, _rx) = broadcast::channel(BROADCAST_CAPACITY);
+    let access = AccessControl::new(
+        &config.allowed_countries,
+        &config.turnstile_site_key,
+        &config.turnstile_secret_key,
+        Duration::from_secs(config.session_hours * 3600),
+    );
+    let access_desc = access.describe();
 
     let state = Arc::new(RemoteState {
         history: Mutex::new(VecDeque::with_capacity(config.history_size)),
@@ -558,7 +614,9 @@ pub async fn start(
         segments: SegmentStore::new(segments_enabled),
         live,
         status: StatusStore::new(),
-        index: IndexPage::new(),
+        index: Page::index(),
+        gate: Page::gate(&access),
+        access,
     });
 
     let app = router(state.clone());
@@ -578,11 +636,12 @@ pub async fn start(
         (true, true) => "basic+token".to_string(),
     };
     log::info!(
-        "Remote サーバ起動: http://{} (auth={}, partials={})",
+        "Remote サーバ起動: http://{} (auth={}, {}, partials={})",
         actual_addr
             .map(|a| a.to_string())
             .unwrap_or_else(|| config.listen.clone()),
         auth_desc,
+        access_desc,
         config.include_partials
     );
 
@@ -603,8 +662,28 @@ fn router(state: Arc<RemoteState>) -> Router {
         .route("/segments", get(serve_segments))
         .route("/audio/{id}", get(serve_audio))
         .route("/live", get(serve_live))
+        .route("/verify", post(serve_verify))
+        .route("/session", get(serve_session))
         .route("/healthz", get(serve_health))
+        .layer(middleware::from_fn_with_state(state.clone(), guard))
         .with_state(state)
+}
+
+/// 全リクエスト共通の入口: 国の制限と、データ系の bot 確認セッション
+async fn guard(State(state): State<Arc<RemoteState>>, req: Request, next: Next) -> Response {
+    let path = req.uri().path();
+    if path == "/healthz" {
+        return next.run(req).await;
+    }
+    if !state.access.country_allowed(req.headers()) {
+        return (StatusCode::FORBIDDEN, "forbidden").into_response();
+    }
+    // `/` はセッションが無ければ確認画面を返す。`/verify` はセッションを作るところ
+    let needs_session = !matches!(path, "/" | "/verify");
+    if needs_session && !state.access.session_valid(req.headers()) {
+        return (StatusCode::FORBIDDEN, "verification required").into_response();
+    }
+    next.run(req).await
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -618,32 +697,50 @@ async fn serve_index(
     if !state.check_basic_auth(&headers) {
         return unauthorized_basic();
     }
-    let etag = state.index.etag.as_str();
+    // bot 確認がまだなら確認画面(キャッシュさせない)
+    if let Some(gate) = &state.gate {
+        if !state.access.session_valid(&headers) {
+            return gate.respond(&headers, "no-store");
+        }
+    }
     // 毎回確認させるが、変わっていなければ 304 で本文を送らない
-    let common = [
-        (header::CACHE_CONTROL, "private, no-cache"),
-        (header::ETAG, etag),
-        (header::VARY, "Accept-Encoding"),
-    ];
-    let not_modified = headers
-        .get(header::IF_NONE_MATCH)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.split(',').any(|t| t.trim() == etag));
-    if not_modified {
-        return (StatusCode::NOT_MODIFIED, common).into_response();
+    state.index.respond(&headers, "private, no-cache")
+}
+
+#[derive(Deserialize)]
+struct VerifyBody {
+    token: String,
+}
+
+/// Turnstile のトークンを検証してセッションクッキーを発行する
+async fn serve_verify(
+    State(state): State<Arc<RemoteState>>,
+    headers: HeaderMap,
+    axum::Json(body): axum::Json<VerifyBody>,
+) -> Response {
+    if !state.check_basic_auth(&headers) {
+        return unauthorized_basic();
     }
-    let ctype = (header::CONTENT_TYPE, "text/html; charset=utf-8");
-    if accepts_brotli(&headers) {
-        (
-            StatusCode::OK,
-            common,
-            [ctype, (header::CONTENT_ENCODING, "br")],
-            state.index.br.clone(),
+    let remote_ip = headers.get("cf-connecting-ip").and_then(|v| v.to_str().ok());
+    match state.access.verify(&body.token, remote_ip).await {
+        Ok(id) => (
+            StatusCode::NO_CONTENT,
+            [
+                (header::SET_COOKIE, state.access.session_cookie(&id)),
+                (header::CACHE_CONTROL, "no-store".to_string()),
+            ],
         )
-            .into_response()
-    } else {
-        (StatusCode::OK, common, [ctype], HTML_PAGE).into_response()
+            .into_response(),
+        Err(e) => {
+            log::warn!("Remote: bot 確認に失敗 (ip={:?}): {}", remote_ip, e);
+            (StatusCode::FORBIDDEN, "verification failed").into_response()
+        }
     }
+}
+
+/// セッションが有効なら 204(無効なら guard が 403 を返す)
+async fn serve_session() -> impl IntoResponse {
+    (StatusCode::NO_CONTENT, [(header::CACHE_CONTROL, "no-store")])
 }
 
 /// /healthz: 認証なし(外部監視用)
@@ -977,7 +1074,9 @@ mod tests {
             segments: SegmentStore::new(false),
             live: None,
             status: StatusStore::new(),
-            index: IndexPage::new(),
+            index: Page::index(),
+            access: AccessControl::disabled(),
+            gate: None,
         })
     }
 
@@ -1494,7 +1593,9 @@ mod tests {
             segments: SegmentStore::new(false),
             live: None,
             status: StatusStore::new(),
-            index: IndexPage::new(),
+            index: Page::index(),
+            access: AccessControl::disabled(),
+            gate: None,
         });
 
         // build_stream を直接駆動して、Lagged で break することを検証
@@ -2069,5 +2170,112 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(format!("{:?}", ev).contains("[[2,-60,0,0]]"));
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // アクセス制限(国 / Turnstile)
+    // ─────────────────────────────────────────────────────────────────
+
+    /// 国制限 JP + Turnstile(siteverify は mockito)の状態
+    async fn state_with_access(server: &mockito::ServerGuard) -> Arc<RemoteState> {
+        let mut s = make_state(false, 10);
+        let m = Arc::get_mut(&mut s).unwrap();
+        let mut access = AccessControl::new(&["JP".into()], "site-key-x", "secret", Duration::from_secs(60));
+        access.set_verify_url(&server.url());
+        m.gate = Page::gate(&access);
+        m.access = access;
+        s
+    }
+
+    #[tokio::test]
+    async fn http_country_restriction() {
+        let server = mockito::Server::new_async().await;
+        let addr = boot(state_with_access(&server).await).await;
+        let client = reqwest::Client::new();
+        let get = |country: Option<&'static str>, host: &'static str| {
+            let mut r = client.get(format!("http://{}/", addr)).header("Host", host);
+            if let Some(c) = country {
+                r = r.header("CF-IPCountry", c);
+            }
+            r.send()
+        };
+        // 国外はトップから 403
+        assert_eq!(get(Some("US"), "t.example").await.unwrap().status(), 403);
+        // ヘッダ無しは公開ホスト名なら 403、ローカルなら通す
+        assert_eq!(get(None, "t.example").await.unwrap().status(), 403);
+        assert_eq!(get(None, "127.0.0.1:8765").await.unwrap().status(), 200);
+        assert_eq!(get(Some("JP"), "t.example").await.unwrap().status(), 200);
+        // /healthz は国に関係なく通す(外部監視用)
+        let r = client
+            .get(format!("http://{}/healthz", addr))
+            .header("CF-IPCountry", "US")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn http_turnstile_gate_then_session() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({ "response": "ok-token" })))
+            .with_body(r#"{"success":true}"#)
+            .create_async()
+            .await;
+        server
+            .mock("POST", "/")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({ "response": "bot" })))
+            .with_body(r#"{"success":false,"error-codes":["invalid-input-response"]}"#)
+            .create_async()
+            .await;
+        let addr = boot(state_with_access(&server).await).await;
+        let client = reqwest::Client::new();
+        let jp = |r: reqwest::RequestBuilder| r.header("CF-IPCountry", "JP");
+
+        // セッション無し: トップは確認画面、データ系は 403
+        let gate = jp(client.get(format!("http://{}/", addr))).send().await.unwrap();
+        assert_eq!(gate.status(), 200);
+        assert_eq!(gate.headers()["cache-control"], "no-store");
+        let html = gate.text().await.unwrap();
+        assert!(html.contains("site-key-x") && html.contains("turnstile"));
+        for path in ["/stream", "/history?before=1", "/segments", "/audio/1", "/live?c=0", "/session"] {
+            let r = jp(client.get(format!("http://{}{}", addr, path))).send().await.unwrap();
+            assert_eq!(r.status(), 403, "{}", path);
+        }
+
+        // bot と判定されたらクッキーは出ない
+        let r = jp(client.post(format!("http://{}/verify", addr)))
+            .json(&serde_json::json!({ "token": "bot" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 403);
+        assert!(r.headers().get("set-cookie").is_none());
+
+        // 確認を通るとクッキー → 本画面とデータ系が使える
+        let r = jp(client.post(format!("http://{}/verify", addr)))
+            .json(&serde_json::json!({ "token": "ok-token" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 204);
+        let cookie = r.headers()["set-cookie"].to_str().unwrap().split(';').next().unwrap().to_string();
+        assert!(cookie.starts_with("dcr_session="));
+
+        let with = |path: &str| jp(client.get(format!("http://{}{}", addr, path))).header("Cookie", &cookie).send();
+        assert_eq!(with("/").await.unwrap().text().await.unwrap(), HTML_PAGE);
+        assert_eq!(with("/session").await.unwrap().status(), 204);
+        assert_eq!(with("/segments").await.unwrap().status(), 200);
+        // 国外からはクッキーがあっても 403
+        let r = client
+            .get(format!("http://{}/session", addr))
+            .header("CF-IPCountry", "US")
+            .header("Cookie", &cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 403);
     }
 }

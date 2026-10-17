@@ -40,6 +40,7 @@
 //! ```
 
 pub mod aac;
+pub mod access;
 pub mod audio_input;
 pub mod audio_output;
 pub mod aws_transcribe;

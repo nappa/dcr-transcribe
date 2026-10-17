@@ -58,6 +58,23 @@ pub struct RemoteConfig {
     /// HTTP Basic 認証のパスワード
     #[serde(default)]
     pub basic_auth_pass: String,
+    /// アクセスを許可する国(ISO 3166 の 2 文字、例: ["JP"])。空なら制限なし。
+    /// Cloudflare が付ける `CF-IPCountry` で判定する(ローカルからの直接アクセスは常に許可)
+    #[serde(default)]
+    pub allowed_countries: Vec<String>,
+    /// Cloudflare Turnstile のサイトキー。シークレットと両方設定すると bot 確認を有効にする
+    #[serde(default)]
+    pub turnstile_site_key: String,
+    /// Cloudflare Turnstile のシークレットキー
+    #[serde(default)]
+    pub turnstile_secret_key: String,
+    /// bot 確認を通ったあと、再確認なしで使える時間(時間)
+    #[serde(default = "default_remote_session_hours")]
+    pub session_hours: u64,
+}
+
+fn default_remote_session_hours() -> u64 {
+    12
 }
 
 /// 発話区間ごとの録音設定

@@ -66,6 +66,10 @@ wav_output_dir = "./recordings"
 # auth_token = ""               # shared secret; clients pass `?t=...` (empty = no auth)
 # basic_auth_user = ""          # HTTP Basic 認証ユーザー名(空なら Basic 認証無効)
 # basic_auth_pass = ""          # HTTP Basic 認証パスワード
+# allowed_countries = ["JP"]    # allow only these countries (Cloudflare CF-IPCountry); empty = no restriction
+# turnstile_site_key = ""       # Cloudflare Turnstile site key; set both keys to require a bot check
+# turnstile_secret_key = ""     # Cloudflare Turnstile secret key
+# session_hours = 12            # how long a passed bot check stays valid
 
 # Per-utterance recording (split on silence), playable from the remote viewer
 # [segments]

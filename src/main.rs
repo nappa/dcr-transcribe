@@ -1,4 +1,5 @@
 mod aac;
+mod access;
 mod audio_input;
 mod audio_output;
 mod aws_transcribe;

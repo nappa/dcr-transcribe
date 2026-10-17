@@ -327,12 +327,34 @@ auth_token = "ランダムな長い文字列"
 クライアントは `https://transcribe.example.com/?t=<token>` でアクセス。
 ブックマーク等で URL に埋め込めるので「リンク 1 つで開ける」用途に向く。
 
-**C. Cloudflare Access**
+**C. 国内 IP に限定 + bot 確認(本体側)**
+
+```toml
+[remote]
+allowed_countries = ["JP"]          # 日本からのアクセスだけ許可
+turnstile_site_key = "0x4AAAA..."   # Cloudflare Turnstile
+turnstile_secret_key = "0x4AAAA..."
+session_hours = 12                  # 確認を通ったあと再確認なしで使える時間
+```
+
+- **国の制限**: Cloudflare がトンネル経由のリクエストに付ける `CF-IPCountry` で判定し、許可していない国は 403。
+  Tor(`T1`)や判定不能(`XX`)も通さない。ヘッダが無いのはローカル(`localhost` / `127.0.0.1`)から直接来たときだけ許可する。
+  Cloudflare ダッシュボードの Network → **IP Geolocation** が有効であること(既定で有効)。
+  海外の VPN や iCloud プライベートリレー経由だと国外扱いになることがある
+- **bot 確認**: 閲覧画面を開くと Turnstile の確認画面が出て、通過するとセッションクッキー(HttpOnly / Secure)が発行される。
+  SSE・録音・ライブなどのデータ系はこのクッキーが無いと 403。期限が切れたら画面が自動で確認画面に戻る。
+  Cloudflare のチャレンジ画面と違い、SSE や音声の読み込みが期限切れで黙って止まることはない。
+  セッションはメモリに持つので、本体を再起動すると確認し直しになる
+- Turnstile のキーは、ダッシュボードの **Turnstile → Add widget** でホスト名(`transcribe-private.bunfree.net` など)を登録して発行する。
+  動作確認だけなら Cloudflare 公開のテスト用キー(サイトキー `1x00000000000000000000AA`、シークレット `1x0000000000000000000000000000000AA`、常に通る)が使える
+- ゾーンで Cloudflare のチャレンジ(「Just a moment...」)が有効になっている場合は、このホスト名では外しておく(SSE や音声の読み込みが止まるため)
+
+**D. Cloudflare Access**
 
 Zero Trust ダッシュボードの Access → Applications で `transcribe.example.com` を Self-hosted アプリとして登録し、
 メールアドレスのワンタイムコードなどで閲覧者を絞る。アプリ側の認証と違い、トンネルの手前で弾ける。
 
-A〜C はすべて併用可能(全てを通過する必要あり、二段階以上のゲート構成)。
+A〜D はすべて併用可能(全てを通過する必要あり、二段階以上のゲート構成)。
 Basic 認証・トークンは `/`, `/stream`, `/history`, `/segments`, `/audio/{id}`, `/live` に適用(トークンは `/` 以外)、`/healthz` は常に認証不要(外部監視用)。
 
 ### URL クエリパラメータ

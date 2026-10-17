@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0f1115">
+<meta name="robots" content="noindex,nofollow">
+<title>dcr-transcribe</title>
+<style>
+:root{--bg:#0f1115;--bg2:#161922;--fg:#e8eaed;--muted:#888c95}
+html,body{margin:0;min-height:100%}
+body{
+  background:var(--bg);color:var(--fg);display:flex;align-items:center;justify-content:center;min-height:100vh;
+  font-family:-apple-system,BlinkMacSystemFont,"Hiragino Sans","Yu Gothic UI","Noto Sans JP",sans-serif;
+  padding:16px;box-sizing:border-box;
+}
+.box{background:var(--bg2);border-radius:14px;padding:24px 20px;max-width:360px;width:100%;text-align:center}
+h1{font-size:16px;margin:0 0 6px}
+p{font-size:13px;color:var(--muted);margin:0 0 18px;line-height:1.6}
+#msg{min-height:1.5em;margin:14px 0 0;font-size:12px}
+#msg.err{color:#f99}
+</style>
+</head>
+<body>
+<div class="box">
+  <h1>dcr-transcribe</h1>
+  <p>アクセスの確認をしています</p>
+  <div id="ts"></div>
+  <p id="msg"></p>
+</div>
+<script>
+(function(){
+var msg=document.getElementById("msg");
+function show(t,err){msg.textContent=t;msg.className=err?"err":""}
+window.onTurnstileLoad=function(){
+  turnstile.render("#ts",{
+    sitekey:"__SITE_KEY__",
+    theme:"dark",
+    callback:function(token){
+      show("確認しました。開いています…");
+      fetch("/verify",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({token:token})})
+        .then(function(r){
+          if(r.ok){location.reload();return}
+          show("確認に失敗しました。もう一度お試しください",true);
+          turnstile.reset("#ts");
+        })
+        .catch(function(){show("通信に失敗しました。もう一度お試しください",true);turnstile.reset("#ts")});
+    },
+    "error-callback":function(){show("確認できませんでした。ページを再読み込みしてください",true)}
+  });
+};
+})();
+</script>
+<script src="https://challenges.cloudflare.com/turnstile/v0/api.js?onload=onTurnstileLoad&render=explicit" async defer></script>
+</body>
+</html>

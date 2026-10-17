@@ -690,7 +690,13 @@ function connect(opts){
     if(es.readyState===EventSource.CONNECTING){
       stat.className="s reco";stat.textContent="再接続中…";
     }else{
+      // HTTP エラーで閉じた(ブラウザは自動で再接続しない)。
+      // bot 確認の期限切れなら確認画面へ、それ以外(本体の再起動など)は少し待ってつなぎ直す
       stat.className="s off";stat.textContent="切断";
+      fetch("/session",{cache:"no-store"}).then(function(r){
+        if(r.status===403){location.reload();return}
+        setTimeout(function(){connect()},5000);
+      }).catch(function(){setTimeout(function(){connect()},5000)});
     }
   };
 }

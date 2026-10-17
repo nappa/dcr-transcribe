@@ -52,6 +52,8 @@ axum = "0.8.9"
 base64 = "0.23"
 # 閲覧画面の HTML / JSON を brotli で圧縮して返す(細いモバイル回線向け)
 brotli = "9.0"
+# Turnstile 確認後のセッション ID
+getrandom = "0.4"
 
 # TUI
 ratatui = "0.30"

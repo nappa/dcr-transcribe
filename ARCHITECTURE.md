@@ -629,6 +629,12 @@ pub enum TranscribeStatus {
 [127.0.0.1:8765] ←── cloudflared (名前付きトンネル) ──→ [モバイルブラウザ N 台]
 ```
 
+**アクセス制限** (`src/access.rs`、axum の middleware `guard` で全リクエストに適用):
+
+- `/healthz` 以外は `CF-IPCountry` が `allowed_countries` に含まれるものだけ通す。ヘッダが無いのは Host が `localhost` / `127.0.0.1` のときだけ許可(トンネル経由なら Host は公開ホスト名)
+- Turnstile が有効なら、`/` はセッションが無いと確認画面(`static/gate.html`)を返す。`POST /verify` で siteverify に問い合わせ、通れば 32 バイト乱数のセッション ID をクッキー(HttpOnly / Secure / SameSite=Lax)で発行
+- データ系(`/stream` `/history` `/segments` `/audio` `/live` `/session`)はセッション必須。閲覧画面は SSE が閉じたら `/session` を確かめ、403 なら再読み込みして確認画面へ戻る
+
 **多クライアント・スロークライアント対策**:
 
 - `tokio::sync::broadcast` で各クライアントが独立 Receiver を持つ → 互いに影響なし

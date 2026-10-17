@@ -1268,6 +1268,7 @@ dependencies = [
  "fdk-aac",
  "flacenc",
  "futures-util",
+ "getrandom 0.4.3",
  "hound",
  "log",
  "mockito",
