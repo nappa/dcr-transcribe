@@ -51,6 +51,10 @@ pub struct RemoteConfig {
     /// partial を配信する場合のチャンネル毎の throttle 間隔(ms)
     #[serde(default = "default_remote_partial_throttle_ms")]
     pub partial_throttle_ms: u64,
+    /// 公開 URL(例: "https://transcribe.example.com")。TUI のログイン URL / QR 表示に使う。
+    /// 空ならトンネルの設定ファイルの hostname から組み立てる
+    #[serde(default)]
+    pub public_url: String,
     /// ログインキー。`/?k=<キー>` を開くとセッションクッキーが発行される。
     /// 空なら `login_key_file` のキーを使う
     #[serde(default)]

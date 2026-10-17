@@ -117,6 +117,13 @@ TUI画面で `q` または `Esc` キーを押すと確認ダイアログが表�
   - `Y`: 終了を確定
   - `N` または `Esc`: キャンセル
 - `Ctrl+C`: 確認なしで即座に終了
+- `u`: 閲覧画面のログイン URL と QR コードを表示(もう一度 `u` か `Esc` で閉じる)
+  - スマホのカメラで QR を読むと、そのままログインして閲覧画面が開く
+  - ログインキーを含むので、開いたときだけ表示する(周りの人に見られないように)
+  - 公開 URL は `[remote] public_url` で指定する。無ければ `[tunnel] config` の設定ファイルの `hostname` から組み立てる
+  - `l`: 公開 URL とローカル URL(このパソコンからのみ)を切り替え
+  - QR は白地に黒で描くので、端末の配色に関係なく読める。端末が小さいときは広げるよう案内が出る
+- 画面の最下行にキー操作の案内が出る
 - `1`～`0`: 対応するチャンネルの音声を出力デバイスに送る（トグル）
   - 選択されたチャンネルは黄色の枠で表示され、タイトルに `[出力中]` が表示されます
   - 同じ数字キーを再度押すと選択解除されます
@@ -275,7 +282,7 @@ bitrate = 16000   # 聞いている 1 ミックスあたりの帯域(16kbps ≒ 
 - サーバは TCP_NODELAY を有効にして、小さなフレームを溜めずにすぐ送る
 - `<audio>` で再生するときは、回線の揺れで遅延が溜まらないよう、ブラウザ側で溜まった分を監視する:
   3 秒を超えたら少し速く再生、5 秒を超えたら今の音まで飛ぶ、10 秒以上止まったらつなぎ直す。
-  遅延が 3 秒を超えるとボタンに「遅延 n秒」と出る(Chrome は再生を続けるのに約 2.3 秒分を溜めるので、これが下限)
+  遅延が 3 秒を超えるとボタンに「■ 停止 n秒」と出る(低遅延再生では常に表示)(Chrome は再生を続けるのに約 2.3 秒分を溜めるので、これが下限)
 - 接続直後にサーバが無音の AAC を 32KB 送る(プリフィル)。Chrome は受信データを 32KB 単位で扱うため、
   これが無いと 16kbps では再生開始まで十数秒かかる。溜まった無音は再生開始時にブラウザが飛ばす。
   接続 1 回あたり 32KB 余分にかかる(`/live?...&prefill=0` で無効化できる)
@@ -297,7 +304,33 @@ cargo run --release
 > **Quick Tunnel (`cloudflared tunnel --url ...` / trycloudflare.com) は SSE 非対応なので使えない。**
 > Cloudflare に登録済みのドメインで名前付きトンネルを作る。
 
-#### おすすめ: ダッシュボードで作ってトークンを貼るだけ
+#### いちばん簡単: トークンと転送先を 1 ファイルにまとめる
+
+ダッシュボードでトンネルを作ってトークンをコピーしたら(下の 1〜2)、次の 1 ファイルを作る。
+Cloudflare 側に転送先(Public Hostname)が無ければ cloudflared はこのファイルの `ingress` を使うので、ダッシュボードでの転送先の設定もいらない。
+
+`secrets/cloudflared.yml`(パーミッション 600 推奨。`secrets/` は git 管理外):
+
+```yaml
+token: eyJ...
+ingress:
+  - hostname: transcribe.example.com
+    service: http://127.0.0.1:8765
+  - service: http_status:404
+```
+
+```toml
+[tunnel]
+enabled = true
+config = "./secrets/cloudflared.yml"
+```
+
+DNS がまだ無い・別のトンネルを指しているときは、一度だけ
+`cloudflared tunnel route dns --overwrite-dns <トンネル名> transcribe.example.com` を実行する(要 `cloudflared tunnel login`)か、
+ダッシュボードの DNS で `<トンネル ID>.cfargotunnel.com` への CNAME(Proxied)を作る。
+別の PC では `config.toml` と `secrets/` をコピーするだけで動く(cloudflared も自動でダウンロードされる)。
+
+#### ダッシュボードで作ってトークンを貼るだけ
 
 1. Cloudflare ダッシュボード → **Zero Trust → Networks → Tunnels → Create a tunnel** → 「Cloudflared」を選び、名前(例: `dcr-transcribe`)を付ける
 2. 「Install and run a connector」に表示されるコマンドの `eyJ...` で始まる長い文字列がトークン。これをコピーする(インストール作業は不要)

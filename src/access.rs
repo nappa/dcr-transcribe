@@ -90,6 +90,15 @@ impl AccessControl {
         self.turnstile.as_ref()
     }
 
+    /// ログイン用のパス(`/?k=<キー>`、ログイン無しなら `/`)
+    pub fn login_path(&self) -> String {
+        if self.login_key.is_empty() {
+            "/".to_string()
+        } else {
+            format!("/?k={}", self.login_key)
+        }
+    }
+
     pub fn login_required(&self) -> bool {
         !self.login_key.is_empty()
     }

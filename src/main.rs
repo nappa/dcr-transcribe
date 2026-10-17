@@ -11,6 +11,7 @@ mod flac_encoder;
 mod opus_encoder;
 mod remote_server;
 mod segment_recorder;
+mod share;
 mod transcribe;
 mod transcribe_backend;
 mod tui;
@@ -323,11 +324,17 @@ async fn main() -> Result<()> {
 
     log::info!("録音を開始しました (Ctrl+C または 'q' で停止)");
 
+    // TUI に出すログイン URL(Remote サーバが動いているときだけ)
+    let share_info = match (&remote_state, &config.remote) {
+        (Some(state), Some(remote)) => Some(share::ShareInfo::new(remote, &config.tunnel, &state.login_path())),
+        _ => None,
+    };
+
     // TUIタスクを起動
     let tui_state_clone = tui_state.clone();
     let running_clone = running.clone();
     let tui_task = tokio::spawn(async move {
-        let mut tui_app = TuiApp::new(tui_state_clone, running_clone);
+        let mut tui_app = TuiApp::new(tui_state_clone, running_clone).with_share(share_info);
         if let Err(e) = tui_app.run().await {
             log::error!("TUIエラー: {}", e);
         }

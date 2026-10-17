@@ -64,6 +64,7 @@ wav_output_dir = "./recordings"
 # include_partials = false      # also stream partial results (more bandwidth)
 # partial_throttle_ms = 500     # throttle partials per channel (only used if include_partials=true)
 # login_key_file = "./secrets/login_key"  # open /?k=<key> to log in (cookie); generated on first start if missing
+# public_url = "https://transcribe.example.com"  # shown as URL / QR in the TUI (`u`); derived from the tunnel config if empty
 # login_key = ""                # or set the key directly (takes precedence over the file)
 # allowed_countries = ["JP"]    # allow only these countries (Cloudflare CF-IPCountry); empty = no restriction
 # turnstile_site_key = ""       # Cloudflare Turnstile site key; set both keys to require a bot check

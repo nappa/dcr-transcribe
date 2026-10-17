@@ -52,6 +52,7 @@ pub mod flac_encoder;
 pub mod opus_encoder;
 pub mod remote_server;
 pub mod segment_recorder;
+pub mod share;
 pub mod transcribe;
 pub mod transcribe_backend;
 pub mod tui_state;

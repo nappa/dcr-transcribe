@@ -1,3 +1,4 @@
+use crate::share::{qr_modules, ShareInfo};
 use crate::tui_state::{ChannelState, TranscribeStatus, TuiState};
 use crate::types::VadState;
 use anyhow::Result;
@@ -28,6 +29,12 @@ pub struct TuiApp {
     running: Arc<AtomicBool>,
     /// 終了確認ダイアログを表示中かどうか
     exit_confirm_shown: bool,
+    /// 閲覧画面のログイン URL(Remote サーバが無効なら None)
+    share: Option<ShareInfo>,
+    /// ログイン URL / QR の窓を表示中か
+    share_shown: bool,
+    /// 窓で公開 URL ではなくローカル URL を出すか
+    share_local: bool,
 }
 
 impl TuiApp {
@@ -36,7 +43,16 @@ impl TuiApp {
             tui_state,
             running,
             exit_confirm_shown: false,
+            share: None,
+            share_shown: false,
+            share_local: false,
         }
+    }
+
+    /// ログイン URL / QR 表示を有効にする
+    pub fn with_share(mut self, share: Option<ShareInfo>) -> Self {
+        self.share = share;
+        self
     }
 
     /// TUIを起動
@@ -70,9 +86,25 @@ impl TuiApp {
                             }
                             _ => {}
                         }
+                    } else if self.share_shown {
+                        // ログイン URL / QR の窓: u / Esc で閉じる、l で公開 / ローカルを切り替え
+                        match key.code {
+                            KeyCode::Char('u') | KeyCode::Char('U') | KeyCode::Esc => self.share_shown = false,
+                            KeyCode::Char('l') | KeyCode::Char('L') => self.share_local = !self.share_local,
+                            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                self.running.store(false, Ordering::SeqCst);
+                                break;
+                            }
+                            _ => {}
+                        }
                     } else {
                         // 通常のキー入力処理
                         match key.code {
+                            KeyCode::Char('u') | KeyCode::Char('U') if self.share.is_some() => {
+                                // ログインキーを含むので、開いたときだけ表示する
+                                self.share_shown = true;
+                                self.share_local = self.share.as_ref().is_some_and(|s| s.public.is_none());
+                            }
                             KeyCode::Char('q') | KeyCode::Esc => {
                                 // 終了確認ダイアログを表示
                                 self.exit_confirm_shown = true;
@@ -152,6 +184,13 @@ impl TuiApp {
             return;
         }
 
+        // 最下行はキー操作の案内
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(f.area());
+        self.draw_help(f, rows[1]);
+
         // チャンネル数に応じて横方向に分割
         let constraints: Vec<Constraint> = channels
             .iter()
@@ -161,7 +200,7 @@ impl TuiApp {
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints(constraints)
-            .split(f.area());
+            .split(rows[0]);
 
         // 選択されているチャンネルIDを取得
         let selected_channel_id = self.tui_state.get_selected_channel_for_output();
@@ -174,10 +213,90 @@ impl TuiApp {
             }
         }
 
+        if self.share_shown {
+            self.draw_share(f);
+        }
+
         // 終了確認ダイアログを描画
         if self.exit_confirm_shown {
             self.draw_exit_confirm_dialog(f);
         }
+    }
+
+    /// 最下行のキー操作の案内
+    fn draw_help(&self, f: &mut Frame, area: Rect) {
+        let key = |k: &'static str| Span::styled(k, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+        let mut spans = Vec::new();
+        if self.share.is_some() {
+            spans.extend([key(" u"), Span::raw(": ログイン URL / QR  ")]);
+        }
+        spans.extend([key(" 1-9"), Span::raw(": 音声出力  "), key(" q"), Span::raw(": 終了")]);
+        f.render_widget(Paragraph::new(Line::from(spans)).style(Style::default().fg(Color::Gray)), area);
+    }
+
+    /// ログイン URL と QR コードの窓
+    fn draw_share(&self, f: &mut Frame) {
+        let Some(share) = &self.share else { return };
+        let (label, url) = match (&share.public, self.share_local) {
+            (Some(public), false) => ("公開 URL", public.as_str()),
+            _ => ("ローカル URL(このパソコンからのみ)", share.local.as_str()),
+        };
+        let qr = qr_modules(url).ok();
+        // QR は上下 2 モジュールを 1 文字(▀)で描くので、高さは半分
+        let qr_w = qr.as_ref().map_or(0, |m| m.len()) as u16;
+        let qr_h = qr.as_ref().map_or(0, |m| m.len().div_ceil(2)) as u16;
+
+        let area = f.area();
+        let url_w = unicode_width(url) as u16;
+        let width = (qr_w.max(url_w).max(44) + 4).min(area.width);
+        let height = (qr_h + 7).min(area.height);
+        let popup = Rect {
+            x: area.width.saturating_sub(width) / 2,
+            y: area.height.saturating_sub(height) / 2,
+            width,
+            height,
+        };
+        f.render_widget(Clear, popup);
+        let switch_hint = if share.public.is_some() { "  l: 公開/ローカル切替" } else { "" };
+        let block = Block::default()
+            .title(format!(" {} ", label))
+            .title_bottom(format!(" u / Esc: 閉じる{} ", switch_hint))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .style(Style::default().bg(Color::Black).fg(Color::White));
+        let inner = block.inner(popup);
+        f.render_widget(block, popup);
+
+        let mut lines = vec![Line::from(Span::styled(url, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)))];
+        lines.push(Line::from(""));
+        match &qr {
+            Some(m) if inner.width >= qr_w && inner.height >= qr_h + 2 => {
+                // 端末の配色に関係なく読めるよう、白地に黒で描く
+                let color = |dark: bool| if dark { Color::Black } else { Color::White };
+                for y in (0..m.len()).step_by(2) {
+                    let spans: Vec<Span> = (0..m.len())
+                        .map(|x| {
+                            let top = m[y][x];
+                            let bottom = m.get(y + 1).is_some_and(|r| r[x]);
+                            Span::styled("▀", Style::default().fg(color(top)).bg(color(bottom)))
+                        })
+                        .collect();
+                    lines.push(Line::from(spans));
+                }
+            }
+            Some(_) => {
+                lines.push(Line::from("端末が小さくて QR を出せません"));
+                lines.push(Line::from("端末を広げてください"));
+            }
+            None => lines.push(Line::from("QR コードを作れませんでした")),
+        }
+        // 長い URL は折り返す(QR の行は幅に収まっているので折り返されない)
+        f.render_widget(
+            Paragraph::new(lines)
+                .alignment(ratatui::layout::Alignment::Center)
+                .wrap(ratatui::widgets::Wrap { trim: false }),
+            inner,
+        );
     }
 
     /// 1つのチャンネルを描画
@@ -551,5 +670,98 @@ impl TuiApp {
             .alignment(ratatui::layout::Alignment::Center);
 
         f.render_widget(paragraph, inner_area);
+    }
+}
+
+/// 端末での表示幅(URL は ASCII なので文字数で足りる)
+fn unicode_width(s: &str) -> usize {
+    s.chars().count()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+
+    fn app(share: Option<ShareInfo>) -> TuiApp {
+        let state = TuiState::new();
+        state.add_channel(0, "L".into());
+        TuiApp::new(state, Arc::new(AtomicBool::new(true))).with_share(share)
+    }
+
+    fn render(app: &TuiApp, w: u16, h: u16) -> ratatui::buffer::Buffer {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        term.backend().buffer().clone()
+    }
+
+    /// 画面の文字を連結する。全角文字は 2 マス使い、次のマスは空なので読み飛ばす
+    fn text(buf: &ratatui::buffer::Buffer) -> String {
+        let mut out = String::new();
+        let mut skip = false;
+        for c in buf.content() {
+            if std::mem::take(&mut skip) {
+                continue;
+            }
+            out.push_str(c.symbol());
+            skip = !c.symbol().is_ascii() && c.symbol() != "▀";
+        }
+        out
+    }
+
+    fn share() -> ShareInfo {
+        ShareInfo {
+            local: "http://127.0.0.1:8765/?k=abc".into(),
+            public: Some("https://t.example.com/?k=abc".into()),
+        }
+    }
+
+    #[test]
+    fn help_bar_mentions_url_key_only_when_available() {
+        assert!(text(&render(&app(Some(share())), 100, 30)).contains("ログイン URL / QR"));
+        assert!(!text(&render(&app(None), 100, 30)).contains("ログイン URL / QR"));
+    }
+
+    #[test]
+    fn share_popup_is_hidden_until_opened() {
+        let a = app(Some(share()));
+        assert!(!text(&render(&a, 100, 40)).contains("https://t.example.com/?k=abc"));
+    }
+
+    #[test]
+    fn share_popup_draws_url_and_qr_matching_modules() {
+        let mut a = app(Some(share()));
+        a.share_shown = true;
+        let buf = render(&a, 100, 40);
+        let all = text(&buf);
+        assert!(all.contains("https://t.example.com/?k=abc"));
+        assert!(all.contains("公開 URL"));
+
+        // ▀ の前景 = 上のモジュール、背景 = 下のモジュール(黒 = 暗)。QR の左上隅を探して照合する
+        let m = qr_modules("https://t.example.com/?k=abc").unwrap();
+        let area = buf.area;
+        let origin = (0..area.height)
+            .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+            .find(|&(x, y)| buf[(x, y)].symbol() == "▀")
+            .expect("QR が描かれている");
+        for (row, y) in (0..m.len()).step_by(2).enumerate() {
+            for x in 0..m.len() {
+                let cell = &buf[(origin.0 + x as u16, origin.1 + row as u16)];
+                let dark = |c: Color| c == Color::Black;
+                assert_eq!(dark(cell.fg), m[y][x], "({}, {})", x, y);
+                assert_eq!(dark(cell.bg), m.get(y + 1).is_some_and(|r| r[x]), "({}, {})", x, y + 1);
+            }
+        }
+
+        // l でローカル URL に切り替え
+        a.share_local = true;
+        assert!(text(&render(&a, 100, 40)).contains("http://127.0.0.1:8765/?k=abc"));
+    }
+
+    #[test]
+    fn share_popup_explains_when_terminal_too_small() {
+        let mut a = app(Some(share()));
+        a.share_shown = true;
+        assert!(text(&render(&a, 60, 15)).contains("端末が小さくて"));
     }
 }

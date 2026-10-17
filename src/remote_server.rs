@@ -448,6 +448,11 @@ impl RemoteState {
         let _ = self.broadcaster.send(stored); // 受信者ゼロでもエラーにしない
     }
 
+    /// ログイン用のパス(`/?k=<キー>`、ログイン無しなら `/`)。TUI の URL / QR 表示用
+    pub fn login_path(&self) -> String {
+        self.access.login_path()
+    }
+
     /// 録音を終えた区間を登録して配信(同期、ノンブロッキング)
     pub fn push_segment(&self, info: &SegmentInfo) {
         let wire = WireSegment {
