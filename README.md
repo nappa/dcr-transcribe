@@ -719,12 +719,15 @@ public_url = "https://relay.example.com"    # 閲覧画面の URL(TUI の `u` �
 
 ## macOS SwiftUI アプリ（初版）
 
-macOS 14 以降と Xcode の Swift ツールチェーンでビルドできます。外部 Swift パッケージは不要です。
+macOS 14 以降と Xcode 本体の Swift ツールチェーンでビルドできます。Command Line Tools のみの環境は対象外です。Xcode をインストールし、一度起動して初期設定を完了してください。外部 Swift パッケージは不要です。
 
 ```bash
 scripts/build_macos.sh
 open target/macos/DCRMonitor.app --args --config "$PWD/config.toml"
 ```
+
+ビルドスクリプトは選択中の Xcode（未選択なら `/Applications/Xcode.app`）の Swift と macOS SDK を使います。システム全体の `xcode-select` 設定は変更しません。別の場所の Xcode は `DEVELOPER_DIR=/path/to/Xcode.app/Contents/Developer scripts/build_macos.sh` で指定できます。
+`SwiftUIMacros` が見つからない場合は、Command Line Tools や別配布の Swift と Xcode の SDK が混在していないか確認してください。`xcode-select -p` と `swift --version`、ビルドスクリプトが出力する Xcode・SDK・Swift の情報が調査に使えます。
 
 GUI 起動時に前回の設定（または `--config`）で録音・文字起こしを自動開始します。
 初回に設定が未選択ならファイル選択画面を表示します。画面には開始・停止ボタンを置かず、アプリ終了時に録音を確定します。
