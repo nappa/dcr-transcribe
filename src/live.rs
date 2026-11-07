@@ -26,9 +26,11 @@ const LIVE_BROADCAST_CAPACITY: usize = 256;
 const PREFILL_BYTES: usize = 32 * 1024;
 
 /// 1 回のオーディオコールバック分のサンプル(チャンネル ID とモノラルサンプル)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct LiveFrame {
     pub channels: Vec<(usize, Vec<i16>)>,
+    /// 録った時刻(最後のサンプル、UNIX ミリ秒、この機械の時計)。中継サーバが遅延を測るのに使う。分からなければ 0
+    pub at_ms: u64,
 }
 
 struct Mix {
@@ -41,8 +43,8 @@ pub struct LiveHub {
     sample_rate: u32,
     bitrate: u32,
     profile: AacProfile,
-    /// 配信してよいチャンネル(有効なチャンネル)
-    channels: Vec<usize>,
+    /// 配信してよいチャンネル(有効なチャンネル)。中継サーバでは会場がつながるたびに入れ替わる
+    channels: Mutex<Vec<usize>>,
     /// キーは昇順・重複なしのチャンネル ID 列
     mixes: Mutex<HashMap<Vec<usize>, Mix>>,
     active: Arc<AtomicBool>,
@@ -56,7 +58,7 @@ impl LiveHub {
             sample_rate,
             bitrate,
             profile,
-            channels,
+            channels: Mutex::new(channels),
             mixes: Mutex::new(HashMap::new()),
             active: Arc::new(AtomicBool::new(false)),
             prefill: std::sync::OnceLock::new(),
@@ -94,8 +96,11 @@ impl LiveHub {
         if key.is_empty() {
             bail!("チャンネルが指定されていません");
         }
-        if let Some(c) = key.iter().find(|c| !self.channels.contains(c)) {
-            bail!("チャンネル {} は配信できません", c);
+        {
+            let allowed = self.channels.lock().unwrap();
+            if let Some(c) = key.iter().find(|c| !allowed.contains(c)) {
+                bail!("チャンネル {} は配信できません", c);
+            }
         }
 
         let mut mixes = self.mixes.lock().unwrap();
@@ -114,6 +119,24 @@ impl LiveHub {
         );
         self.active.store(true, Ordering::Relaxed);
         Ok(rx)
+    }
+
+    /// 配信してよいチャンネルを入れ替える(中継サーバで会場がつながったとき)
+    pub fn set_channels(&self, channels: Vec<usize>) {
+        *self.channels.lock().unwrap() = channels;
+    }
+
+    /// 聞いている人がいるチャンネル(昇順・重複なし)。中継サーバが会場に送ってほしいチャンネルを伝えるのに使う
+    pub fn wanted_channels(&self) -> Vec<usize> {
+        let mixes = self.mixes.lock().unwrap();
+        let mut out: Vec<usize> = mixes
+            .iter()
+            .filter(|(_, mix)| mix.tx.receiver_count() > 0)
+            .flat_map(|(key, _)| key.iter().copied())
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
     }
 
     /// 1 フレーム分を各ミックスに流す
@@ -168,6 +191,7 @@ mod tests {
     fn frame(len: usize, values: &[(usize, i16)]) -> LiveFrame {
         LiveFrame {
             channels: values.iter().map(|&(c, v)| (c, vec![v; len])).collect(),
+            at_ms: 0,
         }
     }
 
@@ -206,6 +230,21 @@ mod tests {
         let _b = hub.subscribe(&[3, 2]).unwrap();
         let _c = hub.subscribe(&[2]).unwrap();
         assert_eq!(hub.mixes.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn wanted_channels_follow_listeners() {
+        let hub = LiveHub::new(48000, 48000, AacProfile::Lc, vec![2, 3, 4]);
+        assert!(hub.wanted_channels().is_empty());
+        let a = hub.subscribe(&[3, 2]).unwrap();
+        let _b = hub.subscribe(&[3]).unwrap();
+        assert_eq!(hub.wanted_channels(), vec![2, 3]);
+        drop(a);
+        assert_eq!(hub.wanted_channels(), vec![3]);
+
+        hub.set_channels(vec![5]);
+        assert!(hub.subscribe(&[2]).is_err());
+        assert!(hub.subscribe(&[5]).is_ok());
     }
 
     #[test]

@@ -2,7 +2,9 @@
 //!
 //! - 国の制限: Cloudflare がトンネル経由のリクエストに付ける `CF-IPCountry` で判定する。
 //!   ヘッダが無いのはローカル(`localhost` / `127.0.0.1`)から直接来たときだけ許可する。
-//! - ログイン: `/?k=<ログインキー>` を開くとセッションクッキーを発行する(キーは URL から消して転送)。
+//! - ログイン: `/#k=<ログインキー>` を開くと、画面の script がキーを同じオリジンの `POST /login` で渡してセッションクッキーをもらう。
+//!   `#` 以降はサーバに送られないので、キーが Cloudflare・アクセスログ・リンクプレビューに渡らない
+//!   (旧形式の `/?k=` も受け付ける)。
 //!   キーは設定に直接書くか、ファイルに保存したもの(無ければ初回に生成)を使う
 //! - bot の確認: Cloudflare Turnstile。確認画面を通過するとセッションが有効になる。
 //!   ログインキーと併用する場合は、キーが正しい人だけ「確認待ち」になり、確認を通ると有効になる。
@@ -15,7 +17,11 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+/// HTTP(LAN から直接見るとき)のセッションクッキー
 pub const SESSION_COOKIE: &str = "dcr_session";
+/// HTTPS(Cloudflare 経由)のセッションクッキー。`__Host-` 接頭辞のクッキーは Secure・Path=/・Domain なしでないと
+/// ブラウザが受け付けないので、サブドメインや平文の HTTP から上書き・差し込みされない
+pub const SECURE_SESSION_COOKIE: &str = "__Host-dcr_session";
 const SITEVERIFY_URL: &str = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
 /// 保持するセッションの上限(ログイン・確認を通った人しか作れないが、念のため)
 const MAX_SESSIONS: usize = 10_000;
@@ -50,7 +56,12 @@ pub struct AccessControl {
     turnstile: Option<Turnstile>,
     sessions: Mutex<HashMap<String, (Instant, SessionState)>>,
     session_ttl: Duration,
+    /// Tor 経由(`CF-IPCountry: T1`)を拒否する
+    block_tor: bool,
 }
+
+/// Cloudflare が Tor 経由のアクセスに付ける国コード
+const TOR_COUNTRY: &str = "T1";
 
 impl AccessControl {
     pub fn new(
@@ -77,25 +88,48 @@ impl AccessControl {
             turnstile,
             sessions: Mutex::new(HashMap::new()),
             session_ttl,
+            block_tor: true,
         }
+    }
+
+    /// Tor 経由を拒否するか(既定は拒否)
+    pub fn with_block_tor(mut self, block: bool) -> Self {
+        self.block_tor = block;
+        self
     }
 
     /// 制限なし(テスト用)
     #[cfg(test)]
     pub fn disabled() -> Self {
-        Self::new(&[], "", "", "", Duration::from_secs(3600))
+        Self::new(&[], "", "", "", Duration::from_secs(3600)).with_block_tor(false)
     }
 
     pub fn turnstile(&self) -> Option<&Turnstile> {
         self.turnstile.as_ref()
     }
 
-    /// ログイン用のパス(`/?k=<キー>`、ログイン無しなら `/`)
+    /// ログイン用のパス(`/#k=<キー>`、ログイン無しなら `/`)
     pub fn login_path(&self) -> String {
         if self.login_key.is_empty() {
             "/".to_string()
         } else {
-            format!("/?k={}", self.login_key)
+            format!("/#k={}", self.login_key)
+        }
+    }
+
+    /// 要求のセッションを消す(ログアウト)
+    pub fn logout(&self, headers: &HeaderMap) {
+        if let (Some(id), Ok(mut sessions)) = (session_id(headers), self.sessions.lock()) {
+            sessions.remove(id);
+        }
+    }
+
+    /// セッションクッキーを消すための Set-Cookie
+    pub fn expired_cookie(https: bool) -> String {
+        if https {
+            format!("{}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict", SECURE_SESSION_COOKIE)
+        } else {
+            format!("{}=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict", SESSION_COOKIE)
         }
     }
 
@@ -116,19 +150,24 @@ impl AccessControl {
             self.allowed_countries.join(",")
         };
         format!(
-            "ログイン={}, 国={}, bot確認={}",
+            "ログイン={}, 国={}, Tor={}, bot確認={}",
             if self.login_required() { "キー" } else { "なし" },
             countries,
+            if self.block_tor { "拒否" } else { "許可" },
             if self.turnstile.is_some() { "Turnstile" } else { "なし" }
         )
     }
 
     /// 国の制限を満たすか
     pub fn country_allowed(&self, headers: &HeaderMap) -> bool {
+        let country = headers.get("cf-ipcountry").and_then(|v| v.to_str().ok());
+        if self.block_tor && country.is_some_and(|c| c.trim().eq_ignore_ascii_case(TOR_COUNTRY)) {
+            return false;
+        }
         if self.allowed_countries.is_empty() {
             return true;
         }
-        match headers.get("cf-ipcountry").and_then(|v| v.to_str().ok()) {
+        match country {
             Some(c) => self.allowed_countries.iter().any(|a| a.eq_ignore_ascii_case(c.trim())),
             // Cloudflare を通らない = ローカルから直接。トンネル経由なら Host は公開ホスト名になる
             None => is_local_host(headers),
@@ -137,10 +176,12 @@ impl AccessControl {
 
     /// クッキーのセッションの段階
     pub fn session_state(&self, headers: &HeaderMap) -> SessionState {
-        let Some(id) = cookie(headers, SESSION_COOKIE) else {
+        let Some(id) = session_id(headers) else {
             return SessionState::None;
         };
-        let sessions = self.sessions.lock().unwrap();
+        let Ok(sessions) = self.sessions.lock() else {
+            return SessionState::None;
+        };
         match sessions.get(id) {
             Some((exp, state)) if *exp > Instant::now() => *state,
             _ => SessionState::None,
@@ -154,15 +195,11 @@ impl AccessControl {
 
     /// ログインキーが正しいか(比較時間から推測されないよう一定時間で比べる)
     pub fn check_login_key(&self, key: &str) -> bool {
-        let (a, b) = (self.login_key.as_bytes(), key.as_bytes());
-        if self.login_key.is_empty() || a.len() != b.len() {
-            return false;
-        }
-        a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+        !self.login_key.is_empty() && constant_time_eq(&self.login_key, key)
     }
 
     /// ログインキーが通ったときのセッション。Turnstile があれば「確認待ち」から始める
-    pub fn login(&self) -> String {
+    pub fn login(&self) -> Result<String> {
         if self.turnstile.is_some() {
             self.new_session(SessionState::Pending, PENDING_TTL)
         } else {
@@ -196,21 +233,22 @@ impl AccessControl {
         if res["success"].as_bool() != Some(true) {
             bail!("Turnstile の検証に失敗: {}", res["error-codes"]);
         }
+        let id = self.new_session(SessionState::Full, self.session_ttl)?;
         // 確認待ちのセッションは捨てて、新しい ID で有効なセッションを作る
-        if let Some(old) = cookie(headers, SESSION_COOKIE) {
-            self.sessions.lock().unwrap().remove(old);
+        if let Some(old) = session_id(headers) {
+            self.sessions.lock().map_err(|_| anyhow::anyhow!("セッションストアが利用できません"))?.remove(old);
         }
-        Ok(self.new_session(SessionState::Full, self.session_ttl))
+        Ok(id)
     }
 
-    fn new_session(&self, state: SessionState, ttl: Duration) -> String {
+    fn new_session(&self, state: SessionState, ttl: Duration) -> Result<String> {
         let mut buf = [0u8; 32];
-        // OS の乱数が取れない環境では起動自体が成り立たないので panic でよい
-        getrandom::fill(&mut buf).expect("OS の乱数を取得できません");
+        getrandom::fill(&mut buf).map_err(|e| anyhow::anyhow!("OS の乱数を取得できません: {}", e))?;
         let id: String = buf.iter().map(|b| format!("{:02x}", b)).collect();
 
         let now = Instant::now();
-        let mut sessions = self.sessions.lock().unwrap();
+        let expires = now.checked_add(ttl).context("セッションの有効期間が大きすぎます")?;
+        let mut sessions = self.sessions.lock().map_err(|_| anyhow::anyhow!("セッションストアが利用できません"))?;
         sessions.retain(|_, (exp, _)| *exp > now);
         if sessions.len() >= MAX_SESSIONS {
             // 期限の近いものから捨てる
@@ -218,22 +256,22 @@ impl AccessControl {
                 sessions.remove(&oldest);
             }
         }
-        sessions.insert(id.clone(), (now + ttl, state));
-        id
+        sessions.insert(id.clone(), (expires, state));
+        Ok(id)
     }
 
     /// セッションクッキーの Set-Cookie 値(有効期限はセッションの段階に合わせる)
-    pub fn session_cookie(&self, id: &str) -> String {
-        let ttl = match self.sessions.lock().unwrap().get(id) {
-            Some((_, SessionState::Pending)) => PENDING_TTL,
-            _ => self.session_ttl,
-        };
-        format!(
-            "{}={}; Path=/; Max-Age={}; HttpOnly; Secure; SameSite=Lax",
-            SESSION_COOKIE,
-            id,
-            ttl.as_secs()
-        )
+    /// セッションクッキー。HTTPS なら `__Host-` + Secure、平文の HTTP(LAN)なら Secure なし(ブラウザが捨てるため)。
+    /// どちらも HttpOnly・SameSite=Strict(別サイトからの要求には付かない)
+    pub fn session_cookie(&self, id: &str, https: bool) -> String {
+        let pending = self.sessions.lock().ok()
+            .is_some_and(|sessions| matches!(sessions.get(id), Some((_, SessionState::Pending))));
+        let ttl = if pending { PENDING_TTL } else { self.session_ttl };
+        if https {
+            format!("{}={}; Path=/; Max-Age={}; HttpOnly; Secure; SameSite=Strict", SECURE_SESSION_COOKIE, id, ttl.as_secs())
+        } else {
+            format!("{}={}; Path=/; Max-Age={}; HttpOnly; SameSite=Strict", SESSION_COOKIE, id, ttl.as_secs())
+        }
     }
 
     #[cfg(test)]
@@ -275,6 +313,12 @@ pub fn load_or_create_login_key(configured: &str, key_file: &str) -> Result<Stri
     Ok(key)
 }
 
+/// 秘密の文字列を比べる(比較時間から推測されないよう、長さが同じなら全バイト比べる)
+pub fn constant_time_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 /// 本人だけ読み書きできるファイルとして書く
 fn write_private(path: &std::path::Path, content: &str) -> std::io::Result<()> {
     use std::io::Write;
@@ -283,6 +327,20 @@ fn write_private(path: &std::path::Path, content: &str) -> std::io::Result<()> {
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
     opts.open(path)?.write_all(content.as_bytes())
+}
+
+/// HTTPS で来た要求か(cloudflared は元の要求の scheme を X-Forwarded-Proto で伝える)。
+/// 偽っても、平文の HTTP では `__Host-` のクッキーをブラウザが受け付けないので害はない
+pub fn is_https(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.split(',').next().is_some_and(|p| p.trim().eq_ignore_ascii_case("https")))
+}
+
+/// 要求のセッション ID。HTTPS では `__Host-` のクッキーだけを見る(接頭辞なしの同名クッキーで差し替えられないように)
+fn session_id(headers: &HeaderMap) -> Option<&str> {
+    cookie(headers, if is_https(headers) { SECURE_SESSION_COOKIE } else { SESSION_COOKIE })
 }
 
 fn is_local_host(headers: &HeaderMap) -> bool {
@@ -344,31 +402,57 @@ mod tests {
     }
 
     #[test]
+    fn tor_blocked_even_without_country_list() {
+        let a = AccessControl::new(&[], "", "", "", Duration::from_secs(60));
+        assert!(!a.country_allowed(&headers(&[("host", "x.example"), ("cf-ipcountry", "T1")])));
+        assert!(a.country_allowed(&headers(&[("host", "x.example"), ("cf-ipcountry", "US")])));
+        let a = a.with_block_tor(false);
+        assert!(a.country_allowed(&headers(&[("host", "x.example"), ("cf-ipcountry", "T1")])));
+    }
+
+    #[test]
     fn session_required_only_with_turnstile() {
         assert!(AccessControl::disabled().session_valid(&HeaderMap::new()));
 
         let a = AccessControl::new(&[], "", "site", "secret", Duration::from_secs(60));
         assert!(!a.session_valid(&HeaderMap::new()));
-        let id = a.new_session(SessionState::Full, Duration::from_secs(60));
+        let id = a.new_session(SessionState::Full, Duration::from_secs(60)).unwrap();
         assert_eq!(id.len(), 64);
         assert!(a.session_valid(&headers(&[("cookie", &format!("a=b; dcr_session={}", id))])));
         assert!(!a.session_valid(&headers(&[("cookie", "dcr_session=forged")])));
-        assert_ne!(id, a.new_session(SessionState::Full, Duration::from_secs(60)));
+        assert_ne!(id, a.new_session(SessionState::Full, Duration::from_secs(60)).unwrap());
+    }
+
+    #[test]
+    fn https_reads_only_host_prefixed_cookie() {
+        let a = AccessControl::new(&[], "", "site", "secret", Duration::from_secs(60));
+        let id = a.new_session(SessionState::Full, Duration::from_secs(60)).unwrap();
+        let https = |c: String| headers(&[("x-forwarded-proto", "https"), ("cookie", &c)]);
+        assert!(a.session_valid(&https(format!("__Host-dcr_session={}", id))));
+        // HTTPS では接頭辞なしのクッキー(サブドメインや平文の HTTP から差し込めるもの)を信用しない
+        assert!(!a.session_valid(&https(format!("dcr_session={}", id))));
+        // 平文の HTTP(LAN)では接頭辞なし
+        assert!(a.session_valid(&headers(&[("cookie", &format!("dcr_session={}", id))])));
+        assert!(!a.session_valid(&headers(&[("cookie", &format!("__Host-dcr_session={}", id))])));
     }
 
     #[test]
     fn session_expires() {
         let a = AccessControl::new(&[], "", "site", "secret", Duration::from_millis(0));
-        let id = a.new_session(SessionState::Full, Duration::from_millis(0));
+        let id = a.new_session(SessionState::Full, Duration::from_millis(0)).unwrap();
         assert!(!a.session_valid(&headers(&[("cookie", &format!("dcr_session={}", id))])));
     }
 
     #[test]
     fn cookie_attributes() {
         let a = AccessControl::new(&[], "", "site", "secret", Duration::from_secs(3600));
-        let c = a.session_cookie("abc");
+        let c = a.session_cookie("abc", false);
         assert!(c.starts_with("dcr_session=abc;"));
-        for attr in ["HttpOnly", "Secure", "SameSite=Lax", "Max-Age=3600", "Path=/"] {
+        assert!(c.contains("SameSite=Strict") && c.contains("HttpOnly") && !c.contains("Secure"), "{}", c);
+        let c = a.session_cookie("abc", true);
+        assert!(c.starts_with("__Host-dcr_session=abc; Path=/;"), "{}", c);
+        assert!(c.contains("Secure") && c.contains("SameSite=Strict") && !c.contains("Domain"), "{}", c);
+        for attr in ["HttpOnly", "Secure", "SameSite=Strict", "Max-Age=3600", "Path=/"] {
             assert!(c.contains(attr), "{}", c);
         }
     }
@@ -418,7 +502,7 @@ mod tests {
         let a = AccessControl::new(&[], "k", "", "", Duration::from_secs(60));
         assert!(!a.is_open());
         assert!(!a.session_valid(&HeaderMap::new()));
-        let id = a.login();
+        let id = a.login().unwrap();
         let h = headers(&[("cookie", &format!("dcr_session={}", id))]);
         assert_eq!(a.session_state(&h), SessionState::Full);
         assert!(a.session_valid(&h));
@@ -434,11 +518,11 @@ mod tests {
         // ログイン前は確認も受け付けない
         assert!(a.verify("t", None, &HeaderMap::new()).await.is_err());
 
-        let pending = a.login();
+        let pending = a.login().unwrap();
         let hp = headers(&[("cookie", &format!("dcr_session={}", pending))]);
         assert_eq!(a.session_state(&hp), SessionState::Pending);
         assert!(!a.session_valid(&hp));
-        assert!(a.session_cookie(&pending).contains("Max-Age=600"));
+        assert!(a.session_cookie(&pending, false).contains("Max-Age=600"));
 
         let full = a.verify("t", None, &hp).await.unwrap();
         assert_ne!(full, pending);
@@ -466,4 +550,24 @@ mod tests {
         // ファイル指定も無ければログイン無し
         assert_eq!(load_or_create_login_key("", "").unwrap(), "");
     }
+    #[test]
+    fn session_expiry_overflow_returns_error_without_inserting() {
+        let a = AccessControl::disabled();
+        assert!(a.new_session(SessionState::Full, Duration::MAX).is_err());
+        assert!(a.sessions.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn poisoned_sessions_fail_closed_without_panicking() {
+        let a = AccessControl::new(&[], "key", "", "", Duration::from_secs(60));
+        let id = a.login().unwrap();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = a.sessions.lock().unwrap();
+            panic!("injected");
+        }));
+        assert!(!a.session_valid(&headers(&[("cookie", &format!("dcr_session={id}"))])));
+        assert!(a.login().is_err());
+        assert!(a.session_cookie(&id, true).contains("HttpOnly"));
+    }
+
 }

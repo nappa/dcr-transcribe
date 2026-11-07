@@ -28,13 +28,204 @@ pub struct Config {
     #[serde(default)]
     pub tunnel: TunnelConfig,
     #[serde(default)]
+    pub uplink: UplinkConfig,
+    #[serde(default)]
+    pub relay: RelayConfig,
+    #[serde(default)]
+    pub clock: ClockConfig,
+    #[serde(default)]
     pub channels: Vec<ChannelConfig>,
+}
+
+/// 中継サーバへのアップリンク(会場側)
+///
+/// 有効にすると、文字起こし・チャンネルの状態・区間録音・ライブ音声を QUIC(UDP)1 本で中継サーバへ送る。
+/// cloudflared は通さず、私設 CA の証明書で互いを確かめる(mTLS)。証明書は `--gen-uplink-pki` で作る。
+/// 閲覧者は中継サーバにつなぐので、会場の上り回線は閲覧者の人数によらず 1 本分で済む。
+/// `[remote]`(ローカルの閲覧サーバ)と同時に使ってもよい。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct UplinkConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// 中継サーバの QUIC の宛先(`IP:ポート` か `名前:ポート`、例: "203.0.113.5:443")
+    #[serde(default)]
+    pub server: String,
+    /// 中継サーバの証明書の SAN と照らし合わせる名前。空なら `server` のホスト部分
+    #[serde(default)]
+    pub server_name: String,
+    /// 私設 CA の証明書(中継サーバの証明書を確かめる)
+    #[serde(default = "default_uplink_ca_file")]
+    pub ca_file: String,
+    /// 会場のクライアント証明書と鍵
+    #[serde(default = "default_uplink_cert_file")]
+    pub cert_file: String,
+    #[serde(default = "default_uplink_key_file")]
+    pub key_file: String,
+    /// 閲覧画面の公開 URL(例: "https://relay.example.com")。TUI のログイン URL / QR 表示用
+    #[serde(default)]
+    pub public_url: String,
+    /// ライブ音声を送るか(中継サーバで聞いている人がいるチャンネルだけ送る)
+    #[serde(default = "default_true")]
+    pub live: bool,
+    /// ライブ音声の Opus ビットレート(bps、1 チャンネルあたり)
+    #[serde(default = "default_uplink_live_bitrate")]
+    pub live_bitrate: i32,
+    /// partial(途中経過)も送るか。上り回線を使うので既定は送らない
+    #[serde(default)]
+    pub include_partials: bool,
+    /// 再接続時に送り直せるよう手元に残す文字起こしの件数
+    #[serde(default = "default_uplink_retain_events")]
+    pub retain_events: usize,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_uplink_ca_file() -> String {
+    "./secrets/uplink/ca.pem".to_string()
+}
+
+fn default_uplink_cert_file() -> String {
+    "./secrets/uplink/venue.pem".to_string()
+}
+
+fn default_uplink_key_file() -> String {
+    "./secrets/uplink/venue.key".to_string()
+}
+
+fn default_uplink_live_bitrate() -> i32 {
+    16000
+}
+
+fn default_uplink_retain_events() -> usize {
+    5000
+}
+
+impl Default for UplinkConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            server: String::new(),
+            server_name: String::new(),
+            ca_file: default_uplink_ca_file(),
+            cert_file: default_uplink_cert_file(),
+            key_file: default_uplink_key_file(),
+            public_url: String::new(),
+            live: true,
+            live_bitrate: default_uplink_live_bitrate(),
+            include_partials: false,
+            retain_events: default_uplink_retain_events(),
+        }
+    }
+}
+
+impl UplinkConfig {
+    /// 証明書と照らし合わせる名前(`server_name`、無ければ `server` のホスト部分。IPv6 の [] は外す)
+    pub fn effective_server_name(&self) -> String {
+        if !self.server_name.is_empty() {
+            return self.server_name.clone();
+        }
+        let host = match self.server.rsplit_once(':') {
+            Some((h, p)) if p.parse::<u16>().is_ok() => h,
+            _ => self.server.as_str(),
+        };
+        host.trim_start_matches('[').trim_end_matches(']').to_string()
+    }
+}
+
+/// 中継サーバ(`dcr-transcribe --relay`)の設定
+///
+/// 閲覧画面の配信は `[remote]`(listen・ログイン・Turnstile など、cloudflared から受ける)、ライブの AAC は `[live]` を使う。
+/// ここには会場からの QUIC の受け口(mTLS)を書く。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RelayConfig {
+    /// QUIC(UDP)の待ち受け
+    #[serde(default = "default_relay_listen")]
+    pub listen: String,
+    /// 中継サーバの証明書と鍵(私設 CA の署名)
+    #[serde(default = "default_relay_cert_file")]
+    pub cert_file: String,
+    #[serde(default = "default_relay_key_file")]
+    pub key_file: String,
+    /// 会場のクライアント証明書を確かめる CA
+    #[serde(default = "default_uplink_ca_file")]
+    pub client_ca_file: String,
+    /// 受け取った区間録音を置くディレクトリ
+    #[serde(default = "default_relay_dir")]
+    pub dir: String,
+}
+
+fn default_relay_listen() -> String {
+    "[::]:8443".to_string()
+}
+
+fn default_relay_cert_file() -> String {
+    "./secrets/uplink/relay.pem".to_string()
+}
+
+fn default_relay_key_file() -> String {
+    "./secrets/uplink/relay.key".to_string()
+}
+
+fn default_relay_dir() -> String {
+    "./relay-data".to_string()
+}
+
+impl Default for RelayConfig {
+    fn default() -> Self {
+        Self {
+            listen: default_relay_listen(),
+            cert_file: default_relay_cert_file(),
+            key_file: default_relay_key_file(),
+            client_ca_file: default_uplink_ca_file(),
+            dir: default_relay_dir(),
+        }
+    }
+}
+
+/// 時計のずれの監視(SNTP で問い合わせて測るだけで、時計は直さない)
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ClockConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 比べる NTP サーバ(`host` か `host:port`)
+    #[serde(default = "default_clock_server")]
+    pub server: String,
+    /// 問い合わせの間隔(秒、16 以上)
+    #[serde(default = "default_clock_interval_secs")]
+    pub interval_secs: u64,
+    /// これ以上ずれていたら警告する(ms)
+    #[serde(default = "default_clock_warn_ms")]
+    pub warn_ms: i64,
+}
+
+fn default_clock_server() -> String {
+    "time.cloudflare.com".to_string()
+}
+
+fn default_clock_interval_secs() -> u64 {
+    64
+}
+
+fn default_clock_warn_ms() -> i64 {
+    crate::clock::DEFAULT_WARN_MS
+}
+
+impl Default for ClockConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            server: default_clock_server(),
+            interval_secs: default_clock_interval_secs(),
+            warn_ms: default_clock_warn_ms(),
+        }
+    }
 }
 
 /// リモート閲覧用 HTTP/SSE サーバ設定
 ///
 /// `axum` ベースの軽量サーバを localhost で起動し、Cloudflare Tunnel 経由で公開する想定。
-/// 確定結果のみリアルタイム配信(転送量最小化のため)。
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RemoteConfig {
     #[serde(default = "default_remote_enabled")]
@@ -83,6 +274,75 @@ pub struct RemoteConfig {
     /// bot 確認を通ったあと、再確認なしで使える時間(時間)
     #[serde(default = "default_remote_session_hours")]
     pub session_hours: u64,
+    /// Tor 経由(Cloudflare の `CF-IPCountry: T1`)を拒否する。`allowed_countries` が空でも効く
+    #[serde(default = "default_true")]
+    pub block_tor: bool,
+    /// アクセスログ(1 リクエスト 1 行の JSON、ログの target は `access`)を出す
+    #[serde(default = "default_true")]
+    pub access_log: bool,
+    /// iCloud プライベートリレー経由のアクセスを拒否する(Apple が公開している出口 IP の一覧と
+    /// Cloudflare の `CF-Connecting-IP` を照らし合わせる。Cloudflare 経由の要求だけに効く)
+    #[serde(default)]
+    pub block_private_relay: bool,
+    /// プライベートリレーの出口 IP の一覧(1 日ごとに取り直す)
+    #[serde(default = "default_private_relay_url")]
+    pub private_relay_url: String,
+    /// 一覧の手元の写し(起動直後や取り直せないときに使う)
+    #[serde(default = "default_private_relay_cache")]
+    pub private_relay_cache: String,
+    /// Sec-Fetch-* の無い要求を断る(対応していないブラウザ。curl で調べるときだけ false にする)
+    #[serde(default = "default_true")]
+    pub require_fetch_metadata: bool,
+    /// ブラウザの版の下限(古ければ「対応していません」を出す)
+    #[serde(default)]
+    pub browser: BrowserPolicy,
+}
+
+/// ブラウザの版の下限。既定は Sec-Fetch-* などの必要な機能が使える版。本番の前に新しめの版へ上げてよい
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct BrowserPolicy {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Chrome・Edge・Android の WebView などの Chromium 系(major)
+    #[serde(default = "default_min_chromium")]
+    pub min_chromium: u32,
+    /// Safari と、iPhone / iPad のすべてのブラウザ(WebKit、"16.4" の形)
+    #[serde(default = "default_min_safari")]
+    pub min_safari: String,
+    /// Firefox(major)
+    #[serde(default = "default_min_firefox")]
+    pub min_firefox: u32,
+}
+
+fn default_min_chromium() -> u32 {
+    120
+}
+
+fn default_min_safari() -> String {
+    "16.4".to_string()
+}
+
+fn default_min_firefox() -> u32 {
+    128
+}
+
+impl Default for BrowserPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_chromium: default_min_chromium(),
+            min_safari: default_min_safari(),
+            min_firefox: default_min_firefox(),
+        }
+    }
+}
+
+fn default_private_relay_url() -> String {
+    crate::private_relay::APPLE_EGRESS_URL.to_string()
+}
+
+fn default_private_relay_cache() -> String {
+    "./private-relay-egress.csv".to_string()
 }
 
 fn default_remote_login_key_file() -> String {
@@ -390,6 +650,8 @@ pub enum AudioFormat {
 /// - `audio_format`: "flac" (FLAC形式)
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TranscribeConfig {
+    #[serde(default)]
+    pub aws: AwsConfig,
     #[serde(default = "default_backend")]
     pub backend: TranscribeBackendType,
     #[serde(default = "default_region")]
@@ -415,6 +677,45 @@ pub struct TranscribeConfig {
     /// 音声の場合は24000〜64000を推奨、高品質の場合は128000まで
     #[serde(default = "default_opus_bitrate")]
     pub opus_bitrate: i32,
+}
+
+/// アプリの設定ファイルから指定する AWS 認証。未指定なら SDK 標準の認証を使う。
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AwsConfig {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub profile: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub access_key_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub secret_access_key: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub session_token: String,
+}
+
+impl std::fmt::Debug for AwsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AwsConfig")
+            .field("profile", &self.profile)
+            .field("access_key_id", &"[redacted]")
+            .field("secret_access_key", &"[redacted]")
+            .field("session_token", &"[redacted]")
+            .finish()
+    }
+}
+
+impl AwsConfig {
+    pub fn validate(&self) -> Result<()> {
+        let key = !self.access_key_id.is_empty();
+        let secret = !self.secret_access_key.is_empty();
+        anyhow::ensure!(key == secret, "transcribe.aws: access_key_id と secret_access_key は両方指定してください");
+        anyhow::ensure!(self.session_token.is_empty() || key, "transcribe.aws: session_token にはアクセスキーも必要です");
+        anyhow::ensure!(self.profile.is_empty() || !key, "transcribe.aws: profile とアクセスキーは同時に指定できません");
+        for value in [&self.profile, &self.access_key_id, &self.secret_access_key, &self.session_token] {
+            anyhow::ensure!(value.trim() == value, "transcribe.aws: 値の前後に空白を入れないでください");
+        }
+        Ok(())
+    }
 }
 
 /// OpenAI Whisper API 設定
@@ -451,20 +752,7 @@ pub struct OutputConfig {
     pub log_level: String,
 }
 
-/// FLAC圧縮設定
-///
-/// Amazon Transcribeに送信する音声データのFLAC圧縮に関する設定。
-///
-/// # デフォルト値
-///
-/// - `compression_level`: 5 (バランス型、0-8の範囲)
-/// - `enabled`: true (FLAC圧縮を使用)
-///
-/// # 圧縮レベル
-///
-/// - 0: 最速（圧縮率低）
-/// - 5: バランス型（推奨）
-/// - 8: 最高圧縮（処理時間長）
+/// FLAC 設定。現在の文字起こし処理では参照されない。
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct FlacConfig {
     #[serde(default = "default_flac_compression_level")]
@@ -554,7 +842,7 @@ fn default_flac_compression_level() -> u32 {
 }
 
 fn default_flac_enabled() -> bool {
-    true // デフォルトでFLAC圧縮を使用
+    true
 }
 
 fn default_backend() -> TranscribeBackendType {
@@ -595,6 +883,9 @@ impl Default for Config {
             segments: SegmentConfig::default(),
             live: LiveConfig::default(),
             tunnel: TunnelConfig::default(),
+            uplink: UplinkConfig::default(),
+            relay: RelayConfig::default(),
+            clock: ClockConfig::default(),
 
             channels: vec![
                 ChannelConfig {
@@ -645,6 +936,7 @@ impl Default for BufferConfig {
 impl Default for TranscribeConfig {
     fn default() -> Self {
         Self {
+            aws: AwsConfig::default(),
             backend: default_backend(),
             region: default_region(),
             language_code: default_language_code(),
@@ -678,6 +970,35 @@ impl Default for FlacConfig {
 }
 
 impl Config {
+    /// 外部サービスやデバイスを開く前に、処理を成立させる設定か確認する。
+    pub fn validate(&self) -> Result<()> {
+        self.transcribe.aws.validate()?;
+        anyhow::ensure!(self.audio.sample_rate > 0, "audio.sample_rate は 0 より大きい値が必要です");
+        anyhow::ensure!(self.audio.channels > 0, "audio.channels は 0 より大きい値が必要です");
+        anyhow::ensure!(self.transcribe.sample_rate > 0, "transcribe.sample_rate は 0 より大きい値が必要です");
+        anyhow::ensure!(self.vad.threshold_db.is_finite(), "vad.threshold_db は有限値が必要です");
+        let mut ids = std::collections::HashSet::new();
+        for channel in self.channels.iter().filter(|c| c.enabled) {
+            anyhow::ensure!(channel.id < self.audio.channels as usize, "チャンネル {} の id が audio.channels の範囲外です", channel.id);
+            anyhow::ensure!(ids.insert(channel.id), "チャンネル id {} が重複しています", channel.id);
+        }
+        if self.uplink.enabled {
+            anyhow::ensure!(
+                self.uplink.server.rsplit_once(':').is_some_and(|(h, p)| !h.is_empty() && p.parse::<u16>().is_ok()),
+                "uplink.server は `IP:ポート` か `名前:ポート` で指定してください"
+            );
+        }
+        if self.transcribe.backend == TranscribeBackendType::Whisper {
+            let whisper = self.whisper.as_ref().context("Whisper設定が見つかりません")?;
+            anyhow::ensure!(whisper.sample_rate > 0 && whisper.chunk_duration_secs > 0,
+                "Whisper の sample_rate と chunk_duration_secs は 0 より大きい値が必要です");
+            whisper.chunk_duration_secs.checked_mul(whisper.sample_rate as u64)
+                .and_then(|n| usize::try_from(n).ok())
+                .context("Whisper のチャンク設定が大きすぎます")?;
+        }
+        Ok(())
+    }
+
     /// 設定ファイルから読み込み
     ///
     /// TOML形式の設定ファイルをパースしてConfig構造体を生成する。
@@ -701,6 +1022,7 @@ impl Config {
             .with_context(|| format!("設定ファイルの読み込みに失敗: {:?}", path.as_ref()))?;
         let config: Config =
             toml::from_str(&content).with_context(|| "設定ファイルのパースに失敗")?;
+        config.validate()?;
         Ok(config)
     }
 
@@ -896,4 +1218,71 @@ name = "Test Channel"
         assert_eq!(config.audio.channels, 4);
         assert_eq!(config.vad.threshold_db, -40.0);
     }
+    #[test]
+    fn invalid_config_is_rejected_on_load() {
+        for content in ["[audio]\nsample_rate = 0", "[audio]\nchannels = 0", "[transcribe]\nsample_rate = 0", "[vad]\nthreshold_db = nan", "[vad]\nthreshold_db = inf", "[[channels]]\nid = 4\nname = 'bad'\nenabled = true", "[[channels]]\nid = 0\nname = 'a'\nenabled = true\n[[channels]]\nid = 0\nname = 'b'\nenabled = true", "[transcribe]\nbackend = 'whisper'"] {
+            let file = NamedTempFile::new().unwrap();
+            std::fs::write(file.path(), content).unwrap();
+            assert!(Config::load_or_default(file.path()).is_err(), "{content}");
+        }
+    }
+
+    #[test]
+    fn whisper_chunk_validation() {
+        for (rate, seconds, valid) in [(16000, 5, true), (0, 5, false), (16000, 0, false), (48000, u64::MAX, false)] {
+            let mut cfg = Config::default();
+            cfg.transcribe.backend = TranscribeBackendType::Whisper;
+            cfg.whisper = Some(WhisperConfig { api_key: "test".into(), model: "whisper-1".into(), language: None, sample_rate: rate, chunk_duration_secs: seconds });
+            assert_eq!(cfg.validate().is_ok(), valid);
+        }
+    }
+
+    #[test]
+    fn example_config_is_valid() {
+        let cfg: Config = toml::from_str(include_str!("../config.toml.example")).unwrap();
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn relay_example_config_is_valid() {
+        let cfg: Config = toml::from_str(include_str!("../relay.toml.example")).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.relay.client_ca_file, "./secrets/uplink/ca.pem");
+        assert!(cfg.remote.unwrap().enabled);
+    }
+
+    #[test]
+    fn deploy_relay_config_is_valid() {
+        let cfg: Config = toml::from_str(include_str!("../deploy/relay/etc/relay.toml")).unwrap();
+        cfg.validate().unwrap();
+        let remote = cfg.remote.unwrap();
+        assert_eq!(remote.allowed_countries, vec!["JP"]);
+        assert!(remote.block_tor && remote.access_log);
+        assert!(!cfg.tunnel.enabled, "cloudflared は別サービスで動かす");
+    }
+
+    #[test]
+    fn uplink_server_needs_port_and_gives_name() {
+        let mut cfg = Config::default();
+        cfg.uplink.enabled = true;
+        for bad in ["", "203.0.113.5", "wss://relay.example.com/uplink", ":443"] {
+            cfg.uplink.server = bad.into();
+            assert!(cfg.validate().is_err(), "{}", bad);
+        }
+        cfg.uplink.server = "203.0.113.5:443".into();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.uplink.effective_server_name(), "203.0.113.5");
+        cfg.uplink.server = "[2001:db8::5]:443".into();
+        assert_eq!(cfg.uplink.effective_server_name(), "2001:db8::5");
+        cfg.uplink.server_name = "relay.example.com".into();
+        assert_eq!(cfg.uplink.effective_server_name(), "relay.example.com");
+    }
+
+    #[test]
+    fn disabled_channel_ids_do_not_require_device_inputs() {
+        let mut cfg = Config::default();
+        cfg.channels.push(ChannelConfig { id: 999, name: "disabled".into(), enabled: false });
+        cfg.validate().unwrap();
+    }
+
 }

@@ -87,6 +87,8 @@ pub struct ChannelProcessor {
     vad_threshold_db: f32,
     buffer: AudioBuffer,
     wav_writer: WavWriter,
+    recording_failed: bool,
+    input_quality: crate::input_quality::InputQualityMonitor,
     transcribe_tx: Option<mpsc::Sender<Vec<i16>>>,
     transcribe_rx: Option<mpsc::Receiver<TranscriptResult>>,
     transcribe_backend: Option<Box<dyn TranscribeBackend>>,
@@ -175,6 +177,8 @@ impl ChannelProcessor {
             vad_threshold_db: vad_config.threshold_db,
             buffer,
             wav_writer,
+            recording_failed: false,
+            input_quality: crate::input_quality::InputQualityMonitor::new(sample_rate, vad_config.threshold_db),
             transcribe_tx: None,
             transcribe_rx: None,
             transcribe_backend: Some(transcribe_backend),
@@ -274,7 +278,40 @@ impl ChannelProcessor {
         let samples = &chunk.samples;
 
         // 1. WAVファイルに書き込み（無音含む全データ）
-        self.wav_writer.write_samples(samples)?;
+        if !self.recording_failed {
+            if let Err(error) = self.wav_writer.write_chunk(&chunk) {
+                self.recording_failed = true;
+                let message = format!("全音声の録音停止: {error:#}");
+                log::error!("チャンネル {}: {}", self.channel_id, message);
+                if let Some(state) = &self.tui_state {
+                    state.update_channel(self.channel_id, |channel| channel.recording_error = Some(message));
+                }
+            }
+        }
+
+        let previous_warning = self.input_quality.warning();
+        self.input_quality.process(&chunk);
+        let warning = self.input_quality.warning();
+        if warning != previous_warning {
+            if let Some(message) = &warning {
+                log::warn!("チャンネル {}: {}", self.channel_id, message);
+            } else {
+                log::info!("チャンネル {}: 入力品質警告を解除", self.channel_id);
+            }
+            if let Some(state) = &self.tui_state {
+                state.update_channel(self.channel_id, |channel| channel.input_quality_warning = warning.clone());
+            }
+            if !self.recording_failed {
+                if let Err(error) = self.wav_writer.record_input_quality(chunk.timestamp_ns, warning.as_deref()) {
+                    self.recording_failed = true;
+                    let message = format!("全音声の録音停止（入力品質記録エラー）: {error:#}");
+                    log::error!("チャンネル {}: {}", self.channel_id, message);
+                    if let Some(state) = &self.tui_state {
+                        state.update_channel(self.channel_id, |channel| channel.recording_error = Some(message));
+                    }
+                }
+            }
+        }
 
         // 2. バッファに追加
         self.buffer.push(BufferedChunk {
@@ -297,6 +334,11 @@ impl ChannelProcessor {
                         self.channel_id,
                         e
                     );
+                    if let Some(state) = &self.tui_state {
+                        state.update_channel(self.channel_id, |channel| {
+                            channel.recording_error = Some(format!("発話区間の録音停止: {e:#}"));
+                        });
+                    }
                     self.segment_recorder = None;
                 }
             }
@@ -490,7 +532,7 @@ impl ChannelProcessor {
 
             // 無音 + 接続中 → カウント増加、閾値超過で切断
             (false, TranscribeConnectionState::Connected) => {
-                self.silence_duration_ms += chunk_duration_ms;
+                self.silence_duration_ms = self.silence_duration_ms.saturating_add(chunk_duration_ms);
 
                 if self.silence_duration_ms >= self.silence_threshold_ms {
                     log::info!(
@@ -682,7 +724,7 @@ impl ChannelProcessor {
         self.transcribe_tx = None;
 
         // WAVファイルを終了
-        self.wav_writer.finalize()?;
+        let wav_result = self.wav_writer.finalize();
 
         // 録音中の区間を閉じる
         if let Some(recorder) = &mut self.segment_recorder {
@@ -691,7 +733,7 @@ impl ChannelProcessor {
             }
         }
 
-        Ok(())
+        wav_result
     }
 
     /// チャンネルIDを取得
@@ -724,51 +766,15 @@ impl ChannelProcessor {
         self.vad.get_last_volume_db()
     }
 
-    /// フィラーワード（言い淀み）を削除
-    ///
-    /// 全位置(文頭・文中・文末・連続)に出現するフィラーを除去する。
-    /// 長いフィラーから先に除去することで、`あのー` を `あの` で剥がしてしまい
-    /// 残骸 `ー` を出すといった部分一致問題を回避する。
-    pub fn remove_filler_words(text: &str) -> String {
-        // 長さ降順(同長は任意)に並べる: 長いほうを先に除去
-        let filler_words = [
-            "あのー", "ええと", "えーと", "えっと", "っとー",
-            "えー", "ええ", "あの", "っと",
-        ];
-
-        let mut result = text.to_string();
-        for filler in &filler_words {
-            // String::replace は非重複の全マッチを置換するので、これだけで
-            // 文頭・文中・文末・連続出現すべてに対応できる
-            result = result.replace(filler, "");
-        }
-
-        // 連続する空白を1つにまとめる
-        while result.contains("  ") {
-            result = result.replace("  ", " ");
-        }
-
-        // 前後の空白を削除
-        result.trim().to_string()
+    /// 認識された言葉を保持し、表示用に前後の空白だけを除去する。
+    /// 日本語の部分一致によるフィラー除去は「もっと」「あの建物」なども壊す。
+    pub fn normalize_transcript(text: &str) -> String {
+        text.trim().to_string()
     }
 
-    /// 句読点のみの行かどうかをチェック
+    /// 句読点のみの行かどうかをチェック。
     pub fn is_punctuation_only(text: &str) -> bool {
-        let trimmed = text.trim();
-
-        // 空文字列の場合はtrue
-        if trimmed.is_empty() {
-            return true;
-        }
-
-        // 句読点のみで構成されているかチェック
-        // 「、」「。」「と。」のような組み合わせ
-        let allowed_chars = ['、', '。', 'と'];
-
-        // すべての文字が許可された文字かチェック
-        let all_punctuation = trimmed.chars().all(|c| allowed_chars.contains(&c));
-
-        all_punctuation
+        text.trim().chars().all(|c| matches!(c, '、' | '。'))
     }
 
     /// サンプルのRMS（二乗平均平方根）を計算
@@ -844,11 +850,11 @@ impl ChannelProcessor {
     pub fn add_transcript_to_tui(&self, result: &TranscriptResult) {
         if let Some(tui_state) = &self.tui_state {
             let text_to_display = if result.is_partial {
-                // 部分結果はフィラーワード削除しない（リアルタイム性を優先）
+                // 部分結果は受信したまま表示する。
                 result.text.clone()
             } else {
-                // 確定結果のみフィラーワードを削除
-                let cleaned_text = Self::remove_filler_words(&result.text);
+                // 確定後も認識された言葉を保持する。
+                let cleaned_text = Self::normalize_transcript(&result.text);
 
                 // 空文字列または句読点のみの場合は追加しない
                 if cleaned_text.is_empty() || Self::is_punctuation_only(&cleaned_text) {
@@ -896,6 +902,7 @@ mod tests {
         };
 
         let transcribe_config = TranscribeConfig {
+            aws: Default::default(),
             backend: TranscribeBackendType::Aws,
             region: "ap-northeast-1".to_string(),
             language_code: "ja-JP".to_string(),
@@ -928,75 +935,22 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    // ─────────────────────────────────────────────────────────────────
-    // remove_filler_words: フィラーワード除去
-    // ─────────────────────────────────────────────────────────────────
-
     #[test]
-    fn filler_empty_string() {
-        assert_eq!(ChannelProcessor::remove_filler_words(""), "");
+    fn transcript_preserves_meaningful_japanese_and_fillers() {
+        for text in [
+            "もっと右", "ちょっと待って", "ずっと待機", "あの建物の前",
+            "ええ、そのとおりです", "えっと、入口へ向かってください",
+            "今日はえっと明日です", "えっと", "と", "hello  えっと world",
+        ] {
+            assert_eq!(ChannelProcessor::normalize_transcript(text), text);
+        }
     }
 
     #[test]
-    fn filler_no_filler() {
-        assert_eq!(
-            ChannelProcessor::remove_filler_words("こんにちは"),
-            "こんにちは"
-        );
-    }
-
-    #[test]
-    fn filler_only_one_filler() {
-        assert_eq!(ChannelProcessor::remove_filler_words("えっと"), "");
-    }
-
-    #[test]
-    fn filler_at_start() {
-        assert_eq!(
-            ChannelProcessor::remove_filler_words("えっと、こんにちは"),
-            "、こんにちは"
-        );
-    }
-
-    #[test]
-    fn filler_at_end() {
-        assert_eq!(
-            ChannelProcessor::remove_filler_words("こんにちはえっと"),
-            "こんにちは"
-        );
-    }
-
-    #[test]
-    fn filler_in_middle() {
-        // 期待: 中央のフィラーも除去される
-        assert_eq!(
-            ChannelProcessor::remove_filler_words("今日はえっと明日です"),
-            "今日は明日です"
-        );
-    }
-
-    #[test]
-    fn filler_consecutive_at_start() {
-        // 期待: 連続するフィラーをすべて除去
-        assert_eq!(
-            ChannelProcessor::remove_filler_words("えっとえっと、こんにちは"),
-            "、こんにちは"
-        );
-    }
-
-    #[test]
-    fn filler_with_surrounding_spaces() {
-        assert_eq!(
-            ChannelProcessor::remove_filler_words("hello えっと world"),
-            "hello world"
-        );
-    }
-
-    #[test]
-    fn filler_collapses_double_spaces() {
-        let r = ChannelProcessor::remove_filler_words("a えっと  b");
-        // 二重スペースが圧縮される
-        assert!(!r.contains("  "), "should not contain double space, got: {:?}", r);
+    fn transcript_trims_only_outer_whitespace() {
+        assert_eq!(ChannelProcessor::normalize_transcript(""), "");
+        assert_eq!(ChannelProcessor::normalize_transcript("  \n"), "");
+        assert_eq!(ChannelProcessor::normalize_transcript("  もっと右。\n"), "もっと右。");
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -1024,11 +978,9 @@ mod tests {
     }
 
     #[test]
-    fn punct_と_is_treated_as_punctuation() {
-        // 元実装の仕様: フィラー除去で残った "と" を捨てる目的で 'と' を許可文字に含めている。
-        // 副作用として、"と" 単体や "とと" は punctuation_only と判定される。
-        assert!(ChannelProcessor::is_punctuation_only("と"));
-        assert!(ChannelProcessor::is_punctuation_only("、と。"));
+    fn punct_preserves_japanese_characters() {
+        assert!(!ChannelProcessor::is_punctuation_only("と"));
+        assert!(!ChannelProcessor::is_punctuation_only("、と。"));
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -1195,6 +1147,7 @@ mod tests {
             samples: vec![0; 1600],
             format: crate::types::AudioFormat { sample_rate: 16000, channels: 1 },
             timestamp_ns: received_ns - 100_000_000,
+            capture: None,
         };
         proc.process_chunk(silence).await.unwrap();
         assert!(origins.lock().unwrap().is_empty());
@@ -1203,6 +1156,7 @@ mod tests {
             samples: (0..1600).map(|i| ((i as f32 * 0.1).sin() * 10000.0) as i16).collect(),
             format: crate::types::AudioFormat { sample_rate: 16000, channels: 1 },
             timestamp_ns: received_ns,
+            capture: None,
         };
         proc.process_chunk(voice).await.unwrap();
 
@@ -1212,4 +1166,38 @@ mod tests {
             + std::time::Duration::from_nanos((received_ns - 100_000_000) as u64);
         assert_eq!(got[0], expected);
     }
+    #[tokio::test]
+    async fn recording_failure_is_visible_and_transcription_continues() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("recordings");
+        let mut proc = ChannelProcessor::new(
+            &ChannelConfig { id: 0, name: "test".into(), enabled: true },
+            &VadConfig::default(), &BufferConfig::default(), &TranscribeConfig::default(), None,
+            &OutputConfig { wav_output_dir: output.to_string_lossy().into_owned(), log_level: "info".into() },
+            16000, std::time::SystemTime::now(),
+        ).await.unwrap();
+        // 書き込み先をファイルで塞ぎ、ディスク I/O エラーを再現。
+        std::fs::remove_dir(&output).unwrap();
+        std::fs::write(&output, "blocked").unwrap();
+        let state = TuiState::new();
+        state.add_channel(0, "test".into());
+        proc.set_tui_state(state.clone());
+        let origins = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        proc.transcribe_backend = Some(Box::new(OriginRecorder {
+            origins: origins.clone(), audio_rx: None, _result_tx: None,
+        }));
+        for _ in 0..2 {
+            proc.process_chunk(AudioChunk {
+                samples: vec![10000; 1600],
+                format: crate::types::AudioFormat { sample_rate: 16000, channels: 1 },
+                timestamp_ns: 1_700_000_000_000_000_000,
+            capture: None,
+            }).await.unwrap();
+        }
+        assert!(proc.recording_failed);
+        assert!(state.get_channel(0).unwrap().recording_error.unwrap().contains("全音声の録音停止"));
+        assert_eq!(origins.lock().unwrap().len(), 1);
+        assert_eq!(proc.connection_state, TranscribeConnectionState::Connected);
+    }
+
 }

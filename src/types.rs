@@ -48,7 +48,8 @@ pub struct AudioFormat {
 /// let chunk = AudioChunk {
 ///     samples: vec![0i16; 1600], // 100ms分 @ 16kHz
 ///     format: AudioFormat { sample_rate: 16000, channels: 1 },
-///     timestamp_ns: 1_000_000_000, // 1秒
+///     timestamp_ns: 1_000_000_000, // 受信時刻
+///     capture: None,
 /// };
 /// ```
 #[derive(Clone, Debug)]
@@ -59,10 +60,19 @@ pub struct AudioChunk {
     /// オーディオフォーマット情報
     pub format: AudioFormat,
 
-    /// このチャンクの開始タイムスタンプ (ナノ秒)
-    ///
-    /// UNIX_EPOCHからの経過時間
+    /// コールバック受信時の PC 時計 (UNIX_EPOCH からのナノ秒)。
+    /// 音声先頭の厳密な取得時刻ではない。
     pub timestamp_ns: u128,
+    /// 実入力では Some。合成・テスト入力では None。
+    pub capture: Option<CaptureTiming>,
+}
+
+/// 入力ストリーム内の位置。キューへ送れなかったサンプルも番号を進める。
+#[derive(Clone, Copy, Debug)]
+pub struct CaptureTiming {
+    pub frame_index: u64,
+    pub monotonic_ns: u128,
+    pub synthetic: bool,
 }
 
 /// バッファリングされたチャンク
@@ -191,6 +201,14 @@ pub struct TranscriptResult {
     /// 部分結果の安定性（部分結果の場合のみ有効）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stability: Option<Stability>,
+
+    /// 発話の終わり(開始時刻からの経過秒、音声の時刻)。Transcribe が返したときだけ。遅延の表示に使う
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_end_seconds: Option<f64>,
+
+    /// 結果を受け取った時刻(UNIX ミリ秒、この機械の時計)
+    #[serde(skip)]
+    pub received_unix_ms: u64,
 }
 
 impl TranscriptResult {
@@ -236,12 +254,10 @@ impl TranscriptResult {
         let unix = now
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default();
-        let timestamp = chrono::DateTime::from_timestamp(
-            unix.as_secs() as i64,
-            unix.subsec_nanos(),
-        )
-        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
-        .unwrap_or_default();
+        let timestamp =
+            chrono::DateTime::from_timestamp(unix.as_secs() as i64, unix.subsec_nanos())
+                .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+                .unwrap_or_default();
 
         Self {
             channel,
@@ -250,6 +266,8 @@ impl TranscriptResult {
             text,
             is_partial,
             stability,
+            audio_end_seconds: None,
+            received_unix_ms: unix.as_millis() as u64,
         }
     }
 
@@ -277,12 +295,10 @@ impl TranscriptResult {
         let unix = now
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default();
-        let timestamp = chrono::DateTime::from_timestamp(
-            unix.as_secs() as i64,
-            unix.subsec_nanos(),
-        )
-        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
-        .unwrap_or_default();
+        let timestamp =
+            chrono::DateTime::from_timestamp(unix.as_secs() as i64, unix.subsec_nanos())
+                .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+                .unwrap_or_default();
 
         Self {
             channel,
@@ -291,6 +307,8 @@ impl TranscriptResult {
             text,
             is_partial,
             stability,
+            audio_end_seconds: None,
+            received_unix_ms: unix.as_millis() as u64,
         }
     }
 }
@@ -318,6 +336,7 @@ mod tests {
                 channels: 1,
             },
             timestamp_ns: 1_000_000_000,
+            capture: None,
         };
         assert_eq!(chunk.samples.len(), 1600);
         assert_eq!(chunk.format.sample_rate, 16000);
@@ -356,7 +375,8 @@ mod tests {
     #[test]
     fn test_transcript_result_creation() {
         let start_time = SystemTime::now();
-        let result = TranscriptResult::new(0, "テストメッセージ".to_string(), false, None, start_time);
+        let result =
+            TranscriptResult::new(0, "テストメッセージ".to_string(), false, None, start_time);
 
         assert_eq!(result.channel, 0);
         assert_eq!(result.text, "テストメッセージ");
@@ -368,7 +388,13 @@ mod tests {
     #[test]
     fn test_transcript_result_json_serialization() {
         let start_time = SystemTime::now();
-        let result = TranscriptResult::new(1, "こんにちは".to_string(), true, Some(Stability::High), start_time);
+        let result = TranscriptResult::new(
+            1,
+            "こんにちは".to_string(),
+            true,
+            Some(Stability::High),
+            start_time,
+        );
 
         let json = serde_json::to_string(&result).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -399,7 +425,12 @@ mod tests {
         let after_dot = &r.timestamp[dot_pos + 1..];
         // "234Z" のような形
         let frac = &after_dot[..after_dot.len() - 1]; // Z を除く
-        assert_eq!(frac.len(), 3, "milliseconds should be 3 digits, got: {}", frac);
+        assert_eq!(
+            frac.len(),
+            3,
+            "milliseconds should be 3 digits, got: {}",
+            frac
+        );
         assert!(frac.chars().all(|c| c.is_ascii_digit()));
     }
 

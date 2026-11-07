@@ -321,7 +321,7 @@ fn rand_serial() -> u32 {
     use std::time::{SystemTime, UNIX_EPOCH};
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_nanos();
     (now as u32) ^ 0xDEADBEEF
 }

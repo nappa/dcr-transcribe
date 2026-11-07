@@ -1,6 +1,8 @@
 //! リモート閲覧用の HTTP/SSE サーバ
 //!
 //! `axum` で軽量サーバを localhost に立て、Cloudflare Tunnel (`cloudflared`) で公開する想定。
+//! 同じサーバを中継サーバ(`crate::relay`)でも使う。そのときは会場からのアップリンクでデータが入り、
+//! 会場との接続状態を `event: up` で配信する。
 //!
 //! # エンドポイント
 //!
@@ -10,11 +12,13 @@
 //!     - 続いて `event: msg` で履歴(直近 N 件、または `Last-Event-ID` 以降)を流す
 //!     - 以降、新規イベントを `event: msg` で順次配信
 //!     - 発話区間の録音が閉じるたびに `event: seg` を配信(ID なし、再接続時は `/segments` で回収)
+//!     - 中継サーバのときだけ、会場との接続状態を `event: up` で配信(`{"on":true,"rtt":85,...}` / `{"on":false,"t":<最終受信 UNIX ms>}`)
+//!     - 10 秒ごとに `event: hb`(`{"ms":<サーバの UNIX ms>,"so":<サーバの時計のずれ ms>}`)。画面は途絶えたら止まったと判断する
 //! - `GET /history` - 過去の文字起こし
 //! - `GET /segments?after=<id>` - 録音区間の一覧(`after` より新しいもの)
 //! - `GET /live?c=<id>,<id>` - 選んだチャンネルをミックスしたライブ音声(AAC/ADTS の連続ストリーム)
 //! - `GET /audio/{id}` - 録音区間の AAC / WAV(Range リクエスト対応、iOS Safari の再生に必須)
-//! - `GET /healthz` - "ok" 返却
+//! - `GET /healthz` - "ok" 返却(画面が Cloudflare の先のサーバまで届くかを測るのにも使う)
 //! - `POST /verify` - Turnstile のトークンを検証してセッションクッキーを発行
 //! - `GET /session` - セッションが有効なら 204(期限切れを画面側で検知するため)
 //! - `GET /share` - 共有用のログインパス(`{"path":"/?k=..."}`)。ログイン済みの人だけ
@@ -24,6 +28,11 @@
 //!
 //! - `/healthz` 以外は国の制限(`CF-IPCountry`)を通ったものだけ
 //! - Turnstile が有効なら、`/` はセッションが無いと確認画面を返し、データ系はセッション必須
+//!
+//! # アクセスログ
+//!
+//! `[remote] access_log` が有効なら、1 リクエスト 1 行の JSON をログの target `access` に出す。
+//! クエリのログインキー(`k`)と共有 URL(`u`)は伏せる。SSE・ライブは応答を返し始めた時点で記録する
 //!
 //! # 細い回線向けの転送量対策
 //!
@@ -52,6 +61,8 @@
 //! - サーバタスクが落ちても他に波及しない
 
 use crate::access::AccessControl;
+use crate::clock::ClockMonitor;
+use crate::security::PageKind;
 use crate::config::{ChannelConfig, RemoteConfig};
 use crate::live::LiveHub;
 use crate::segment_recorder::SegmentInfo;
@@ -60,7 +71,7 @@ use anyhow::{Context, Result};
 use axum::body::Body;
 use axum::extract::{Path, Query, Request, State};
 use axum::middleware::{self, Next};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -72,10 +83,63 @@ use std::convert::Infallible;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 
 const HTML_PAGE: &str = include_str!("../static/index.html");
 const GATE_PAGE: &str = include_str!("../static/gate.html");
+/// ログイン直後・別サイトから開かれた直後に返す中継ページ。同じオリジンから `/` を開き直させる
+/// (セッションクッキーは SameSite=Strict なので、別サイトからの遷移には付かない。同じオリジンからなら付く)。
+/// `location.replace` なので、ログインキー付きの URL は履歴に残らない
+const RELOAD_PAGE: &str = "<!DOCTYPE html><html lang=\"ja\"><head><meta charset=\"utf-8\">\
+<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta name=\"robots\" content=\"noindex,nofollow\">\
+<meta name=\"referrer\" content=\"no-referrer\"><title>dcr-transcribe</title>\
+<noscript><meta http-equiv=\"refresh\" content=\"0;url=/\"></noscript>\
+<style>body{background:#0f1115;color:#888c95;font-family:-apple-system,sans-serif;display:flex;align-items:center;\
+justify-content:center;min-height:100vh;margin:0}a{color:#8cf}</style></head>\
+<body><p><a href=\"/\">開いています…</a></p><script>location.replace(\"/\"+location.hash)</script></body></html>";
+/// iCloud プライベートリレー経由で来た人への案内
+const PRIVATE_RELAY_PAGE: &str = "<!DOCTYPE html><html lang=\"ja\"><head><meta charset=\"utf-8\">\
+<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+<meta name=\"robots\" content=\"noindex,nofollow\"><title>dcr-transcribe</title>\
+<style>body{background:#0f1115;color:#e8eaed;font-family:-apple-system,sans-serif;\
+display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;padding:16px}\
+div{max-width:480px}h1{font-size:16px}p,li{color:#888c95;font-size:14px;line-height:1.7}</style></head>\
+<body><div><h1>iCloud プライベートリレー経由では開けません</h1>\
+<p>このページはプライベートリレーを使わずに開いてください。</p><ul>\
+<li>iPhone / iPad の Safari: アドレスバーの「ぁあ」(または「aA」)→「IP アドレスを表示」</li>\
+<li>Mac の Safari: メニューの「表示」→「IP アドレスを表示して再読み込み」</li>\
+<li>または 設定 →(自分の名前)→ iCloud →「プライベートリレー」をオフ</li>\
+</ul><p>切り替えたら、もう一度ログイン用の URL を開いてください。</p></div></body></html>";
+/// ログインの画面。`#k=<キー>` があれば、アドレスバーと履歴から消してから同じオリジンの `POST /login` で渡す
+const LOGIN_SCRIPT_PAGE: &str = "<!DOCTYPE html><html lang=\"ja\"><head><meta charset=\"utf-8\">\
+<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+<meta name=\"robots\" content=\"noindex,nofollow\"><meta name=\"referrer\" content=\"no-referrer\"><title>dcr-transcribe</title>\
+<style>body{background:#0f1115;color:#e8eaed;font-family:-apple-system,sans-serif;\
+display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;padding:16px}\
+h1{font-size:16px}p{color:#888c95;font-size:14px}</style></head>\
+<body><div><h1>dcr-transcribe</h1><p id=\"m\">ログイン用の URL を開いてください</p></div>\
+<script>(function(){var m=/(?:^#|&)k=([^&]+)/.exec(location.hash),p=document.getElementById(\"m\");if(!m)return;\
+history.replaceState(null,\"\",\"/\");p.textContent=\"ログインしています…\";\
+fetch(\"/login\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({k:decodeURIComponent(m[1])})})\
+.then(function(r){if(r.status===204){location.replace(\"/\");return}\
+p.textContent=r.status===403?\"ログインキーが違います\":\"ログインできませんでした(\"+r.status+\")\"})\
+.catch(function(){p.textContent=\"通信に失敗しました。もう一度ログイン用の URL を開いてください\"})})()</script></body></html>";
+/// Sec-Fetch-* を送らない(対応していない)ブラウザ・古すぎるブラウザへの案内(`{message}` を置き換える)
+const UNSUPPORTED_PAGE: &str = "<!DOCTYPE html><html lang=\"ja\"><head><meta charset=\"utf-8\">\
+<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+<meta name=\"robots\" content=\"noindex,nofollow\"><title>dcr-transcribe</title>\
+<style>body{background:#0f1115;color:#e8eaed;font-family:-apple-system,sans-serif;\
+display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;padding:16px}\
+h1{font-size:16px}p{color:#888c95;font-size:14px;line-height:1.7}</style></head>\
+<body><div><h1>このブラウザには対応していません</h1><p>{message}</p></div></body></html>";
+/// ログインできていないときの案内(`{message}` を置き換える)
+const LOGIN_PAGE: &str = "<!DOCTYPE html><html lang=\"ja\"><head><meta charset=\"utf-8\">\
+<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+<meta name=\"robots\" content=\"noindex,nofollow\"><title>dcr-transcribe</title>\
+<style>body{background:#0f1115;color:#e8eaed;font-family:-apple-system,sans-serif;\
+display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;padding:16px}\
+h1{font-size:16px}p{color:#888c95;font-size:14px}</style></head>\
+<body><div><h1>dcr-transcribe</h1><p>{message}</p></div></body></html>";
 /// broadcast バッファ容量。スロークライアントが本数ぶん遅れた時点で Lagged として切断される。
 /// 小さいほどスロークライアントを早く切るが、瞬間的なバースト時の誤切断も増える。
 const BROADCAST_CAPACITY: usize = 256;
@@ -83,26 +147,50 @@ const BROADCAST_CAPACITY: usize = 256;
 const MAX_SEGMENTS: usize = 1000;
 /// これより小さい JSON は圧縮しない(ヘッダのほうが大きくなる)
 const COMPRESS_MIN_BYTES: usize = 512;
+/// 心拍(`event: hb`)の間隔
+const HEARTBEAT: Duration = Duration::from_secs(10);
+/// アクセスログに残す User-Agent の長さ
+const ACCESS_LOG_UA_MAX: usize = 200;
 /// 状態の音量は、受信中はこの dB 以上動いたら送る
 const STATUS_LEVEL_STEP_RECEIVING: i8 = 6;
 /// 受信していないときの音量はこの dB 以上動いたときだけ送る(雑音の揺れで送らない)
 const STATUS_LEVEL_STEP_IDLE: i8 = 12;
 
 /// SSE で配信する1イベント(転送量最小化のため短いキー)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct WireEvent {
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub(crate) struct WireEvent {
     /// channel id
-    c: usize,
+    pub(crate) c: usize,
     /// timestamp_seconds (anchor からの経過秒)
-    s: f64,
+    pub(crate) s: f64,
     /// text
-    x: String,
+    pub(crate) x: String,
     /// partial フラグ。false なら省略
     #[serde(default, skip_serializing_if = "is_false")]
-    p: bool,
+    pub(crate) p: bool,
     /// 録音区間 ID。区間録音が無効なら省略
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    g: Option<u64>,
+    pub(crate) g: Option<u64>,
+    /// 発話の終わり(anchor からの経過秒)。画面が「話し終えてから表示まで」の遅延を出すのに使う
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) e: Option<f64>,
+    /// 会場が文字起こしの結果を受け取った時刻(UNIX ミリ秒、会場の時計)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) r: Option<u64>,
+}
+
+impl WireEvent {
+    pub(crate) fn from_result(result: &TranscriptResult, segment: Option<u64>) -> Self {
+        Self {
+            c: result.channel,
+            s: result.timestamp_seconds,
+            x: result.text.clone(),
+            p: result.is_partial,
+            g: segment,
+            e: result.audio_end_seconds.map(|e| (e * 1000.0).round() / 1000.0),
+            r: (result.received_unix_ms > 0).then_some(result.received_unix_ms),
+        }
+    }
 }
 
 /// `event: seg` / `/segments` で配信する録音区間
@@ -131,7 +219,51 @@ pub struct ChannelStatus {
 }
 
 /// 配信形式 `[c, l, r, x]`(l は -60〜0 dB の整数)
-type WireStatus = (usize, i8, u8, u8);
+pub(crate) type WireStatus = (usize, i8, u8, u8);
+
+impl ChannelStatus {
+    pub(crate) fn wire(&self) -> WireStatus {
+        (
+            self.channel,
+            self.level_db.clamp(-60.0, 0.0).round() as i8,
+            self.receiving as u8,
+            self.transcribe,
+        )
+    }
+}
+
+/// 会場との接続状態(中継サーバのときだけ配信する)
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize)]
+pub(crate) struct UpState {
+    pub(crate) on: bool,
+    /// 切断中なら、最後に会場から受け取った時刻(UNIX ミリ秒)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) t: Option<u64>,
+    /// 中継サーバ ⇄ 会場の往復時間(ms)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) rtt: Option<u32>,
+    /// 会場で送れずに溜まっている文字起こし・区間録音の数
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) q: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) k: Option<u32>,
+    /// 会場の時計 − 中継サーバの時計(ms)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) vo: Option<i64>,
+    /// ライブ音声の 会場で録ってから中継サーバに届くまで(ms、時計のずれを補正した片道)。聞いている人がいるときだけ
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) ld: Option<u32>,
+}
+
+/// `event: hb`
+#[derive(Debug, Clone, Copy, Serialize)]
+struct Heartbeat {
+    /// サーバの UNIX ミリ秒
+    ms: u64,
+    /// サーバの時計のずれ(サーバの時計 − 正しい時刻、ms)。測れていなければ省略
+    #[serde(skip_serializing_if = "Option::is_none")]
+    so: Option<i64>,
+}
 
 /// チャンネル状態の差分配信
 struct StatusStore {
@@ -162,7 +294,7 @@ impl StatusStore {
 }
 
 /// 前回送った状態から意味のある変化があったか
-fn status_changed(prev: Option<&WireStatus>, next: &WireStatus) -> bool {
+pub(crate) fn status_changed(prev: Option<&WireStatus>, next: &WireStatus) -> bool {
     let Some(prev) = prev else { return true };
     if prev.2 != next.2 || prev.3 != next.3 {
         return true;
@@ -218,10 +350,10 @@ struct StoredEvent {
     event: WireEvent,
 }
 
-#[derive(Debug, Clone, Serialize)]
-struct ChannelInfo {
-    id: usize,
-    name: String,
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct ChannelInfo {
+    pub(crate) id: usize,
+    pub(crate) name: String,
 }
 
 /// `event: hello` で送信される初期ペイロード
@@ -244,6 +376,9 @@ struct StreamQuery {
     /// モバイルが長時間 hidden の後に再接続するとき、欠損を全部辿らずに最新だけ即取得するため。
     #[serde(default)]
     head: Option<usize>,
+    /// 受信済みの最大 ID(画面が接続を作り直したとき。EventSource は新しい接続に Last-Event-ID を付けないため)
+    #[serde(default)]
+    last: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -307,43 +442,86 @@ pub struct RemoteState {
     include_partials: bool,
     partial_throttle: Duration,
     anchor: String,
-    channels: Vec<ChannelInfo>,
+    /// 中継サーバでは会場がつながるたびに入れ替わる
+    channels: Mutex<Vec<ChannelInfo>>,
     segments: SegmentStore,
     live: Option<Arc<LiveHub>>,
+    /// ライブ音声の元があるか(中継サーバでは、会場がライブを送れるときだけ立つ)
+    live_source: std::sync::atomic::AtomicBool,
     status: StatusStore,
+    /// 中継サーバのとき: 会場との接続状態
+    upstream: Option<watch::Sender<UpState>>,
+    /// この機械の時計のずれ(`event: hb` で配信)
+    clock: Option<Arc<ClockMonitor>>,
+    access_log: bool,
     index: Page,
     access: AccessControl,
     /// Turnstile の確認画面(Turnstile 無効なら None)
     gate: Option<Page>,
+    /// ログイン直後などの中継ページ
+    reload: Page,
+    /// ログインの画面(`#k=` を受け取る)
+    login: Page,
+    /// Sec-Fetch-* の無い要求を断るか
+    require_fetch_metadata: bool,
+    /// ブラウザの版の下限
+    browser: crate::config::BrowserPolicy,
+    /// iCloud プライベートリレー経由を止める判定(無効なら None)
+    private_relay: Option<Arc<crate::private_relay::PrivateRelayFilter>>,
 }
 
-/// 圧縮済みの HTML
+/// 圧縮済みの HTML と、その CSP(インラインの script / style のハッシュ入り)
 struct Page {
     html: String,
     br: Vec<u8>,
     etag: String,
+    csp: String,
+    kind: PageKind,
 }
 
 impl Page {
-    fn new(html: String) -> Self {
+    fn new(html: String, kind: PageKind) -> Self {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         html.hash(&mut h);
         Self {
             br: brotli_compress(html.as_bytes(), 11),
             etag: format!("\"{:016x}\"", h.finish()),
+            csp: crate::security::page_csp(&html, kind),
+            kind,
             html,
         }
     }
 
     fn index() -> Self {
-        Self::new(HTML_PAGE.to_string())
+        Self::new(HTML_PAGE.to_string(), PageKind::Viewer)
+    }
+
+    fn reload() -> Self {
+        Self::new(RELOAD_PAGE.to_string(), PageKind::Simple)
     }
 
     fn gate(access: &AccessControl) -> Option<Self> {
-        access
-            .turnstile()
-            .map(|ts| Self::new(GATE_PAGE.replace("__SITE_KEY__", &ts.site_key)))
+        access.turnstile().map(|ts| {
+            // サイトキーは HTML と JS の文字列に入るので、使える文字を限る(注入されないように)
+            let key: String = ts.site_key.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-').collect();
+            Self::new(GATE_PAGE.replace("__SITE_KEY__", &key), PageKind::Gate)
+        })
+    }
+
+    /// 毎回作り直す小さなページ(CSP はハッシュを付けて)
+    fn simple(status: StatusCode, html: String) -> Response {
+        let csp = crate::security::page_csp(&html, PageKind::Simple);
+        (
+            status,
+            [
+                (header::CONTENT_TYPE, "text/html; charset=utf-8".to_string()),
+                (header::CACHE_CONTROL, "no-store".to_string()),
+                (header::CONTENT_SECURITY_POLICY, csp),
+            ],
+            html,
+        )
+            .into_response()
     }
 
     /// `cache_control` を付けて返す。ETag が一致すれば 304、brotli 対応なら圧縮して返す
@@ -358,16 +536,26 @@ impl Page {
             .get(header::IF_NONE_MATCH)
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v.split(',').any(|t| t.trim() == etag));
-        if not_modified {
-            return (StatusCode::NOT_MODIFIED, common).into_response();
-        }
-        let ctype = (header::CONTENT_TYPE, "text/html; charset=utf-8");
-        if accepts_brotli(headers) {
-            (StatusCode::OK, common, [ctype, (header::CONTENT_ENCODING, "br")], self.br.clone())
-                .into_response()
+        let mut resp = if not_modified {
+            (StatusCode::NOT_MODIFIED, common).into_response()
         } else {
-            (StatusCode::OK, common, [ctype], self.html.clone()).into_response()
+            let ctype = (header::CONTENT_TYPE, "text/html; charset=utf-8");
+            if accepts_brotli(headers) {
+                (StatusCode::OK, common, [ctype, (header::CONTENT_ENCODING, "br")], self.br.clone()).into_response()
+            } else {
+                (StatusCode::OK, common, [ctype], self.html.clone()).into_response()
+            }
+        };
+        let h = resp.headers_mut();
+        if let Ok(v) = HeaderValue::from_str(&self.csp) {
+            h.insert(header::CONTENT_SECURITY_POLICY, v);
         }
+        if self.kind == PageKind::Viewer {
+            for (name, value) in crate::security::viewer_isolation() {
+                h.insert(name, HeaderValue::from_static(value));
+            }
+        }
+        resp
     }
 }
 
@@ -415,28 +603,25 @@ impl RemoteState {
 
     /// 録音区間 ID 付きで文字起こし結果を投入
     pub fn push_with_segment(&self, result: &TranscriptResult, segment: Option<u64>) {
-        if result.is_partial {
+        self.push_event(WireEvent::from_result(result, segment));
+    }
+
+    /// 配信形式のイベントを投入(中継サーバは会場から届いたものをそのまま入れる)
+    pub(crate) fn push_event(&self, event: WireEvent) {
+        if event.p {
             if !self.include_partials {
                 return;
             }
             // チャンネルごとに throttle
             let mut last = self.last_partial.lock().unwrap();
             let now = Instant::now();
-            if let Some(prev) = last.get(&result.channel) {
+            if let Some(prev) = last.get(&event.c) {
                 if now.duration_since(*prev) < self.partial_throttle {
                     return;
                 }
             }
-            last.insert(result.channel, now);
+            last.insert(event.c, now);
         }
-
-        let event = WireEvent {
-            c: result.channel,
-            s: result.timestamp_seconds,
-            x: result.text.clone(),
-            p: result.is_partial,
-            g: segment,
-        };
 
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let stored = StoredEvent { id, event };
@@ -457,14 +642,19 @@ impl RemoteState {
 
     /// 録音を終えた区間を登録して配信(同期、ノンブロッキング)
     pub fn push_segment(&self, info: &SegmentInfo) {
+        self.register_segment(info.id, info.channel, info.start_unix_ms, info.duration_ms, info.path.clone());
+    }
+
+    /// 区間を登録して配信(中継サーバは受け取った区間に自分の ID を振って登録する)
+    pub(crate) fn register_segment(&self, id: u64, channel: usize, start_unix_ms: u64, duration_ms: u64, path: std::path::PathBuf) {
         let wire = WireSegment {
-            i: info.id,
-            c: info.channel,
-            t: info.start_unix_ms,
-            d: info.duration_ms,
+            i: id,
+            c: channel,
+            t: start_unix_ms,
+            d: duration_ms,
         };
         let mut items = self.segments.items.lock().unwrap();
-        items.push_back((wire.clone(), info.path.clone()));
+        items.push_back((wire.clone(), path));
         while items.len() > MAX_SEGMENTS {
             items.pop_front();
         }
@@ -473,17 +663,17 @@ impl RemoteState {
 
     /// チャンネルの状態を更新し、変化があったチャンネルだけ配信する(同期、ノンブロッキング)
     pub fn push_status(&self, items: &[ChannelStatus]) {
+        let wires: Vec<WireStatus> = items.iter().map(ChannelStatus::wire).collect();
+        self.push_wire_status(&wires);
+    }
+
+    /// 配信形式の状態を投入(中継サーバ用)
+    pub(crate) fn push_wire_status(&self, items: &[WireStatus]) {
         let mut last = self.status.last.lock().unwrap();
         let mut changed: Vec<WireStatus> = Vec::new();
-        for st in items {
-            let wire = (
-                st.channel,
-                st.level_db.clamp(-60.0, 0.0).round() as i8,
-                st.receiving as u8,
-                st.transcribe,
-            );
-            if status_changed(last.get(&st.channel), &wire) {
-                last.insert(st.channel, wire);
+        for &wire in items {
+            if status_changed(last.get(&wire.0), &wire) {
+                last.insert(wire.0, wire);
                 changed.push(wire);
             }
         }
@@ -492,6 +682,48 @@ impl RemoteState {
         }
         if let Ok(s) = serde_json::to_string(&changed) {
             let _ = self.status.broadcaster.send(Arc::from(s));
+        }
+    }
+
+    /// チャンネル一覧を入れ替える(中継サーバで会場がつながったとき)。
+    /// 画面のタブは初回の hello でしか作らないので、変わったときは状態だけ消して次の接続から反映する
+    pub(crate) fn set_channels(&self, channels: Vec<ChannelInfo>) {
+        let mut cur = self.channels.lock().unwrap();
+        if *cur != channels {
+            *cur = channels;
+            self.status.last.lock().unwrap().clear();
+        }
+    }
+
+    /// 最後に送った状態を忘れる(会場がつなぎ直したとき、次の状態を全チャンネル分配信させる)
+    pub(crate) fn clear_status(&self) {
+        self.status.last.lock().unwrap().clear();
+    }
+
+    /// ライブ音声の元があるか(hello の `live`)
+    pub(crate) fn set_live_source(&self, on: bool) {
+        self.live_source.store(on, Ordering::Relaxed);
+    }
+
+    /// 会場との接続状態の一部を書き換える(変化したときだけ配信される)
+    pub(crate) fn update_upstream(&self, f: impl FnOnce(&mut UpState)) {
+        if let Some(tx) = &self.upstream {
+            tx.send_if_modified(|cur| {
+                let before = *cur;
+                f(cur);
+                *cur != before
+            });
+        }
+    }
+
+    /// 会場との接続状態を更新(中継サーバ用。変化したときだけ配信される)
+    pub(crate) fn set_upstream(&self, state: UpState) {
+        if let Some(tx) = &self.upstream {
+            tx.send_if_modified(|cur| {
+                let changed = *cur != state;
+                *cur = state;
+                changed
+            });
         }
     }
 
@@ -522,6 +754,9 @@ impl RemoteState {
     }
 }
 
+/// 録音の Cache-Control(ブラウザには残してよいが毎回確かめさせる。共有キャッシュには載せない)
+const AUDIO_CACHE: &str = "private, no-cache";
+
 /// HTTP サーバを起動して `RemoteState` の Arc を返す
 pub async fn start(
     config: RemoteConfig,
@@ -529,8 +764,8 @@ pub async fn start(
     start_time: SystemTime,
     segments_enabled: bool,
     live: Option<Arc<LiveHub>>,
+    clock: Option<Arc<ClockMonitor>>,
 ) -> Result<Arc<RemoteState>> {
-    let anchor = chrono::DateTime::<chrono::Utc>::from(start_time).to_rfc3339();
     let channels: Vec<ChannelInfo> = channels_config
         .iter()
         .filter(|c| c.enabled)
@@ -539,49 +774,86 @@ pub async fn start(
             name: c.name.clone(),
         })
         .collect();
+    let state = Arc::new(build(&config, channels, start_time, segments_enabled, live, clock, false)?);
+    serve(state.clone(), &config, Router::new()).await?;
+    Ok(state)
+}
 
-    let (tx, _rx) = broadcast::channel(BROADCAST_CAPACITY);
+/// 設定から `RemoteState` を組み立てる。`relay` なら会場との接続状態(`event: up`)を持つ
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build(
+    config: &RemoteConfig,
+    channels: Vec<ChannelInfo>,
+    start_time: SystemTime,
+    segments_enabled: bool,
+    live: Option<Arc<LiveHub>>,
+    clock: Option<Arc<ClockMonitor>>,
+    relay: bool,
+) -> Result<RemoteState> {
     if !config.auth_token.is_empty() || !config.basic_auth_user.is_empty() || !config.basic_auth_pass.is_empty() {
         anyhow::bail!(
             "[remote] の basic_auth_user / basic_auth_pass / auth_token は廃止しました。\
              代わりに login_key(または login_key_file)を設定し、/?k=<キー> でログインしてください"
         );
     }
+    let session_secs = config.session_hours.checked_mul(3600)
+        .ok_or_else(|| anyhow::anyhow!("remote.session_hours が大きすぎます"))?;
+    let session_ttl = Duration::from_secs(session_secs);
+    Instant::now().checked_add(session_ttl)
+        .ok_or_else(|| anyhow::anyhow!("remote.session_hours が大きすぎます"))?;
     let login_key = crate::access::load_or_create_login_key(&config.login_key, &config.login_key_file)?;
     let access = AccessControl::new(
         &config.allowed_countries,
         &login_key,
         &config.turnstile_site_key,
         &config.turnstile_secret_key,
-        Duration::from_secs(config.session_hours * 3600),
-    );
-    let access_desc = access.describe();
-
-    let state = Arc::new(RemoteState {
-        history: Mutex::new(VecDeque::with_capacity(config.history_size)),
-        last_partial: Mutex::new(HashMap::new()),
-        broadcaster: tx,
-        next_id: AtomicU64::new(1),
-        history_size: config.history_size,
-        include_partials: config.include_partials,
-        partial_throttle: Duration::from_millis(config.partial_throttle_ms),
-        anchor,
+        session_ttl,
+    )
+    .with_block_tor(config.block_tor);
+    let mut state = RemoteState::new(
+        config.history_size,
+        config.include_partials,
+        Duration::from_millis(config.partial_throttle_ms),
+        start_time,
         channels,
-        segments: SegmentStore::new(segments_enabled),
+        segments_enabled,
         live,
-        status: StatusStore::new(),
-        index: Page::index(),
-        gate: Page::gate(&access),
         access,
-    });
+    );
+    state.clock = clock;
+    state.access_log = config.access_log;
+    state.require_fetch_metadata = config.require_fetch_metadata;
+    state.browser = config.browser.clone();
+    if config.block_private_relay {
+        state.private_relay = Some(crate::private_relay::PrivateRelayFilter::new(
+            &config.private_relay_url,
+            &config.private_relay_cache,
+        ));
+    }
+    if relay {
+        // 会場がつながるまでは切断中(最終受信なし)
+        state.upstream = Some(watch::channel(UpState::default()).0);
+        state.live_source.store(false, Ordering::Relaxed);
+    }
+    Ok(state)
+}
 
-    let app = router(state.clone());
+/// HTTP サーバを起動する。`extra` のルート(中継サーバのアップリンク)は guard を通さない
+pub(crate) async fn serve(state: Arc<RemoteState>, config: &RemoteConfig, extra: Router) -> Result<std::net::SocketAddr> {
+    let access_desc = state.access.describe();
+    if let Some(filter) = &state.private_relay {
+        tokio::spawn(filter.clone().run());
+    }
+    let app = extra
+        .merge(router(state.clone()))
+        .layer(middleware::from_fn_with_state(state.clone(), access_log));
 
     let listener = tokio::net::TcpListener::bind(&config.listen)
         .await
         .with_context(|| format!("Remote サーバの bind に失敗: {}", config.listen))?;
 
     let actual_addr = listener.local_addr().ok();
+    let bound = actual_addr.with_context(|| format!("Remote サーバの bind 先が分かりません: {}", config.listen))?;
     log::info!(
         "Remote サーバ起動: http://{} ({}, partials={})",
         actual_addr
@@ -606,8 +878,49 @@ pub async fn start(
             log::error!("Remote サーバが終了: {}", e);
         }
     });
+    Ok(bound)
+}
 
-    Ok(state)
+impl RemoteState {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        history_size: usize,
+        include_partials: bool,
+        partial_throttle: Duration,
+        start_time: SystemTime,
+        channels: Vec<ChannelInfo>,
+        segments_enabled: bool,
+        live: Option<Arc<LiveHub>>,
+        access: AccessControl,
+    ) -> Self {
+        let (tx, _rx) = broadcast::channel(BROADCAST_CAPACITY);
+        Self {
+            history: Mutex::new(VecDeque::new()),
+            last_partial: Mutex::new(HashMap::new()),
+            broadcaster: tx,
+            next_id: AtomicU64::new(1),
+            history_size,
+            include_partials,
+            partial_throttle,
+            anchor: chrono::DateTime::<chrono::Utc>::from(start_time).to_rfc3339(),
+            channels: Mutex::new(channels),
+            segments: SegmentStore::new(segments_enabled),
+            live_source: std::sync::atomic::AtomicBool::new(live.is_some()),
+            live,
+            status: StatusStore::new(),
+            upstream: None,
+            clock: None,
+            access_log: false,
+            index: Page::index(),
+            gate: Page::gate(&access),
+            reload: Page::reload(),
+            login: Page::new(LOGIN_SCRIPT_PAGE.to_string(), PageKind::Login),
+            require_fetch_metadata: false,
+            browser: crate::config::BrowserPolicy { enabled: false, ..Default::default() },
+            private_relay: None,
+            access,
+        }
+    }
 }
 
 fn router(state: Arc<RemoteState>) -> Router {
@@ -623,21 +936,132 @@ fn router(state: Arc<RemoteState>) -> Router {
         .route("/share", get(serve_share))
         .route("/share/qr.svg", get(serve_share_qr))
         .route("/healthz", get(serve_health))
+        .route("/login", post(serve_login))
+        .route("/logout", post(serve_logout))
+        .route(
+            "/csp-report",
+            post(crate::security::serve_reports)
+                .layer(axum::extract::DefaultBodyLimit::max(crate::security::REPORT_MAX_BYTES)),
+        )
+        .route(
+            "/reports",
+            post(crate::security::serve_reports)
+                .layer(axum::extract::DefaultBodyLimit::max(crate::security::REPORT_MAX_BYTES)),
+        )
         .layer(middleware::from_fn_with_state(state.clone(), guard))
+        // 守りのヘッダは guard が返す 403 にも付ける(いちばん外側)
+        .layer(middleware::from_fn(crate::security::headers_middleware))
         .with_state(state)
+}
+
+/// 1 リクエスト 1 行のアクセスログ(target `access`)
+async fn access_log(State(state): State<Arc<RemoteState>>, req: Request, next: Next) -> Response {
+    // /healthz は閲覧画面が 30 秒ごとに叩くので記録しない(埋もれないように)
+    if !state.access_log || req.uri().path() == "/healthz" {
+        return next.run(req).await;
+    }
+    let started = Instant::now();
+    let h = req.headers();
+    let get = |name: &str| h.get(name).and_then(|v| v.to_str().ok()).map(str::to_string);
+    let ua = get("user-agent").map(|u| u.chars().take(ACCESS_LOG_UA_MAX).collect::<String>());
+    let (ip, cc, ray) = (get("cf-connecting-ip"), get("cf-ipcountry"), get("cf-ray"));
+    // Fetch Metadata(ブラウザが何として読んだか)。音声の例外を外してよいかを実機で確かめるのにも使う
+    let (site, mode, dest) = (get("sec-fetch-site"), get("sec-fetch-mode"), get("sec-fetch-dest"));
+    let method = req.method().to_string();
+    let path = redact_uri(req.uri());
+    let resp = next.run(req).await;
+    log::info!(
+        target: "access",
+        "{}",
+        serde_json::json!({
+            "m": method,
+            "p": path,
+            "st": resp.status().as_u16(),
+            "ms": started.elapsed().as_millis() as u64,
+            "ip": ip,
+            "cc": cc,
+            "ray": ray,
+            "site": site,
+            "mode": mode,
+            "dest": dest,
+            "ua": ua,
+        })
+    );
+    resp
+}
+
+/// ログに残す URI。ログインキー(`k`)と共有 URL(`u`、キーを含む)の値は伏せる
+fn redact_uri(uri: &axum::http::Uri) -> String {
+    let Some(q) = uri.query() else { return uri.path().to_string() };
+    let q: Vec<String> = q
+        .split('&')
+        .map(|kv| match kv.split_once('=') {
+            Some((k, _)) if k == "k" || k == "u" => format!("{}=***", k),
+            _ => kv.to_string(),
+        })
+        .collect();
+    format!("{}?{}", uri.path(), q.join("&"))
 }
 
 /// 全リクエスト共通の入口: 国の制限と、データ系の bot 確認セッション
 async fn guard(State(state): State<Arc<RemoteState>>, req: Request, next: Next) -> Response {
     let path = req.uri().path();
+    // 使うメソッドは GET / HEAD と、確認・報告の POST だけ
+    let method_ok = match *req.method() {
+        Method::GET | Method::HEAD => true,
+        Method::POST => matches!(path, "/verify" | "/login" | "/logout" | "/csp-report" | "/reports"),
+        _ => false,
+    };
+    if !method_ok {
+        return (StatusCode::METHOD_NOT_ALLOWED, "method not allowed").into_response();
+    }
     if path == "/healthz" {
         return next.run(req).await;
+    }
+    // Fetch Metadata: エンドポイントごとに「誰が・何として」読んでいるかを確かめる
+    match crate::security::check_fetch(req.method(), path, req.headers()) {
+        crate::security::FetchCheck::Ok => {}
+        crate::security::FetchCheck::Refuse(why) => {
+            log::warn!(
+                "Remote: 要求を拒否 {} {} ({}; site={:?}, mode={:?}, dest={:?}, ip={:?})",
+                req.method(),
+                path,
+                why,
+                req.headers().get("sec-fetch-site"),
+                req.headers().get("sec-fetch-mode"),
+                req.headers().get("sec-fetch-dest"),
+                req.headers().get("cf-connecting-ip")
+            );
+            return (StatusCode::FORBIDDEN, "request refused").into_response();
+        }
+        crate::security::FetchCheck::Missing => {
+            if state.require_fetch_metadata && !crate::security::metadata_optional(path) {
+                if path == "/" {
+                    return Page::simple(
+                        StatusCode::BAD_REQUEST,
+                        UNSUPPORTED_PAGE.replace("{message}", "最新の Safari・Chrome・Edge・Firefox で開いてください。"),
+                    );
+                }
+                return (StatusCode::FORBIDDEN, "fetch metadata required").into_response();
+            }
+        }
     }
     if !state.access.country_allowed(req.headers()) {
         return (StatusCode::FORBIDDEN, "forbidden").into_response();
     }
-    // `/` はセッションが無ければ確認画面を返す。`/verify` はセッションを作るところ
-    let needs_session = !matches!(path, "/" | "/verify");
+    if state.private_relay.as_ref().is_some_and(|f| f.blocks(req.headers())) {
+        log::info!(
+            "Remote: iCloud プライベートリレー経由を拒否 {} (ip={:?})",
+            path,
+            req.headers().get("cf-connecting-ip")
+        );
+        if path == "/" {
+            return Page::simple(StatusCode::FORBIDDEN, PRIVATE_RELAY_PAGE.to_string());
+        }
+        return (StatusCode::FORBIDDEN, "private relay not allowed").into_response();
+    }
+    // 確認画面(セッション前)からも CSP 違反の報告は届く
+    let needs_session = !matches!(path, "/" | "/verify" | "/login" | "/logout" | "/csp-report" | "/reports");
     if needs_session && !state.access.session_valid(req.headers()) {
         return (StatusCode::FORBIDDEN, "verification required").into_response();
     }
@@ -657,26 +1081,56 @@ async fn serve_index(
 ) -> Response {
     use crate::access::SessionState;
     let access = &state.access;
-    if let Some(key) = q.k.as_deref() {
+    if state.browser.enabled {
+        if let Some((d, need)) = crate::browser::too_old(&headers, &state.browser) {
+            log::info!("Remote: 古いブラウザを拒否 {:?} {}.{}", d.engine, d.version.0, d.version.1);
+            let message = format!(
+                "お使いの {}(バージョン {}.{})は古いため対応していません。{} 以上に更新してから開いてください。",
+                d.engine.name(),
+                d.version.0,
+                d.version.1,
+                need
+            );
+            return Page::simple(StatusCode::FORBIDDEN, UNSUPPORTED_PAGE.replace("{message}", &message));
+        }
+    }
+    // 先読み・プレビューの要求ではセッションを作らない
+    let prefetch = headers
+        .get("sec-purpose")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains("prefetch") || v.contains("prerender"));
+    if let Some(key) = q.k.as_deref().filter(|_| !prefetch) {
         if !access.check_login_key(key) {
             log::warn!(
                 "Remote: ログインキーが違います (ip={:?})",
                 headers.get("cf-connecting-ip").and_then(|v| v.to_str().ok())
             );
+            // 総当たりを遅くする(Cloudflare の回数制限と二重)
+            tokio::time::sleep(Duration::from_millis(500)).await;
             return login_page(StatusCode::FORBIDDEN, "ログインキーが違います");
         }
-        let id = access.login();
-        return (
-            StatusCode::SEE_OTHER,
-            [
-                (header::SET_COOKIE, access.session_cookie(&id)),
-                (header::LOCATION, "/".to_string()),
-                (header::CACHE_CONTROL, "no-store".to_string()),
-                // キー付きの URL を他所へ送らない
-                (header::REFERRER_POLICY, "no-referrer".to_string()),
-            ],
-        )
-            .into_response();
+        let id = match access.login() {
+            Ok(id) => id,
+            Err(e) => {
+                log::error!("Remote: セッション作成に失敗: {}", e);
+                return (StatusCode::SERVICE_UNAVAILABLE, "session unavailable").into_response();
+            }
+        };
+        // 303 で / へ送ると、別サイト(LINE など)から始まった遷移のままなので SameSite=Strict のクッキーが付かない。
+        // 中継ページから同じオリジンとして開き直させる(キー付きの URL は location.replace で履歴から消える)
+        let mut resp = state.reload.respond(&headers, "no-store");
+        if let Ok(v) = HeaderValue::from_str(&access.session_cookie(&id, crate::access::is_https(&headers))) {
+            resp.headers_mut().insert(header::SET_COOKIE, v);
+        }
+        return resp;
+    }
+    // 別サイトから開かれた直後はクッキーが付いていない。一度だけ同じオリジンから開き直させる
+    let cross_site = matches!(
+        headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()),
+        Some("cross-site" | "same-site")
+    );
+    if cross_site && access.session_state(&headers) == SessionState::None && !access.is_open() {
+        return state.reload.respond(&headers, "no-store");
     }
     match access.session_state(&headers) {
         SessionState::Full => {}
@@ -688,7 +1142,10 @@ async fn serve_index(
         }
         SessionState::None => {
             if access.login_required() {
-                return login_page(StatusCode::UNAUTHORIZED, "ログイン用の URL を開いてください");
+                // `#k=` は画面の script が読んで POST /login に渡す
+                let mut resp = state.login.respond(&headers, "no-store");
+                *resp.status_mut() = StatusCode::UNAUTHORIZED;
+                return resp;
             }
             if let Some(gate) = &state.gate {
                 return gate.respond(&headers, "no-store");
@@ -699,25 +1156,63 @@ async fn serve_index(
     state.index.respond(&headers, "private, no-cache")
 }
 
-/// ログインできていないときの案内(小さな HTML)
-fn login_page(status: StatusCode, message: &str) -> Response {
-    let html = format!(
-        "<!DOCTYPE html><html lang=\"ja\"><head><meta charset=\"utf-8\">\
-         <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
-         <meta name=\"robots\" content=\"noindex,nofollow\"><title>dcr-transcribe</title>\
-         <style>body{{background:#0f1115;color:#e8eaed;font-family:-apple-system,sans-serif;\
-         display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;padding:16px}}\
-         p{{color:#888c95;font-size:14px}}</style></head>\
-         <body><div><h1 style=\"font-size:16px\">dcr-transcribe</h1><p>{}</p></div></body></html>",
-        message
-    );
+/// ログインできていないときの案内(小さな HTML。`message` はこちらで決めた文だけ)
+fn login_page(status: StatusCode, message: &'static str) -> Response {
+    Page::simple(status, LOGIN_PAGE.replace("{message}", message))
+}
+
+#[derive(Deserialize)]
+struct LoginBody {
+    k: String,
+}
+
+/// `POST /login {"k": "<キー>"}`(ログインの画面の script から)。正しければセッションクッキーを出して 204
+async fn serve_login(
+    State(state): State<Arc<RemoteState>>,
+    headers: HeaderMap,
+    axum::Json(body): axum::Json<LoginBody>,
+) -> Response {
+    let ip = headers.get("cf-connecting-ip").and_then(|v| v.to_str().ok());
+    if !crate::security::same_origin_post(&headers) {
+        log::warn!("Remote: 別オリジンからのログインを拒否 (ip={:?}, origin={:?})", ip, headers.get(header::ORIGIN));
+        return (StatusCode::FORBIDDEN, "cross-origin request refused").into_response();
+    }
+    if !state.access.check_login_key(&body.k) {
+        log::warn!("Remote: ログインキーが違います (ip={:?})", ip);
+        // 総当たりを遅くする(Cloudflare の回数制限と二重)
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        return (StatusCode::FORBIDDEN, "wrong key").into_response();
+    }
+    match state.access.login() {
+        Ok(id) => (
+            StatusCode::NO_CONTENT,
+            [
+                (header::SET_COOKIE, state.access.session_cookie(&id, crate::access::is_https(&headers))),
+                (header::CACHE_CONTROL, "no-store".to_string()),
+            ],
+        )
+            .into_response(),
+        Err(e) => {
+            log::error!("Remote: セッション作成に失敗: {}", e);
+            (StatusCode::SERVICE_UNAVAILABLE, "session unavailable").into_response()
+        }
+    }
+}
+
+/// `POST /logout`: セッションを消し、この端末のクッキー・キャッシュ・保存データを消させる。
+/// Clear-Site-Data の "cookies" は同じドメインのほかのサブドメインのクッキーまで消すので使わず、自分のクッキーだけ消す
+async fn serve_logout(State(state): State<Arc<RemoteState>>, headers: HeaderMap) -> Response {
+    if !crate::security::same_origin_post(&headers) {
+        return (StatusCode::FORBIDDEN, "cross-origin request refused").into_response();
+    }
+    state.access.logout(&headers);
     (
-        status,
+        StatusCode::NO_CONTENT,
         [
-            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
-            (header::CACHE_CONTROL, "no-store"),
+            (header::SET_COOKIE, AccessControl::expired_cookie(crate::access::is_https(&headers))),
+            (header::HeaderName::from_static("clear-site-data"), "\"cache\", \"storage\"".to_string()),
+            (header::CACHE_CONTROL, "no-store".to_string()),
         ],
-        html,
     )
         .into_response()
 }
@@ -734,11 +1229,16 @@ async fn serve_verify(
     axum::Json(body): axum::Json<VerifyBody>,
 ) -> Response {
     let remote_ip = headers.get("cf-connecting-ip").and_then(|v| v.to_str().ok());
+    // 別オリジンのページからの POST は受け付けない(Fetch Metadata に加えて Origin でも確かめる)
+    if !crate::security::same_origin_post(&headers) {
+        log::warn!("Remote: 別オリジンからの確認を拒否 (ip={:?}, origin={:?})", remote_ip, headers.get(header::ORIGIN));
+        return (StatusCode::FORBIDDEN, "cross-origin request refused").into_response();
+    }
     match state.access.verify(&body.token, remote_ip, &headers).await {
         Ok(id) => (
             StatusCode::NO_CONTENT,
             [
-                (header::SET_COOKIE, state.access.session_cookie(&id)),
+                (header::SET_COOKIE, state.access.session_cookie(&id, crate::access::is_https(&headers))),
                 (header::CACHE_CONTROL, "no-store".to_string()),
             ],
         )
@@ -765,9 +1265,10 @@ struct ShareQrQuery {
     u: String,
 }
 
-/// 共有 URL の QR コード(SVG)
-async fn serve_share_qr(Query(q): Query<ShareQrQuery>) -> Response {
-    if q.u.is_empty() || q.u.len() > 512 {
+/// 共有 URL の QR コード(SVG)。自分のオリジンの URL だけ(ほかのサイトへ誘導する QR の生成に使わせない)
+async fn serve_share_qr(Query(q): Query<ShareQrQuery>, headers: HeaderMap) -> Response {
+    let own = crate::security::own_origin(&headers).map(|o| format!("{}/", o));
+    if q.u.len() > 512 || !own.is_some_and(|o| q.u.starts_with(&o)) {
         return (StatusCode::BAD_REQUEST, "invalid url").into_response();
     }
     match crate::share::qr_svg(&q.u) {
@@ -786,9 +1287,9 @@ async fn serve_session() -> impl IntoResponse {
     (StatusCode::NO_CONTENT, [(header::CACHE_CONTROL, "no-store")])
 }
 
-/// /healthz: 認証なし(外部監視用)
+/// /healthz: 認証なし(外部監視用。閲覧画面もサーバまで届くかを測るのに使う)
 async fn serve_health() -> impl IntoResponse {
-    (StatusCode::OK, "ok")
+    (StatusCode::OK, [(header::CACHE_CONTROL, "no-store")], "ok")
 }
 
 async fn serve_stream(
@@ -797,7 +1298,7 @@ async fn serve_stream(
     headers: HeaderMap,
 ) -> Response {
 
-    // モード優先度: Last-Event-ID > head > 全件。
+    // モード優先度: Last-Event-ID > ?last= > head > 全件。
     //
     // この順序が重要: ?head=N でファストロード接続したあと、回線断による自動再接続では
     // EventSource が Last-Event-ID を付与する。?head は URL に残っているが Last-Event-ID
@@ -807,7 +1308,7 @@ async fn serve_stream(
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok());
 
-    let mode = match (last_event_id, q.head) {
+    let mode = match (last_event_id.or(q.last), q.head) {
         (Some(id), _) => SubscribeMode::Since(id),
         (None, Some(n)) => SubscribeMode::Head(n.min(state.history_size)),
         (None, None) => SubscribeMode::All,
@@ -842,6 +1343,7 @@ async fn serve_history(
                 "s": e.event.s,
                 "x": e.event.x,
                 "p": e.event.p,
+                "g": e.event.g,
             })
         })
         .collect();
@@ -878,7 +1380,20 @@ async fn serve_audio(
         Some("wav") => "audio/wav",
         _ => "audio/aac",
     };
-    audio_response(data, content_type, headers.get(header::RANGE).and_then(|v| v.to_str().ok()))
+    // 区間の録音は書き終えたら変わらない。ブラウザには残してよいが毎回確かめさせ(no-cache)、変わっていなければ 304
+    let etag = format!("\"seg-{}-{}\"", id, data.len());
+    let not_modified = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.split(',').any(|t| t.trim() == etag));
+    if not_modified {
+        return (StatusCode::NOT_MODIFIED, [(header::ETAG, etag), (header::CACHE_CONTROL, AUDIO_CACHE.to_string())]).into_response();
+    }
+    let mut resp = audio_response(data, content_type, headers.get(header::RANGE).and_then(|v| v.to_str().ok()));
+    if let Ok(v) = HeaderValue::from_str(&etag) {
+        resp.headers_mut().insert(header::ETAG, v);
+    }
+    resp
 }
 
 /// 選んだチャンネルのミックスを AAC (ADTS) で流し続ける。
@@ -931,8 +1446,8 @@ async fn serve_live(
 /// 区間ファイルは数 MB 程度なので、全体を読んでからスライスする。
 fn audio_response(data: Vec<u8>, content_type: &'static str, range: Option<&str>) -> Response {
     let len = data.len() as u64;
-    // 認証付きなので Cloudflare 等の共有キャッシュには載せない
-    let cache = (header::CACHE_CONTROL, "private, max-age=86400");
+    // ブラウザには残してよいが毎回確かめさせる。CDN には残さない(private + CDN-Cache-Control: no-store)
+    let cache = (header::CACHE_CONTROL, AUDIO_CACHE);
     let accept = (header::ACCEPT_RANGES, "bytes");
     let ctype = (header::CONTENT_TYPE, content_type);
 
@@ -991,11 +1506,12 @@ fn build_stream(
         let mut status_rx = state.status.broadcaster.subscribe();
 
         // 1. hello イベント(anchor + チャンネル名)
+        let mut up_rx = state.upstream.as_ref().map(|tx| tx.subscribe());
         let hello = Hello {
             anchor: state.anchor.clone(),
-            channels: state.channels.clone(),
+            channels: state.channels.lock().unwrap().clone(),
             seg: state.segments.enabled,
-            live: state.live.is_some(),
+            live: state.live.is_some() && state.live_source.load(Ordering::Relaxed),
         };
         let hello_data = serde_json::to_string(&hello).unwrap_or_else(|_| "{}".into());
         yield Ok(Event::default().event("hello").data(hello_data));
@@ -1013,10 +1529,18 @@ fn build_stream(
             }
         }
 
-        // 3.5 チャンネルの現状
+        // 3.5 チャンネルの現状と、会場との接続状態(中継サーバのとき)
         if let Some(s) = state.status.snapshot() {
             yield Ok(Event::default().event("st").data(s));
         }
+        if let Some(rx) = &mut up_rx {
+            let up = *rx.borrow_and_update();
+            if let Ok(s) = serde_json::to_string(&up) {
+                yield Ok(Event::default().event("up").data(s));
+            }
+        }
+        // 最初の tick はすぐ来るので、接続直後にも 1 回送る
+        let mut hb = tokio::time::interval(HEARTBEAT);
 
         // 4. ライブ配信
         loop {
@@ -1052,6 +1576,28 @@ fn build_stream(
                     Err(broadcast::error::RecvError::Lagged(_)) => break,
                     Err(broadcast::error::RecvError::Closed) => break,
                 },
+                r = async {
+                    match &mut up_rx {
+                        Some(rx) => rx.changed().await.map(|_| *rx.borrow_and_update()),
+                        None => std::future::pending().await,
+                    }
+                } => match r {
+                    Ok(up) => {
+                        if let Ok(s) = serde_json::to_string(&up) {
+                            yield Ok(Event::default().event("up").data(s));
+                        }
+                    }
+                    Err(_) => break,
+                },
+                _ = hb.tick() => {
+                    let beat = Heartbeat {
+                        ms: SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64),
+                        so: state.clock.as_ref().and_then(|c| c.offset_ms()),
+                    };
+                    if let Ok(s) = serde_json::to_string(&beat) {
+                        yield Ok(Event::default().event("hb").data(s));
+                    }
+                }
                 r = status_rx.recv() => match r {
                     Ok(s) => yield Ok(Event::default().event("st").data(s.to_string())),
                     // 状態は最新だけ分かればよいので、取りこぼしたら現状を送り直して続ける
@@ -1073,24 +1619,20 @@ mod tests {
     use crate::types::TranscriptResult;
 
     fn make_state(include_partials: bool, history_size: usize) -> Arc<RemoteState> {
-        let (tx, _rx) = broadcast::channel(64);
-        Arc::new(RemoteState {
-            history: Mutex::new(VecDeque::with_capacity(history_size)),
-            last_partial: Mutex::new(HashMap::new()),
-            broadcaster: tx,
-            next_id: AtomicU64::new(1),
+        Arc::new(raw_state(include_partials, history_size))
+    }
+
+    fn raw_state(include_partials: bool, history_size: usize) -> RemoteState {
+        RemoteState::new(
             history_size,
             include_partials,
-            partial_throttle: Duration::from_millis(100),
-            anchor: "2025-01-01T00:00:00Z".to_string(),
-            channels: vec![],
-            segments: SegmentStore::new(false),
-            live: None,
-            status: StatusStore::new(),
-            index: Page::index(),
-            access: AccessControl::disabled(),
-            gate: None,
-        })
+            Duration::from_millis(100),
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1_735_689_600),
+            vec![],
+            false,
+            None,
+            AccessControl::disabled(),
+        )
     }
 
     fn make_result(channel: usize, text: &str, is_partial: bool) -> TranscriptResult {
@@ -1221,13 +1763,17 @@ mod tests {
         assert_eq!(resp.status(), 403);
         assert!(resp.headers().get("set-cookie").is_none());
 
-        // 正しいキー → クッキー + キーを消した / へ転送
+        // 正しいキー → クッキー + 同じオリジンから / を開き直す中継ページ(SameSite=Strict のため)
         let resp = client.get(format!("http://{}/?k=key123", addr)).send().await.unwrap();
-        assert_eq!(resp.status(), 303);
-        assert_eq!(resp.headers()["location"], "/");
+        assert_eq!(resp.status(), 200);
         assert_eq!(resp.headers()["referrer-policy"], "no-referrer");
-        let set = resp.headers()["set-cookie"].to_str().unwrap();
-        assert!(set.starts_with("dcr_session=") && set.contains("HttpOnly"), "{}", set);
+        assert_eq!(resp.headers()["cache-control"], "no-store");
+        let set = resp.headers()["set-cookie"].to_str().unwrap().to_string();
+        assert!(set.starts_with("dcr_session=") && set.contains("HttpOnly") && set.contains("SameSite=Strict"), "{}", set);
+        let csp = resp.headers()["content-security-policy"].to_str().unwrap().to_string();
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("location.replace(\"/\"+location.hash)"), "{}", body);
+        assert_csp_allows_inline(&csp, &body);
         let cookie = set.split(';').next().unwrap();
 
         // クッキーで本画面とデータ系が使える
@@ -1241,6 +1787,280 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 200);
+    }
+
+    /// CSP がページのインラインの script / style をハッシュで(だけ)許していること
+    fn assert_csp_allows_inline(csp: &str, html: &str) {
+        let (scripts, styles) = crate::security::inline_hashes(html);
+        for h in scripts.iter().chain(styles.iter()) {
+            assert!(csp.contains(&format!("'sha256-{}'", h)), "{} が CSP に無い: {}", h, csp);
+        }
+        assert!(!csp.contains("unsafe-inline") || csp.contains("style-src-attr"), "{}", csp);
+        assert!(!csp.contains("unsafe-eval"), "{}", csp);
+    }
+
+    #[tokio::test]
+    async fn http_security_headers_on_every_response() {
+        let addr = boot(with_login_key(make_state(false, 10))).await;
+        let client = no_redirect();
+        let cookie = login_cookie(&client, addr).await;
+
+        // 閲覧画面: CSP(ハッシュ・Trusted Types)・COEP ほか
+        let resp = client.get(format!("http://{}/", addr)).header("Cookie", &cookie).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let h = resp.headers().clone();
+        let csp = h["content-security-policy"].to_str().unwrap();
+        assert!(csp.starts_with("default-src 'none'"), "{}", csp);
+        assert!(csp.contains("require-trusted-types-for 'script'") && csp.contains("frame-ancestors 'none'"), "{}", csp);
+        assert_csp_allows_inline(csp, HTML_PAGE);
+        assert_eq!(h["cross-origin-embedder-policy"], "require-corp; report-to=\"default\"");
+        for (name, value) in [
+            ("x-content-type-options", "nosniff"),
+            ("x-frame-options", "DENY"),
+            ("referrer-policy", "no-referrer"),
+            ("cross-origin-opener-policy", "same-origin; report-to=\"default\""),
+            ("x-robots-tag", "noindex, nofollow, noarchive, nosnippet, noimageindex"),
+            ("cdn-cache-control", "no-store"),
+            ("cloudflare-cdn-cache-control", "no-store"),
+            ("cross-origin-resource-policy", "same-origin"),
+            ("origin-agent-cluster", "?1"),
+        ] {
+            assert_eq!(h[name], value, "{}", name);
+        }
+        let pp = h["permissions-policy"].to_str().unwrap();
+        assert!(pp.contains("camera=()") && pp.contains("geolocation=()") && pp.contains("microphone=()"), "{}", pp);
+        assert!(h.get("strict-transport-security").is_none(), "平文の HTTP では HSTS を出さない");
+
+        // ページ以外(JSON)や拒否の応答にも、何も動かない CSP と守りのヘッダ
+        for path in ["/history?before=9", "/stream?head=0"] {
+            let r = client.get(format!("http://{}{}", addr, path)).send().await.unwrap();
+            assert_eq!(r.status(), 403, "{}", path);
+            assert!(r.headers()["content-security-policy"].to_str().unwrap().contains("sandbox"), "{}", path);
+            assert_eq!(r.headers()["x-content-type-options"], "nosniff");
+        }
+
+        // HTTPS(cloudflared 経由)では HSTS と __Host- のクッキー
+        let r = client
+            .get(format!("http://{}/?k=key123", addr))
+            .header("x-forwarded-proto", "https")
+            .send()
+            .await
+            .unwrap();
+        assert!(r.headers()["strict-transport-security"].to_str().unwrap().starts_with("max-age="));
+        let set = r.headers()["set-cookie"].to_str().unwrap();
+        assert!(set.starts_with("__Host-dcr_session=") && set.contains("Secure"), "{}", set);
+        // HTTPS では NEL(ネットワークエラーの報告)も
+        let nel = r.headers()["nel"].to_str().unwrap();
+        assert!(nel.contains("\"failure_fraction\":1.0") && nel.contains("\"report_to\":\"nel\""), "{}", nel);
+        let report_to = r.headers()["report-to"].to_str().unwrap();
+        assert!(report_to.contains("/reports"), "{}", report_to);
+    }
+
+    /// ブラウザが付ける Sec-Fetch-* を真似る
+    fn browser(rb: reqwest::RequestBuilder, site: &str, mode: &str, dest: &str) -> reqwest::RequestBuilder {
+        rb.header("sec-fetch-site", site).header("sec-fetch-mode", mode).header("sec-fetch-dest", dest)
+    }
+
+    #[tokio::test]
+    async fn http_fragment_login_and_logout() {
+        let addr = boot(with_login_key(make_state(false, 10))).await;
+        let client = no_redirect();
+        // キーは `#k=` でサーバに来ない。ログインの画面が script で POST /login に渡す
+        let r = client.get(format!("http://{}/", addr)).send().await.unwrap();
+        assert_eq!(r.status(), 401);
+        let csp = r.headers()["content-security-policy"].to_str().unwrap().to_string();
+        let body = r.text().await.unwrap();
+        assert!(body.contains("history.replaceState") && body.contains("fetch(\"/login\""), "{}", body);
+        assert_csp_allows_inline(&csp, &body);
+        // fetch が実行されても、CSP で /login が遮断されるとログインできない。
+        assert!(csp.split(';').any(|d| d.trim() == "connect-src 'self'"), "{}", csp);
+
+        let login = |k: &str, origin: Option<&str>| {
+            let mut rb = client.post(format!("http://{}/login", addr)).json(&serde_json::json!({"k": k}));
+            if let Some(o) = origin {
+                rb = rb.header("origin", o);
+            }
+            rb.send()
+        };
+        assert_eq!(login("wrong", None).await.unwrap().status(), 403);
+        assert_eq!(login("key123", Some("https://evil.example")).await.unwrap().status(), 403, "別オリジン");
+        let r = login("key123", Some(&format!("http://{}", addr))).await.unwrap();
+        assert_eq!(r.status(), 204);
+        let set = r.headers()["set-cookie"].to_str().unwrap();
+        assert!(set.contains("SameSite=Strict") && set.contains("HttpOnly"), "{}", set);
+        let cookie = set.split(';').next().unwrap().to_string();
+        let r = client.get(format!("http://{}/history?before=9", addr)).header("Cookie", &cookie).send().await.unwrap();
+        assert_eq!(r.status(), 200);
+
+        // ログアウト: セッションを消し、キャッシュ・保存データを消させ、クッキーも消す
+        let r = client.post(format!("http://{}/logout", addr)).header("Cookie", &cookie).send().await.unwrap();
+        assert_eq!(r.status(), 204);
+        assert_eq!(r.headers()["clear-site-data"], "\"cache\", \"storage\"", "cookies はほかのサブドメインまで消すので使わない");
+        assert!(r.headers()["set-cookie"].to_str().unwrap().contains("Max-Age=0"));
+        let r = client.get(format!("http://{}/history?before=9", addr)).header("Cookie", &cookie).send().await.unwrap();
+        assert_eq!(r.status(), 403, "ログアウトしたセッションは使えない");
+
+        // 旧形式の ?k= でも、先読み・プレビューではセッションを作らない
+        let r = client.get(format!("http://{}/?k=key123", addr)).header("sec-purpose", "prefetch").send().await.unwrap();
+        assert!(r.headers().get("set-cookie").is_none());
+    }
+
+    #[tokio::test]
+    async fn http_strict_fetch_metadata_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = with_login_key(state_with_segment(dir.path()));
+        Arc::get_mut(&mut s).unwrap().require_fetch_metadata = true;
+        let addr = boot(s).await;
+        let client = no_redirect();
+        // Sec-Fetch-* を送らないブラウザには「対応していません」
+        let r = client.get(format!("http://{}/", addr)).send().await.unwrap();
+        assert_eq!(r.status(), 400);
+        assert!(r.text().await.unwrap().contains("このブラウザには対応していません"));
+        let r = browser(client.get(format!("http://{}/?k=key123", addr)), "none", "navigate", "document").send().await.unwrap();
+        let cookie = r.headers()["set-cookie"].to_str().unwrap().split(';').next().unwrap().to_string();
+        let get = |path: &str, site: &str, mode: &str, dest: &str| {
+            browser(client.get(format!("http://{}{}", addr, path)), site, mode, dest).header("Cookie", cookie.clone()).send()
+        };
+        assert_eq!(get("/history?before=9", "same-origin", "cors", "empty").await.unwrap().status(), 200);
+        assert_eq!(get("/history?before=9", "same-origin", "navigate", "document").await.unwrap().status(), 403, "直接開く");
+        assert_eq!(client.get(format!("http://{}/history?before=9", addr)).header("Cookie", &cookie).send().await.unwrap().status(), 403, "ヘッダなし");
+        assert_eq!(get("/audio/7", "same-origin", "no-cors", "audio").await.unwrap().status(), 200);
+        assert_eq!(get("/audio/7", "same-origin", "cors", "empty").await.unwrap().status(), 403, "fetch で抜く");
+        // iOS などでメディアの読み込みが別経路になるので、音声はヘッダが無くても(セッションがあれば)通す
+        assert_eq!(client.get(format!("http://{}/audio/7", addr)).header("Cookie", &cookie).send().await.unwrap().status(), 200);
+        // ブラウザの報告
+        let r = browser(client.post(format!("http://{}/reports", addr)), "same-origin", "no-cors", "report")
+            .header("content-type", "application/reports+json")
+            .body(r#"[{"type":"network-error","url":"http://x/stream","body":{"type":"tcp.reset","phase":"connection"}}]"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 204);
+    }
+
+    #[tokio::test]
+    async fn http_old_browsers_are_refused() {
+        let mut s = make_state(false, 10);
+        Arc::get_mut(&mut s).unwrap().browser = crate::config::BrowserPolicy::default();
+        let addr = boot(s).await;
+        let client = reqwest::Client::new();
+        let old = "Mozilla/5.0 (iPhone; CPU iPhone OS 15_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.6 Mobile/15E148 Safari/604.1";
+        let r = client.get(format!("http://{}/", addr)).header("user-agent", old).send().await.unwrap();
+        assert_eq!(r.status(), 403);
+        let body = r.text().await.unwrap();
+        assert!(body.contains("15.6") && body.contains("16.4 以上"), "{}", body);
+        let new = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1";
+        let r = client.get(format!("http://{}/", addr)).header("user-agent", new).send().await.unwrap();
+        assert_eq!(r.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn http_audio_revalidates_and_stays_out_of_cdn() {
+        let dir = tempfile::tempdir().unwrap();
+        let addr = boot(state_with_segment(dir.path())).await;
+        let client = reqwest::Client::new();
+        let r = client.get(format!("http://{}/audio/7", addr)).send().await.unwrap();
+        assert_eq!(r.headers()["cache-control"], "private, no-cache");
+        assert_eq!(r.headers()["cdn-cache-control"], "no-store");
+        let etag = r.headers()["etag"].to_str().unwrap().to_string();
+        let r = client.get(format!("http://{}/audio/7", addr)).header("if-none-match", &etag).send().await.unwrap();
+        assert_eq!(r.status(), 304);
+    }
+
+    #[tokio::test]
+    async fn http_refuses_cross_site_requests_and_odd_methods() {
+        let addr = boot(with_login_key(make_state(false, 10))).await;
+        let client = no_redirect();
+        let cookie = login_cookie(&client, addr).await;
+        let cross = |rb: reqwest::RequestBuilder, mode: &str, dest: &str| {
+            rb.header("Cookie", &cookie)
+                .header("sec-fetch-site", "cross-site")
+                .header("sec-fetch-mode", mode)
+                .header("sec-fetch-dest", dest)
+        };
+        // 別サイトのページからの fetch / 画像 / iframe は拒否
+        for (path, mode, dest) in [("/history?before=9", "cors", "empty"), ("/audio/1", "no-cors", "audio"), ("/", "navigate", "iframe")] {
+            let r = cross(client.get(format!("http://{}{}", addr, path)), mode, dest).send().await.unwrap();
+            assert_eq!(r.status(), 403, "{} {}", path, dest);
+        }
+        // 別サイトからのトップレベルの遷移は通すが、クッキーが付かない前提で中継ページを返す
+        let r = client
+            .get(format!("http://{}/", addr))
+            .header("sec-fetch-site", "cross-site")
+            .header("sec-fetch-mode", "navigate")
+            .header("sec-fetch-dest", "document")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        assert!(r.text().await.unwrap().contains("location.replace"));
+
+        // /verify は別オリジンからの POST を拒否
+        let r = client
+            .post(format!("http://{}/verify", addr))
+            .header("origin", "https://evil.example")
+            .json(&serde_json::json!({"token": "x"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 403);
+
+        // 使わないメソッド
+        for m in ["PUT", "DELETE", "OPTIONS", "TRACE", "PATCH"] {
+            let r = client
+                .request(reqwest::Method::from_bytes(m.as_bytes()).unwrap(), format!("http://{}/", addr))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), 405, "{}", m);
+        }
+        let r = client.post(format!("http://{}/history", addr)).header("Cookie", &cookie).send().await.unwrap();
+        assert_eq!(r.status(), 405);
+    }
+
+    #[tokio::test]
+    async fn http_private_relay_is_refused_with_guidance() {
+        let mut raw = raw_state(false, 10);
+        let filter = crate::private_relay::PrivateRelayFilter::new("http://127.0.0.1:1/", "/nonexistent");
+        filter.set(crate::private_relay::EgressList::parse("104.28.0.0/24,JP,JP-13,Tokyo,\n"), "テスト");
+        raw.private_relay = Some(filter);
+        let addr = boot(Arc::new(raw)).await;
+        let client = reqwest::Client::new();
+        let r = client.get(format!("http://{}/", addr)).header("cf-connecting-ip", "104.28.0.20").send().await.unwrap();
+        assert_eq!(r.status(), 403);
+        let csp = r.headers()["content-security-policy"].to_str().unwrap().to_string();
+        let body = r.text().await.unwrap();
+        assert!(body.contains("プライベートリレー") && body.contains("IP アドレスを表示"), "{}", body);
+        assert_csp_allows_inline(&csp, &body);
+        let r = client.get(format!("http://{}/history?before=9", addr)).header("cf-connecting-ip", "104.28.0.20").send().await.unwrap();
+        assert_eq!(r.status(), 403);
+        // ほかの IP・監視(/healthz)は通す
+        let r = client.get(format!("http://{}/", addr)).header("cf-connecting-ip", "203.0.113.7").send().await.unwrap();
+        assert_eq!(r.status(), 200);
+        let r = client.get(format!("http://{}/healthz", addr)).header("cf-connecting-ip", "104.28.0.20").send().await.unwrap();
+        assert_eq!(r.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn http_csp_report_accepted_without_session_and_size_limited() {
+        let addr = boot(with_login_key(make_state(false, 10))).await;
+        let client = reqwest::Client::new();
+        let r = client
+            .post(format!("http://{}/csp-report", addr))
+            .header("content-type", "application/csp-report")
+            .body(r#"{"csp-report":{"violated-directive":"script-src","blocked-uri":"inline"}}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 204);
+        let r = client
+            .post(format!("http://{}/csp-report", addr))
+            .header("content-type", "application/csp-report")
+            .body(vec![b'x'; crate::security::REPORT_MAX_BYTES + 1])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 413);
     }
 
     #[tokio::test]
@@ -1462,6 +2282,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_sse_last_query_resumes_like_last_event_id() {
+        let s = make_state(false, 100);
+        for i in 1..=4 {
+            s.push(&make_result(0, &format!("m{}", i), false));
+        }
+        let addr = boot(s).await;
+        let resp = reqwest::get(format!("http://{}/stream?last=3", addr)).await.unwrap();
+        let mut body = futures_util::StreamExt::boxed(resp.bytes_stream());
+        let mut text = String::new();
+        while !text.contains("event: hb") {
+            let chunk = tokio::time::timeout(Duration::from_secs(2), futures_util::StreamExt::next(&mut body))
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            text.push_str(std::str::from_utf8(&chunk).unwrap());
+        }
+        assert!(!text.contains("\"x\":\"m3\""), "{}", text);
+        assert!(text.contains("\"x\":\"m4\""), "{}", text);
+        // 心拍はサーバの時刻を持つ(時計のずれは測っていなければ省略)
+        assert!(text.contains("data: {\"ms\":"), "{}", text);
+    }
+
+    #[tokio::test]
     async fn http_sse_last_event_id_resumes_from_position() {
         let s = make_state(false, 100);
         for i in 1..=5 {
@@ -1495,23 +2339,9 @@ mod tests {
 
         // 小さい capacity の broadcast を直接作って Lagged を再現
         let (tx, _) = broadcast::channel::<StoredEvent>(4);
-        let state = Arc::new(RemoteState {
-            history: Mutex::new(VecDeque::new()),
-            last_partial: Mutex::new(HashMap::new()),
-            broadcaster: tx,
-            next_id: AtomicU64::new(1),
-            history_size: 100,
-            include_partials: false,
-            partial_throttle: Duration::from_millis(100),
-            anchor: "2025-01-01T00:00:00Z".to_string(),
-            channels: vec![],
-            segments: SegmentStore::new(false),
-            live: None,
-            status: StatusStore::new(),
-            index: Page::index(),
-            access: AccessControl::disabled(),
-            gate: None,
-        });
+        let mut raw = raw_state(false, 100);
+        raw.broadcaster = tx;
+        let state = Arc::new(raw);
 
         // build_stream を直接駆動して、Lagged で break することを検証
         let stream = build_stream(state.clone(), SubscribeMode::All);
@@ -1559,13 +2389,7 @@ mod tests {
 
     #[test]
     fn wire_event_omits_p_when_false() {
-        let ev = WireEvent {
-            c: 1,
-            s: 2.5,
-            x: "hi".to_string(),
-            p: false,
-            g: None,
-        };
+        let ev = WireEvent { c: 1, s: 2.5, x: "hi".to_string(), ..Default::default() };
         let json = serde_json::to_string(&ev).unwrap();
         assert!(!json.contains("\"p\""));
         assert!(json.contains("\"c\":1"));
@@ -1573,13 +2397,7 @@ mod tests {
 
     #[test]
     fn wire_event_includes_p_when_true() {
-        let ev = WireEvent {
-            c: 1,
-            s: 2.5,
-            x: "hi".to_string(),
-            p: true,
-            g: None,
-        };
+        let ev = WireEvent { c: 1, s: 2.5, x: "hi".to_string(), p: true, ..Default::default() };
         let json = serde_json::to_string(&ev).unwrap();
         assert!(json.contains("\"p\":true"));
     }
@@ -1701,6 +2519,16 @@ mod tests {
     // ─────────────────────────────────────────────────────────────────
     // 録音区間
     // ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn access_log_hides_login_key() {
+        let uri: axum::http::Uri = "/?k=secret&x=1".parse().unwrap();
+        assert_eq!(redact_uri(&uri), "/?k=***&x=1");
+        let uri: axum::http::Uri = "/share/qr.svg?u=https%3A%2F%2Fh%2F%3Fk%3Ds".parse().unwrap();
+        assert_eq!(redact_uri(&uri), "/share/qr.svg?u=***");
+        let uri: axum::http::Uri = "/audio/3".parse().unwrap();
+        assert_eq!(redact_uri(&uri), "/audio/3");
+    }
 
     #[test]
     fn parse_range_variants() {
@@ -1877,6 +2705,7 @@ mod tests {
             for _ in 0..200 {
                 hub.process(&crate::live::LiveFrame {
                     channels: vec![(2, vec![1000; 480]), (3, vec![-500; 480])],
+                    at_ms: 0,
                 });
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
@@ -2213,7 +3042,7 @@ mod tests {
     async fn start_refuses_legacy_basic_auth_settings() {
         for legacy in ["basic_auth_user = \"a\"", "basic_auth_pass = \"b\"", "auth_token = \"t\""] {
             let cfg: RemoteConfig = toml::from_str(&format!("listen = \"127.0.0.1:0\"\n{}", legacy)).unwrap();
-            let err = start(cfg, &[], SystemTime::now(), false, None).await.err().expect("起動しない");
+            let err = start(cfg, &[], SystemTime::now(), false, None, None).await.err().expect("起動しない");
             assert!(err.to_string().contains("login_key"), "{}", err);
         }
     }
@@ -2230,10 +3059,11 @@ mod tests {
         let r = client.get(format!("http://{}/share", addr)).header("Cookie", &cookie).send().await.unwrap();
         assert_eq!(r.status(), 200);
         let j: serde_json::Value = r.json().await.unwrap();
-        assert_eq!(j["path"], "/?k=key123");
+        assert_eq!(j["path"], "/#k=key123");
 
+        let own = format!("http%3A%2F%2F{}%2F%3Fk%3Dkey123", addr.to_string().replace(':', "%3A"));
         let r = client
-            .get(format!("http://{}/share/qr.svg?u=https%3A%2F%2Ft.example.com%2F%3Fk%3Dkey123", addr))
+            .get(format!("http://{}/share/qr.svg?u={}", addr, own))
             .header("Cookie", &cookie)
             .send()
             .await
@@ -2241,7 +3071,32 @@ mod tests {
         assert_eq!(r.status(), 200);
         assert_eq!(r.headers()["content-type"], "image/svg+xml");
         assert!(r.text().await.unwrap().starts_with("<svg"));
-        let r = client.get(format!("http://{}/share/qr.svg?u=", addr)).header("Cookie", &cookie).send().await.unwrap();
-        assert_eq!(r.status(), 400);
+        // ほかのサイトの URL の QR は作らない(誘導に使わせない)
+        for bad in ["", "https%3A%2F%2Fevil.example%2F"] {
+            let r = client.get(format!("http://{}/share/qr.svg?u={}", addr, bad)).header("Cookie", &cookie).send().await.unwrap();
+            assert_eq!(r.status(), 400, "{}", bad);
+        }
     }
+    #[tokio::test]
+    async fn login_failure_returns_503_without_cookie() {
+        let mut state = make_state(false, 10);
+        Arc::get_mut(&mut state).unwrap().access = AccessControl::new(&[], "key", "", "", Duration::MAX);
+        let response = serve_index(State(state), Query(IndexQuery { k: Some("key".into()) }), HeaderMap::new()).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!response.headers().contains_key(header::SET_COOKIE));
+    }
+
+    #[tokio::test]
+    async fn oversized_session_config_is_rejected_before_start() {
+        let cfg: RemoteConfig = toml::from_str("session_hours = 18446744073709551615").unwrap();
+        assert!(start(cfg, &[], SystemTime::now(), false, None, None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn empty_audio_range_is_416() {
+        let response = audio_response(vec![], "audio/wav", Some("bytes=0-"));
+        assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(response.headers()[header::CONTENT_RANGE], "bytes */0");
+    }
+
 }

@@ -5,7 +5,6 @@
 use crate::config::TranscribeConfig;
 use crate::types::TranscriptResult;
 use anyhow::Result;
-use aws_config;
 use aws_sdk_transcribestreaming::Client as AwsTranscribeClient;
 use aws_sdk_transcribestreaming::types::{AudioEvent, AudioStream, LanguageCode, MediaEncoding};
 use aws_smithy_types::Blob;
@@ -54,7 +53,7 @@ impl TranscribeClient {
         let (result_tx, result_rx) = mpsc::channel::<TranscriptResult>(32);
 
         // AWS SDKクライアント初期化
-        let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+        let config = crate::aws_settings::load(&self.config).await?;
         let client = AwsTranscribeClient::new(&config);
 
         let language_code = match self.config.language_code.as_str() {
@@ -251,6 +250,7 @@ mod tests {
     #[tokio::test]
     async fn test_transcribe_client_creation() {
         let config = TranscribeConfig {
+            aws: Default::default(),
             backend: TranscribeBackendType::Aws,
             region: "ap-northeast-1".to_string(),
             language_code: "ja-JP".to_string(),

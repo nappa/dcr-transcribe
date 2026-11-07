@@ -143,11 +143,24 @@ impl SegmentRecorder {
         threshold_db: f32,
         config: &SegmentConfig,
     ) -> Result<Self> {
+        anyhow::ensure!(sample_rate > 0, "録音の sample_rate は 0 より大きい値が必要です");
+        anyhow::ensure!(threshold_db.is_finite(), "録音の閾値は有限値が必要です");
+        let ms_to_samples = |ms: u64| -> Result<usize> {
+            ms.checked_mul(sample_rate as u64)
+                .and_then(|n| usize::try_from(n / 1000).ok())
+                .context("録音時間の設定が大きすぎます")
+        };
+        let pre_roll_samples = ms_to_samples(config.pre_roll_ms)?;
+        let tail_samples = ms_to_samples(config.tail_ms)?;
+        let silence_split_samples = ms_to_samples(config.silence_split_ms)?.max(1);
+        let min_voice_samples = ms_to_samples(config.min_voice_ms)?;
+        let max_ms = config.max_duration_secs.checked_mul(1000)
+            .context("録音の max_duration_secs が大きすぎます")?;
+        let max_samples = ms_to_samples(max_ms)?.max(1);
         let output_dir = output_dir.as_ref().to_path_buf();
         fs::create_dir_all(&output_dir)
             .with_context(|| format!("区間録音ディレクトリの作成に失敗: {:?}", output_dir))?;
 
-        let ms_to_samples = |ms: u64| (ms * sample_rate as u64 / 1000) as usize;
 
         Ok(Self {
             channel_id,
@@ -162,11 +175,11 @@ impl SegmentRecorder {
             bitrate: config.bitrate,
             profile: config.profile,
             threshold_db,
-            pre_roll_samples: ms_to_samples(config.pre_roll_ms),
-            tail_samples: ms_to_samples(config.tail_ms),
-            silence_split_samples: ms_to_samples(config.silence_split_ms).max(1),
-            min_voice_samples: ms_to_samples(config.min_voice_ms),
-            max_samples: ms_to_samples(config.max_duration_secs * 1000).max(1),
+            pre_roll_samples,
+            tail_samples,
+            silence_split_samples,
+            min_voice_samples,
+            max_samples,
             pre_roll: VecDeque::new(),
             current: None,
             last_segment_id: None,
@@ -309,6 +322,25 @@ impl SegmentRecorder {
             duration_ms as f64 / 1000.0,
             seg.path
         );
+        // GUI は音声の確定後に公開した索引だけを読む。音声ファイルは変更しない。
+        let index_path = seg.path.with_extension(format!("{}.json", seg.path.extension().and_then(|s| s.to_str()).unwrap_or("audio")));
+        let temporary = index_path.with_extension("json.part");
+        let publish = || -> Result<()> {
+            let metadata = serde_json::json!({
+                "version": 1, "channel": self.channel_id,
+                "start_unix_ms": seg.start_unix_ms, "duration_ms": duration_ms,
+                "time_basis": "estimated_pc_clock", "id": seg.id
+            });
+            let mut file = fs::File::create(&temporary)?;
+            serde_json::to_writer(&mut file, &metadata)?;
+            file.flush()?;
+            fs::rename(&temporary, &index_path)?;
+            Ok(())
+        };
+        if let Err(error) = publish() {
+            // GUI の索引エラーで区間録音自体を無効化しない。
+            log::warn!("区間録音の GUI 索引保存に失敗: {:?}: {error:#}", index_path);
+        }
         Ok(Some(SegmentInfo {
             id: seg.id,
             channel: self.channel_id,
@@ -396,6 +428,12 @@ mod tests {
         let segs = feed(&mut rec, 5, false, &mut t);
 
         assert_eq!(segs.len(), 1);
+        let metadata_path = segs[0].path.with_extension("wav.json");
+        let metadata: serde_json::Value = serde_json::from_slice(&fs::read(metadata_path).unwrap()).unwrap();
+        assert_eq!(metadata["channel"], segs[0].channel);
+        assert_eq!(metadata["start_unix_ms"], segs[0].start_unix_ms);
+        assert_eq!(metadata["duration_ms"], segs[0].duration_ms);
+
         let seg = &segs[0];
         // pre-roll 20 + 発話 40 + tail 10
         assert_eq!(seg.duration_ms, 70);
@@ -492,4 +530,16 @@ mod tests {
         assert_eq!(read_wav(&seg.path).len(), 40);
         assert!(rec.finish().unwrap().is_none());
     }
+    #[test]
+    fn regression_invalid_recording_parameters_return_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(SegmentRecorder::new(0, dir.path(), 0, -40.0, &config()).is_err());
+        let mut cfg = config();
+        cfg.pre_roll_ms = u64::MAX;
+        assert!(SegmentRecorder::new(0, dir.path(), 48000, -40.0, &cfg).is_err());
+        cfg = config();
+        cfg.max_duration_secs = u64::MAX;
+        assert!(SegmentRecorder::new(0, dir.path(), 48000, -40.0, &cfg).is_err());
+    }
+
 }

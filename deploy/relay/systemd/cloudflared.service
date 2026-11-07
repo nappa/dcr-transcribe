@@ -1,0 +1,64 @@
+# Cloudflare Tunnel。/etc/systemd/system/cloudflared.service
+# cloudflared は Cloudflare の apt リポジトリから入れる(apt で更新される。自動更新は切る)。
+# トークンはコマンドラインに出さず(ps で見える)、systemd の資格情報として渡す:
+#   /etc/cloudflared/tunnel_token(root:root 0600)→ $CREDENTIALS_DIRECTORY/tunnel_token
+#
+# トンネルの転送先(ダッシュボードの Public Hostname): http://127.0.0.1:8765
+
+[Unit]
+Description=Cloudflare Tunnel for dcr-relay
+Wants=network-online.target
+After=network-online.target time-sync.target
+
+[Service]
+Type=notify
+User=cloudflared
+Group=cloudflared
+LoadCredential=tunnel_token:/etc/cloudflared/tunnel_token
+ExecStart=/usr/bin/cloudflared --no-autoupdate tunnel --metrics 127.0.0.1:20241 run --token-file ${CREDENTIALS_DIRECTORY}/tunnel_token
+Restart=always
+RestartSec=5
+TimeoutStartSec=0
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateUsers=yes
+RestrictSUIDSGID=yes
+KeyringMode=private
+RemoveIPC=yes
+UMask=0077
+
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+DevicePolicy=closed
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+InaccessiblePaths=-/etc/dcr-relay -/var/lib/dcr-relay -/root -/home
+
+# cloudflared はネットワークインタフェースの情報を netlink で読む
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @debug @cpu-emulation @obsolete @raw-io @reboot @swap @module @clock
+SystemCallErrorNumber=EPERM
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+LimitNOFILE=65536
+TasksMax=256
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

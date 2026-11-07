@@ -1,0 +1,12 @@
+# UFW を維持する場合の追加ルール。既存 ruleset は消さない。
+# UFW 側では UDP 8443 を許可する。直接 8443 に来た通信はここで拒否する。
+table inet dcr_relay {
+  chain prerouting {
+    type nat hook prerouting priority dstnat; policy accept;
+    udp dport 443 redirect to :8443
+  }
+  chain input {
+    type filter hook input priority -10; policy accept;
+    iifname != "lo" udp dport 8443 ct original proto-dst != 443 drop
+  }
+}

@@ -1,0 +1,33 @@
+# 中継サーバ(VPS)用の設定: dcr-transcribe --relay relay.toml
+# 会場の [uplink] から QUIC で受け取り、閲覧画面の配信(cloudflared 経由の HTTPS)をこちらで行う。
+
+# 閲覧画面の配信(ローカルの [remote] と同じ項目が使える)
+[remote]
+listen = "127.0.0.1:8765"               # cloudflared(下の [tunnel])から転送させる
+login_key_file = "./secrets/login_key"  # 閲覧画面のログインキー。無ければ生成
+history_size = 1000                     # 新しく開いた人に送る履歴の件数
+# block_private_relay = true            # iCloud プライベートリレー経由を拒否(Apple の出口 IP 一覧を 1 日ごとに取得)
+# allowed_countries = ["JP"]
+# turnstile_site_key = ""
+# turnstile_secret_key = ""
+# session_hours = 12
+
+# ライブ再生(会場から届く Opus を中継サーバでミックスして AAC で配信する)
+[live]
+enabled = true
+profile = "he"
+bitrate = 16000
+
+# 会場からの受け口: QUIC(UDP)+ mTLS。cloudflared は通さない
+# 証明書は `dcr-transcribe --gen-uplink-pki ./secrets/uplink <中継サーバの IP>` で作る
+[relay]
+listen = "[::]:8443"                           # UDP。外からは 443/udp で受けて nftables で 8443 へ
+cert_file = "./secrets/uplink/relay.pem"
+key_file = "./secrets/uplink/relay.key"
+client_ca_file = "./secrets/uplink/ca.pem"     # 会場の証明書を確かめる CA
+dir = "./relay-data"                           # 受け取った区間録音(起動ごとに日時名のディレクトリ)
+
+# VPS 上で cloudflared を動かして公開する(会場のローカル版と同じ設定)
+[tunnel]
+enabled = true
+token_file = "./secrets/tunnel_token"

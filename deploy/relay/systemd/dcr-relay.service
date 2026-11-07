@@ -1,0 +1,92 @@
+# 中継サーバ本体。/etc/systemd/system/dcr-relay.service
+#
+# 方針: 必要なものだけ許す。
+#   - 専用ユーザ dcr-relay(ログイン不可)。特権(capability)は一切持たせない(8765 番は 1024 以上)
+#   - 書けるのは /var/lib/dcr-relay(StateDirectory)だけ。設定 /etc/dcr-relay は読み取りのみ
+#   - システムコールは @system-service から特権系を除いたもの(seccomp)
+#   - さらに AppArmor のプロファイル(/etc/apparmor.d/opt.dcr-relay.bin.dcr-transcribe)で
+#     ファイル・ネットワークを絞る。外向きの通信先は nftables(uid 単位)で絞る
+#   - 待ち受けは 2 つ: 閲覧(HTTP、127.0.0.1:8765、cloudflared から)と会場(QUIC、UDP 8443、mTLS)。
+#     外の 443/udp は nftables で 8443 へ転送するので、特権ポートを開ける capability は要らない
+#   - QUIC の秘密鍵は root だけが読めるファイルに置き、systemd の資格情報として渡す
+#     (/etc/dcr-relay/tls/relay.key → /run/credentials/dcr-relay.service/relay.key)
+#
+# 確認: systemd-analyze security dcr-relay.service(数字が小さいほど堅い)
+
+[Unit]
+Description=dcr-transcribe relay (viewer server for the venue uplink)
+Documentation=file:///opt/dcr-relay/README.md
+# 時計が合ってから起動する(閲覧画面の時刻はこの機械の時計が基準)
+Wants=network-online.target time-sync.target
+After=network-online.target time-sync.target chrony.service
+# 落ち続けるときは 1 分に 10 回で諦める(journal に残る)
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=dcr-relay
+Group=dcr-relay
+ExecStart=/opt/dcr-relay/bin/dcr-transcribe --relay /etc/dcr-relay/relay.toml
+WorkingDirectory=/var/lib/dcr-relay
+Environment=RUST_LOG=info
+Restart=always
+RestartSec=2
+
+# QUIC(mTLS)の秘密鍵
+LoadCredential=relay.key:/etc/dcr-relay/tls/relay.key
+
+# 書き込み先
+StateDirectory=dcr-relay
+StateDirectoryMode=0700
+UMask=0077
+
+# ── 権限 ──
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateUsers=yes
+RestrictSUIDSGID=yes
+KeyringMode=private
+RemoveIPC=yes
+
+# ── ファイルシステム ──
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+DevicePolicy=closed
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ReadOnlyPaths=/etc/dcr-relay
+InaccessiblePaths=-/etc/cloudflared -/root -/home
+
+# ── ネットワーク ──
+# 待ち受けは 127.0.0.1:8765(cloudflared から)と UDP 8443(会場の QUIC)。
+# 外向きは Turnstile の検証(443)と時計の確認(NTP 123)だけ
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# ── システムコール(seccomp) ──
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @debug @cpu-emulation @obsolete @raw-io @reboot @swap @module @clock
+SystemCallErrorNumber=EPERM
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+# ── 資源 ──
+LimitNOFILE=65536
+TasksMax=512
+MemoryHigh=384M
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,13 @@
+## /etc/audit/rules.d/90-dcr.rules  反映: sudo augenrules --load
+## 設定・秘密の変更と、root でのコマンド実行を記録する(誰かに入られたときの調査用)
+-w /etc/dcr-relay/ -p wa -k dcr-config
+-w /etc/cloudflared/ -p wa -k cloudflared-config
+-w /opt/dcr-relay/bin/ -p wa -k dcr-binary
+-w /var/lib/dcr-relay/secrets/ -p wa -k dcr-secrets
+-w /etc/ssh/sshd_config -p wa -k sshd
+-w /etc/ssh/sshd_config.d/ -p wa -k sshd
+-w /etc/nftables.conf -p wa -k firewall
+-w /etc/apparmor.d/ -p wa -k apparmor
+-w /etc/sudoers -p wa -k sudoers
+-w /etc/sudoers.d/ -p wa -k sudoers
+-a always,exit -F arch=b64 -S execve -F euid=0 -F auid>=1000 -F auid!=unset -k root-exec

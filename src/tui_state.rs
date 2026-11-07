@@ -39,6 +39,8 @@ pub struct ChannelState {
     pub channel_id: usize,
     /// チャンネル名
     pub channel_name: String,
+    pub recording_error: Option<String>,
+    pub input_quality_warning: Option<String>,
     /// リアルタイムボリューム (dB)
     pub current_volume_db: f32,
     /// VAD閾値 (dB)
@@ -60,6 +62,8 @@ impl ChannelState {
         Self {
             channel_id,
             channel_name,
+            recording_error: None,
+            input_quality_warning: None,
             current_volume_db: -100.0,
             vad_threshold_db: -40.0, // デフォルト値
             vad_state: VadState::Silence,
@@ -154,19 +158,46 @@ impl ChannelState {
     }
 }
 
+/// 状態表示の色(緑・黄・赤・灰)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Health {
+    /// 正常
+    Good,
+    /// 動いているが品質が悪い(遅い・溜まっている・時計がずれている)
+    Warn,
+    /// 止まっている
+    Bad,
+    /// まだ分からない
+    Unknown,
+}
+
 /// 全チャンネルの状態を管理
 #[derive(Clone)]
 pub struct TuiState {
+    pub share_info: Arc<Mutex<Option<crate::share::ShareInfo>>>,
+    /// 中継サーバへのアップリンクの状態(色と 1 行)。アップリンクが無効なら None
+    pub uplink_status: Arc<Mutex<Option<(Health, String)>>>,
+    /// この機械の時計のずれ
+    pub clock: Arc<crate::clock::ClockMonitor>,
+    pub output_muted: Arc<std::sync::atomic::AtomicBool>,
+    pub input_health: crate::audio_health::StreamHealth,
+    pub output_health: crate::audio_health::StreamHealth,
     channels: Arc<Mutex<Vec<ChannelState>>>,
-    /// 音声出力用に選択されているチャンネルID (None = 選択なし)
-    selected_channel_for_output: Arc<Mutex<Option<usize>>>,
+    /// 同時にモニターするチャンネル。入力コールバックではtry_lockで参照する。
+    pub(crate) selected_channels_for_output: Arc<Mutex<std::collections::BTreeSet<usize>>>,
 }
 
 impl TuiState {
     pub fn new() -> Self {
         Self {
+            share_info: Arc::new(Mutex::new(None)),
+            uplink_status: Arc::new(Mutex::new(None)),
+            clock: crate::clock::ClockMonitor::new(),
+            output_muted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            input_health: Default::default(),
+            output_health: Default::default(),
             channels: Arc::new(Mutex::new(Vec::new())),
-            selected_channel_for_output: Arc::new(Mutex::new(None)),
+            selected_channels_for_output: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
         }
     }
 
@@ -199,17 +230,30 @@ impl TuiState {
         }
     }
 
-    /// 音声出力用のチャンネルを選択
     pub fn set_selected_channel_for_output(&self, channel_id: Option<usize>) {
-        let mut selected = self.selected_channel_for_output.lock().unwrap();
-        *selected = channel_id;
+        let mut selected = self.selected_channels_for_output.lock().unwrap();
+        selected.clear();
+        selected.extend(channel_id);
     }
 
-    /// 音声出力用に選択されているチャンネルIDを取得
     pub fn get_selected_channel_for_output(&self) -> Option<usize> {
-        let selected = self.selected_channel_for_output.lock().unwrap();
-        *selected
+        self.selected_channels_for_output.lock().unwrap().iter().next().copied()
     }
+
+    pub fn get_selected_channels_for_output(&self) -> Vec<usize> {
+        self.selected_channels_for_output.lock().unwrap().iter().copied().collect()
+    }
+
+    pub fn set_output_enabled(&self, channel: usize, enabled: bool) {
+        let mut selected = self.selected_channels_for_output.lock().unwrap();
+        if enabled { selected.insert(channel); } else { selected.remove(&channel); }
+    }
+
+    pub fn toggle_output(&self, channel: usize) {
+        let mut selected = self.selected_channels_for_output.lock().unwrap();
+        if !selected.remove(&channel) { selected.insert(channel); }
+    }
+
 }
 
 impl Default for TuiState {

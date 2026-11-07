@@ -2,11 +2,14 @@ use anyhow::{Context, Result};
 use crate::audio_input::cpal_device_name;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, FromSample, Sample, SampleFormat, SizedSample, Stream, StreamConfig};
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 /// 音声出力デバイスマネージャ
 pub struct AudioOutput {
+    health: crate::audio_health::StreamHealth,
+    muted: Arc<std::sync::atomic::AtomicBool>,
     device: Device,
     sample_rate: u32,
     stream: Option<Stream>,
@@ -14,6 +17,12 @@ pub struct AudioOutput {
 }
 
 impl AudioOutput {
+    pub fn set_health(&mut self, health: crate::audio_health::StreamHealth) {
+        self.health = health;
+    }
+
+    pub fn set_mute_flag(&mut self, flag: Arc<std::sync::atomic::AtomicBool>) { self.muted = flag; }
+
     /// 新しいAudioOutputを作成
     pub fn new(device_name: Option<&str>, sample_rate: u32) -> Result<Self> {
         let host = cpal::default_host();
@@ -33,6 +42,8 @@ impl AudioOutput {
         log::info!("出力デバイス: {}", cpal_device_name(&device)?);
 
         Ok(Self {
+            health: Default::default(),
+            muted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             device,
             sample_rate,
             stream: None,
@@ -97,7 +108,7 @@ impl AudioOutput {
         );
 
         // チャンネルを作成（大きめのバッファ）
-        let (audio_tx, audio_rx) = mpsc::channel::<Vec<i16>>(1024);
+        let (audio_tx, audio_rx) = mpsc::channel::<Vec<i16>>(8);
 
         // デバイスのサンプルフォーマットに応じてストリームを構築
         let stream = match default_config.sample_format() {
@@ -111,7 +122,11 @@ impl AudioOutput {
         };
 
         // ストリームを再生開始
-        stream.play().context("ストリームの再生開始に失敗")?;
+        self.health.start();
+        if let Err(error) = stream.play() {
+            self.health.stop();
+            return Err(error).context("ストリームの再生開始に失敗");
+        }
 
         self.stream = Some(stream);
         self.audio_tx = Some(audio_tx.clone());
@@ -129,24 +144,37 @@ impl AudioOutput {
         T: SizedSample + Sample + FromSample<f32> + Send + 'static,
     {
         // サンプルバッファを共有
-        let sample_buffer: Arc<Mutex<Vec<i16>>> = Arc::new(Mutex::new(Vec::new()));
+        let sample_buffer: Arc<Mutex<VecDeque<i16>>> = Arc::new(Mutex::new(VecDeque::new()));
         let sample_buffer_clone = sample_buffer.clone();
+        // 出力が止まっても、保持する音声は直近 1 秒まで。
+        let capacity = self.sample_rate as usize;
 
         // バックグラウンドタスクで音声データを受信してバッファに追加
         tokio::spawn(async move {
             while let Some(samples) = audio_rx.recv().await {
-                let mut buffer = sample_buffer_clone.lock().unwrap();
-                buffer.extend_from_slice(&samples);
+                let mut buffer = lock_samples(&sample_buffer_clone);
+                append_samples(&mut buffer, &samples, capacity);
             }
         });
 
+        let muted = self.muted.clone();
+        let health = self.health.clone();
+        let error_health = self.health.clone();
         // 出力ストリームを構築
         let stream = self
             .device
             .build_output_stream(
                 config,
                 move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
-                    let mut buffer = sample_buffer.lock().unwrap();
+                    if !data.is_empty() {
+                        health.heartbeat();
+                    }
+                    let mut buffer = lock_samples(&sample_buffer);
+                    if muted.load(std::sync::atomic::Ordering::Relaxed) {
+                        buffer.clear();
+                        data.fill(Sample::EQUILIBRIUM);
+                        return;
+                    }
 
                     if buffer.len() >= data.len() {
                         // バッファから必要なサンプル数を取り出し
@@ -170,6 +198,7 @@ impl AudioOutput {
                     }
                 },
                 move |err| {
+                    error_health.report_error();
                     log::error!("出力ストリームエラー: {}", err);
                 },
                 None,
@@ -188,6 +217,7 @@ impl AudioOutput {
 
     /// 音声ストリームを停止
     pub fn stop(&mut self) {
+        self.health.stop();
         if let Some(stream) = self.stream.take() {
             drop(stream);
             log::info!("出力ストリームを停止しました");
@@ -199,5 +229,55 @@ impl AudioOutput {
 impl Drop for AudioOutput {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+// 音声は再取得できないが、破損したバッファを破棄すれば再生を再開できる。
+fn lock_samples(buffer: &Mutex<VecDeque<i16>>) -> std::sync::MutexGuard<'_, VecDeque<i16>> {
+    buffer.lock().unwrap_or_else(|error| {
+        let mut samples = error.into_inner();
+        samples.clear();
+        buffer.clear_poison();
+        samples
+    })
+}
+
+fn append_samples(buffer: &mut VecDeque<i16>, samples: &[i16], capacity: usize) {
+    let incoming = &samples[samples.len().saturating_sub(capacity)..];
+    let keep = capacity.saturating_sub(incoming.len());
+    buffer.drain(..buffer.len().saturating_sub(keep));
+    buffer.extend(incoming.iter().copied());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stalled_output_retains_only_recent_audio() {
+        let mut buffer = VecDeque::new();
+        for i in 0..100 { append_samples(&mut buffer, &[i; 3], 5); }
+        assert_eq!(buffer.into_iter().collect::<Vec<_>>(), vec![98, 98, 99, 99, 99]);
+    }
+
+    #[test]
+    fn oversized_output_chunk_keeps_tail() {
+        let mut buffer = VecDeque::from(vec![1, 2]);
+        append_samples(&mut buffer, &[3, 4, 5, 6], 2);
+        assert_eq!(buffer, VecDeque::from(vec![5, 6]));
+        append_samples(&mut buffer, &[], 2);
+        assert_eq!(buffer, VecDeque::from(vec![5, 6]));
+        append_samples(&mut buffer, &[7], 0);
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn poisoned_output_buffer_is_cleared_and_reusable() {
+        let buffer = Mutex::new(VecDeque::from(vec![1, 2]));
+        let _ = std::panic::catch_unwind(|| { let _guard = buffer.lock().unwrap(); panic!("injected"); });
+        assert!(lock_samples(&buffer).is_empty());
+        assert!(!buffer.is_poisoned());
+        append_samples(&mut lock_samples(&buffer), &[3], 5);
+        assert_eq!(lock_samples(&buffer).pop_front(), Some(3));
     }
 }

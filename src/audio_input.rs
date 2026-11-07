@@ -1,13 +1,12 @@
 use crate::config::AudioConfig;
 use crate::live::LiveFrame;
-use crate::types::{AudioChunk, AudioFormat};
+use crate::types::{AudioChunk, AudioFormat, CaptureTiming};
 use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Sample, SizedSample};
-use regex_lite::Regex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
 /// 入力コールバック 1 回あたりのフレーム数
@@ -20,6 +19,7 @@ pub fn cpal_device_name(device: &cpal::Device) -> Result<String> {
 
 /// オーディオデバイスからのマルチチャンネル音声入力
 pub struct AudioInput {
+    health: crate::audio_health::StreamHealth,
     device: cpal::Device,
     config: cpal::StreamConfig,
     stream: Option<cpal::Stream>,
@@ -27,7 +27,9 @@ pub struct AudioInput {
     num_channels: u16,
     /// 実際にデバイスから開くチャンネル数。設定より少なければ残りは無音で埋める
     device_channels: u16,
-    live_tap: Option<LiveTap>,
+    /// ライブ配信への分岐(ローカルの閲覧サーバ・中継サーバへのアップリンク)
+    live_taps: Vec<LiveTap>,
+    monitor: Option<(mpsc::Sender<Vec<i16>>, crate::tui_state::TuiState)>,
 }
 
 /// ライブ配信への分岐。聞いている人がいる間だけ全チャンネル分をまとめて送る
@@ -38,6 +40,10 @@ struct LiveTap {
 }
 
 impl AudioInput {
+    pub fn set_health(&mut self, health: crate::audio_health::StreamHealth) {
+        self.health = health;
+    }
+
     /// 新しいAudioInputを作成
     pub fn new(config: &AudioConfig) -> Result<Self> {
         let host = cpal::default_host();
@@ -96,18 +102,24 @@ impl AudioInput {
         };
 
         Ok(Self {
+            health: Default::default(),
             device,
             config: stream_config,
             stream: None,
             num_channels: config.channels,
             device_channels,
-            live_tap: None,
+            live_taps: Vec::new(),
+            monitor: None,
         })
     }
 
-    /// ライブ配信用の分岐を設定する(`start` より前に呼ぶ)
-    pub fn set_live_tap(&mut self, tx: mpsc::Sender<LiveFrame>, active: Arc<AtomicBool>) {
-        self.live_tap = Some(LiveTap { tx, active });
+    pub fn set_monitor(&mut self, tx: mpsc::Sender<Vec<i16>>, state: crate::tui_state::TuiState) {
+        self.monitor = Some((tx, state));
+    }
+
+    /// ライブ配信用の分岐を追加する(`start` より前に呼ぶ)。`active` が立っている分岐にだけ送る
+    pub fn add_live_tap(&mut self, tx: mpsc::Sender<LiveFrame>, active: Arc<AtomicBool>) {
+        self.live_taps.push(LiveTap { tx, active });
     }
 
     /// ストリームを開始
@@ -140,7 +152,11 @@ impl AudioInput {
             _ => anyhow::bail!("サポートされていないサンプルフォーマット"),
         };
 
-        stream.play().context("ストリームの再生開始に失敗")?;
+        self.health.start();
+        if let Err(error) = stream.play() {
+            self.health.stop();
+            return Err(error).context("ストリームの再生開始に失敗");
+        }
         self.stream = Some(stream);
 
         log::info!("音声入力ストリームを開始しました");
@@ -169,12 +185,30 @@ impl AudioInput {
         let channel_senders = Arc::new(channel_senders);
 
         let drop_counters_cb = drop_counters.clone();
-        let live_tap = self.live_tap.clone();
+        let live_taps = self.live_taps.clone();
+        let monitor = self.monitor.clone();
         let device_channels = self.device_channels as usize;
+        let health = self.health.clone();
+        let error_health = self.health.clone();
+        let capture_origin = Instant::now();
+        let mut frame_index = 0u64;
         let data_callback = move |data: &[T], _info: &cpal::InputCallbackInfo| {
-            let live_on = live_tap
-                .as_ref()
-                .is_some_and(|t| t.active.load(Ordering::Relaxed));
+            if !data.is_empty() {
+                health.heartbeat();
+            }
+            // 同じ入力フレームからミックスするため、チャンネル数によって再生時間は増えない。
+            if let Some((tx, state)) = &monitor {
+                if !state.output_muted.load(Ordering::Relaxed) {
+                    if let Ok(selected) = state.selected_channels_for_output.try_lock() {
+                        let channels: Vec<_> = selected.iter().copied().collect();
+                        drop(selected);
+                        if !channels.is_empty() {
+                            let _ = tx.try_send(mix_monitor(data, device_channels, &channels));
+                        }
+                    }
+                }
+            }
+            let live_on = live_taps.iter().any(|t| t.active.load(Ordering::Relaxed));
             let mut live_channels = Vec::new();
 
             // タイムスタンプを取得（全チャンネルで共有）
@@ -185,6 +219,12 @@ impl AudioInput {
 
             // インターリーブされたデータを各チャンネルに分離
             let samples_per_channel = data.len() / device_channels;
+            let capture = CaptureTiming {
+                frame_index,
+                monotonic_ns: capture_origin.elapsed().as_nanos(),
+                synthetic: false,
+            };
+            frame_index = frame_index.saturating_add(samples_per_channel as u64);
 
             // 各チャンネルを順次処理
             for ch in 0..num_channels as usize {
@@ -205,6 +245,7 @@ impl AudioInput {
                         samples: silence,
                         format: AudioFormat { sample_rate, channels: 1 },
                         timestamp_ns,
+                        capture: Some(CaptureTiming { synthetic: true, ..capture }),
                     });
                     continue;
                 }
@@ -232,6 +273,7 @@ impl AudioInput {
                         channels: 1, // モノラル
                     },
                     timestamp_ns,
+                    capture: Some(capture),
                 };
 
                 // 非同期送信（ブロッキングしない）
@@ -259,14 +301,16 @@ impl AudioInput {
             }
 
             // ライブ配信へ(詰まっていたら捨てる。RT コールバックなので待たない)
-            if let (Some(tap), false) = (&live_tap, live_channels.is_empty()) {
-                let _ = tap.tx.try_send(LiveFrame {
-                    channels: live_channels,
-                });
+            if !live_channels.is_empty() {
+                let frame = LiveFrame { channels: live_channels, at_ms: (timestamp_ns / 1_000_000) as u64 };
+                for tap in live_taps.iter().filter(|t| t.active.load(Ordering::Relaxed)) {
+                    let _ = tap.tx.try_send(frame.clone());
+                }
             }
         };
 
         let error_callback = move |err| {
+            error_health.report_error();
             log::error!("ストリームエラー: {}", err);
         };
 
@@ -280,6 +324,7 @@ impl AudioInput {
 
     /// ストリームを停止
     pub fn stop(&mut self) {
+        self.health.stop();
         if let Some(stream) = self.stream.take() {
             drop(stream);
             log::info!("音声入力ストリームを停止しました");
@@ -311,30 +356,51 @@ impl AudioInput {
         Ok(())
     }
 
-    /// MacBook Air 本体・WebCam など、通常入力デバイスとして利用してはいけないデバイスを除外したデバイス一覧を取得
+    /// デバイス名による除外をせず、利用可能な入力をすべて取得する。
     fn input_devices() -> Result<Vec<cpal::Device>> {
         let host = cpal::default_host();
-        let devices = host
-            .input_devices()?
-            .filter(|device| {
-                if let Ok(name) = cpal_device_name(&device) {
-                    // 除外するデバイス名のリスト
-                    let excluded_names_regex = Regex::new("MacBook (Air|Pro)|AirPods|iPhone|Webcam|Background|Microsoft Teams|ZoomAudioDevice").unwrap();
-                    if excluded_names_regex.is_match(&name) {
-                        return false;
-                    }
-                    return true;
-                } else {
-                    true
-                }
-            })
-            .collect();
-        Ok(devices)
+        Ok(host.input_devices()?.collect())
     }
+
 }
 
 impl Drop for AudioInput {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+fn mix_monitor<T: Sample>(data: &[T], channels: usize, selected: &[usize]) -> Vec<i16>
+where <T as Sample>::Float: Into<f32> {
+    if channels == 0 { return Vec::new(); }
+    let selected: Vec<_> = selected.iter().copied().filter(|&channel| channel < channels).collect();
+    data.chunks_exact(channels).map(|frame| {
+        if selected.is_empty() { return 0; }
+        let sum: f32 = selected.iter().map(|&channel| {
+            let value: f32 = frame[channel].to_float_sample().into();
+            if value.is_finite() { value.clamp(-1.0, 1.0) } else { 0.0 }
+        }).sum();
+        ((sum / selected.len() as f32).clamp(-1.0, 1.0) * i16::MAX as f32) as i16
+    }).collect()
+}
+
+#[cfg(test)]
+mod monitor_tests {
+    use super::*;
+    #[test]
+    fn mixes_simultaneous_frames_without_extending_time_or_clipping() {
+        let mixed = mix_monitor(&[1.0f32, 1.0, -1.0, 1.0, 0.5, 0.0], 2, &[0, 1]);
+        assert_eq!(mixed, vec![32767, 0, 8191]);
+        assert_eq!(mix_monitor(&[0.5f32, -0.5], 2, &[1]), vec![-16383]);
+        assert_eq!(mix_monitor(&[0.5f32, -0.5], 2, &[9]), vec![0]);
+        assert_eq!(mix_monitor(&[f32::NAN, 1.0], 2, &[0, 1]), vec![16383]);
+    }
+    #[test]
+    fn output_toggles_are_independent() {
+        let state = crate::tui_state::TuiState::new();
+        state.toggle_output(0); state.toggle_output(1);
+        assert_eq!(state.get_selected_channels_for_output(), vec![0, 1]);
+        state.toggle_output(0);
+        assert_eq!(state.get_selected_channels_for_output(), vec![1]);
     }
 }

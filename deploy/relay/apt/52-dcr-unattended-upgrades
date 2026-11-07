@@ -1,0 +1,10 @@
+// /etc/apt/apt.conf.d/52-dcr-unattended-upgrades
+// セキュリティ更新は自動で入れる。勝手に再起動はしない(本番の前日に手動で再起動して確かめる)
+// cloudflared(Cloudflare の apt リポジトリ)も自動更新に含める
+Unattended-Upgrade::Origins-Pattern {
+        "origin=Ubuntu,archive=${distro_codename}-security";
+        "origin=UbuntuESM,archive=${distro_codename}-infra-security";
+        "origin=cloudflared";
+};
+Unattended-Upgrade::Automatic-Reboot "false";
+Unattended-Upgrade::Remove-Unused-Dependencies "true";

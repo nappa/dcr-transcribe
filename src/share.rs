@@ -10,17 +10,17 @@ const QUIET_ZONE: usize = 2;
 /// TUI に表示するログイン URL
 #[derive(Debug, Clone, PartialEq)]
 pub struct ShareInfo {
-    /// このパソコンから開く URL(`http://127.0.0.1:8765/?k=...`)
-    pub local: String,
-    /// 公開 URL(トンネル経由)。分からなければ None
+    /// このパソコンから開く URL(`http://127.0.0.1:8765/#k=...`)。ローカルの閲覧サーバが無ければ None
+    pub local: Option<String>,
+    /// 公開 URL(トンネル・中継サーバ経由)。分からなければ None
     pub public: Option<String>,
 }
 
 impl ShareInfo {
-    /// `login_path` は `/?k=<キー>`(ログイン無しなら `/`)
+    /// `login_path` は `/#k=<キー>`(ログイン無しなら `/`)
     pub fn new(remote: &RemoteConfig, tunnel: &TunnelConfig, login_path: &str) -> Self {
         Self {
-            local: format!("http://{}{}", remote.listen, login_path),
+            local: Some(format!("http://{}{}", remote.listen, login_path)),
             public: public_base(remote, tunnel).map(|base| format!("{}{}", base, login_path)),
         }
     }
@@ -125,13 +125,13 @@ mod tests {
         std::fs::write(&yml, "ingress:\n  - hostname: t.example.com\n    service: http://x\n").unwrap();
         let t = tunnel_with(yml.to_str().unwrap());
 
-        let s = ShareInfo::new(&remote(""), &t, "/?k=abc");
-        assert_eq!(s.local, "http://127.0.0.1:8765/?k=abc");
-        assert_eq!(s.public.as_deref(), Some("https://t.example.com/?k=abc"));
+        let s = ShareInfo::new(&remote(""), &t, "/#k=abc");
+        assert_eq!(s.local.as_deref(), Some("http://127.0.0.1:8765/#k=abc"));
+        assert_eq!(s.public.as_deref(), Some("https://t.example.com/#k=abc"));
 
         // public_url の設定が優先(末尾の / は取る)
-        let s = ShareInfo::new(&remote("https://other.example/"), &t, "/?k=abc");
-        assert_eq!(s.public.as_deref(), Some("https://other.example/?k=abc"));
+        let s = ShareInfo::new(&remote("https://other.example/"), &t, "/#k=abc");
+        assert_eq!(s.public.as_deref(), Some("https://other.example/#k=abc"));
 
         // トンネル無し・トークンだけのトンネルでは公開 URL は分からない
         assert_eq!(ShareInfo::new(&remote(""), &TunnelConfig::default(), "/").public, None);
@@ -141,7 +141,7 @@ mod tests {
 
     #[test]
     fn qr_has_quiet_zone_and_finder_pattern() {
-        let m = qr_modules("https://t.example.com/?k=0123456789abcdef0123456789abcdef").unwrap();
+        let m = qr_modules("https://t.example.com/#k=0123456789abcdef0123456789abcdef").unwrap();
         let n = m.len();
         assert!(m.iter().all(|r| r.len() == n));
         // 余白は白
@@ -156,7 +156,7 @@ mod tests {
 
     #[test]
     fn qr_decodes_back_to_url() {
-        let url = "https://transcribe-private.bunfree.net/?k=0123456789abcdef0123456789abcdef";
+        let url = "https://transcribe-private.bunfree.net/#k=0123456789abcdef0123456789abcdef";
         let m = qr_modules(url).unwrap();
         // 1 モジュール = 4x4 ピクセルの画像にして読み取る
         let scale = 4;
@@ -172,8 +172,8 @@ mod tests {
 
     #[test]
     fn svg_has_one_path_for_dark_modules() {
-        let svg = qr_svg("https://t.example.com/?k=abc").unwrap();
-        let n = qr_modules("https://t.example.com/?k=abc").unwrap().len();
+        let svg = qr_svg("https://t.example.com/#k=abc").unwrap();
+        let n = qr_modules("https://t.example.com/#k=abc").unwrap().len();
         assert!(svg.starts_with("<svg") && svg.ends_with("</svg>"));
         assert!(svg.contains(&format!("viewBox=\"0 0 {n} {n}\"")));
         assert_eq!(svg.matches("<path").count(), 1);

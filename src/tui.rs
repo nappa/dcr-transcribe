@@ -1,5 +1,5 @@
 use crate::share::{qr_modules, ShareInfo};
-use crate::tui_state::{ChannelState, TranscribeStatus, TuiState};
+use crate::tui_state::{ChannelState, Health, TranscribeStatus, TuiState};
 use crate::types::VadState;
 use anyhow::Result;
 use chrono::Timelike;
@@ -35,6 +35,7 @@ pub struct TuiApp {
     share_shown: bool,
     /// 窓で公開 URL ではなくローカル URL を出すか
     share_local: bool,
+    flash_clock: std::time::Instant,
 }
 
 impl TuiApp {
@@ -46,6 +47,7 @@ impl TuiApp {
             share: None,
             share_shown: false,
             share_local: false,
+            flash_clock: std::time::Instant::now(),
         }
     }
 
@@ -66,6 +68,10 @@ impl TuiApp {
 
         // メインループ
         loop {
+            // 中継サーバのログイン URL はつながってから届くので、共有状態から取り直す
+            if let Some(share) = self.tui_state.share_info.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+                self.share = Some(share);
+            }
             // 画面を描画
             terminal.draw(|f| self.draw(f))?;
 
@@ -104,6 +110,10 @@ impl TuiApp {
                                 // ログインキーを含むので、開いたときだけ表示する
                                 self.share_shown = true;
                                 self.share_local = self.share.as_ref().is_some_and(|s| s.public.is_none());
+                                // ローカル URL が無ければ公開 URL だけ
+                                if self.share.as_ref().is_some_and(|s| s.local.is_none()) {
+                                    self.share_local = false;
+                                }
                             }
                             KeyCode::Char('q') | KeyCode::Esc => {
                                 // 終了確認ダイアログを表示
@@ -140,13 +150,7 @@ impl TuiApp {
 
                                         // 該当するチャンネルが存在するか確認
                                         if channels.iter().any(|ch| ch.channel_id == channel_id) {
-                                            // 現在の選択と同じなら選択解除、異なるなら選択
-                                            let current_selection = self.tui_state.get_selected_channel_for_output();
-                                            if current_selection == Some(channel_id) {
-                                                self.tui_state.set_selected_channel_for_output(None);
-                                            } else {
-                                                self.tui_state.set_selected_channel_for_output(Some(channel_id));
-                                            }
+                                            self.tui_state.toggle_output(channel_id);
                                         }
                                     }
                                 }
@@ -181,6 +185,7 @@ impl TuiApp {
                 .borders(Borders::ALL);
             let paragraph = Paragraph::new("チャンネルがありません").block(block);
             f.render_widget(paragraph, f.area());
+            self.draw_device_alert(f, self.flash_clock.elapsed().as_secs() % 2 == 0);
             return;
         }
 
@@ -203,12 +208,12 @@ impl TuiApp {
             .split(rows[0]);
 
         // 選択されているチャンネルIDを取得
-        let selected_channel_id = self.tui_state.get_selected_channel_for_output();
+        let selected_channels = self.tui_state.get_selected_channels_for_output();
 
         // 各チャンネルを描画
         for (i, channel) in channels.iter().enumerate() {
             if i < chunks.len() {
-                let is_selected = selected_channel_id == Some(channel.channel_id);
+                let is_selected = selected_channels.contains(&channel.channel_id);
                 self.draw_channel(f, chunks[i], channel, is_selected);
             }
         }
@@ -217,10 +222,34 @@ impl TuiApp {
             self.draw_share(f);
         }
 
+        self.draw_device_alert(f, self.flash_clock.elapsed().as_secs() % 2 == 0);
+
         // 終了確認ダイアログを描画
         if self.exit_confirm_shown {
             self.draw_exit_confirm_dialog(f);
         }
+    }
+
+    fn draw_device_alert(&self, f: &mut Frame, flash: bool) {
+        let mut messages: Vec<String> = [
+            ("入力", &self.tui_state.input_health),
+            ("出力", &self.tui_state.output_health),
+        ].into_iter().filter_map(|(label, health)| {
+            health.problem().map(|problem| format!("{label}: {problem}"))
+        }).collect();
+        messages.extend(self.tui_state.get_all_channels().into_iter().filter_map(|channel| {
+            channel.recording_error.map(|error| format!("{}: {error}", channel.channel_name))
+        }));
+        if messages.is_empty() { return; }
+        let area = if flash { f.area() } else {
+            Rect { height: f.area().height.min(4), ..f.area() }
+        };
+        f.render_widget(Clear, area);
+        let message = format!("{}\n接続・保存先を確認してください。復帰しない場合は再起動。 q: 終了", messages.join("\n"));
+        f.render_widget(Paragraph::new(message)
+            .wrap(ratatui::widgets::Wrap { trim: true })
+            .style(Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD))
+            .block(Block::default().title("音声・録音警告").borders(Borders::ALL)), area);
     }
 
     /// 最下行のキー操作の案内
@@ -231,15 +260,27 @@ impl TuiApp {
             spans.extend([key(" u"), Span::raw(": ログイン URL / QR  ")]);
         }
         spans.extend([key(" 1-9"), Span::raw(": 音声出力  "), key(" q"), Span::raw(": 終了")]);
+        if let Some((health, up)) = self.tui_state.uplink_status.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+            spans.extend([Span::raw("   "), Span::styled(format!("● {}", up), Style::default().fg(health_color(health)))]);
+        }
+        // この機械の時計のずれ(測れるまでは灰)
+        let clock = &self.tui_state.clock;
+        let (health, text) = match clock.offset_ms() {
+            Some(o) if o.abs() > clock.warn_ms() => (Health::Warn, format!("時計 {:+.1}s", o as f64 / 1000.0)),
+            Some(o) => (Health::Good, format!("時計 {:+}ms", o)),
+            None => (Health::Unknown, "時計 未測定".to_string()),
+        };
+        spans.extend([Span::raw("   "), Span::styled(format!("● {}", text), Style::default().fg(health_color(health)))]);
         f.render_widget(Paragraph::new(Line::from(spans)).style(Style::default().fg(Color::Gray)), area);
     }
 
     /// ログイン URL と QR コードの窓
     fn draw_share(&self, f: &mut Frame) {
         let Some(share) = &self.share else { return };
-        let (label, url) = match (&share.public, self.share_local) {
-            (Some(public), false) => ("公開 URL", public.as_str()),
-            _ => ("ローカル URL(このパソコンからのみ)", share.local.as_str()),
+        let (label, url) = match (&share.public, &share.local, self.share_local) {
+            (Some(public), _, false) | (Some(public), None, _) => ("公開 URL", public.as_str()),
+            (_, Some(local), _) => ("ローカル URL(このパソコンからのみ)", local.as_str()),
+            (None, None, _) => return,
         };
         let qr = qr_modules(url).ok();
         // QR は上下 2 モジュールを 1 文字(▀)で描くので、高さは半分
@@ -257,7 +298,7 @@ impl TuiApp {
             height,
         };
         f.render_widget(Clear, popup);
-        let switch_hint = if share.public.is_some() { "  l: 公開/ローカル切替" } else { "" };
+        let switch_hint = if share.public.is_some() && share.local.is_some() { "  l: 公開/ローカル切替" } else { "" };
         let block = Block::default()
             .title(format!(" {} ", label))
             .title_bottom(format!(" u / Esc: 閉じる{} ", switch_hint))
@@ -314,7 +355,13 @@ impl TuiApp {
             )
         };
 
-        let border_color = if is_selected {
+        let title = if channel.input_quality_warning.is_some() {
+            format!("{title} [入力品質警告]")
+        } else { title };
+
+        let border_color = if channel.input_quality_warning.is_some() {
+            Color::Yellow
+        } else if is_selected {
             Color::Yellow
         } else {
             Color::White
@@ -338,7 +385,7 @@ impl TuiApp {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(0),    // Transcribe結果
-                Constraint::Length(1), // 空白行
+                Constraint::Length(if channel.input_quality_warning.is_some() { 2 } else { 1 }), // 入力品質警告
                 Constraint::Length(1), // ボリュームバー
                 Constraint::Length(1), // ステータス
             ])
@@ -347,7 +394,12 @@ impl TuiApp {
         // 1. Transcribe結果表示
         self.draw_transcripts(f, sections[0], channel);
 
-        // 2. 空白行（何も描画しない）
+        // 2. 品質警告は録音停止の赤い警告と区別する。
+        if let Some(warning) = &channel.input_quality_warning {
+            f.render_widget(Paragraph::new(warning.as_str())
+                .wrap(ratatui::widgets::Wrap { trim: true })
+                .style(Style::default().fg(Color::Yellow)), sections[1]);
+        }
 
         // 3. ボリューム表示
         self.draw_volume_bar(f, sections[2], channel);
@@ -604,14 +656,10 @@ impl TuiApp {
                 local_dt.second()
             )
         } else {
-            // パース失敗時はタイムスタンプの一部を抽出する簡易版
-            // "2025-01-04T12:34:56" の形式から "12:34:56" を抽出
-            if timestamp.len() >= 19 {
-                let time_part = &timestamp[11..19]; // "12:34:56"
-                time_part.to_string()
-            } else {
-                "--:--:--".to_string()
-            }
+            timestamp.get(..19)
+                .and_then(|s| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").ok())
+                .map(|dt| dt.format("%H:%M:%S").to_string())
+                .unwrap_or_else(|| "--:--:--".to_string())
         }
     }
 
@@ -678,6 +726,16 @@ fn unicode_width(s: &str) -> usize {
     s.chars().count()
 }
 
+/// 状態表示の色(緑・黄・赤・灰)
+fn health_color(h: Health) -> Color {
+    match h {
+        Health::Good => Color::Green,
+        Health::Warn => Color::Yellow,
+        Health::Bad => Color::Red,
+        Health::Unknown => Color::DarkGray,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -711,8 +769,8 @@ mod tests {
 
     fn share() -> ShareInfo {
         ShareInfo {
-            local: "http://127.0.0.1:8765/?k=abc".into(),
-            public: Some("https://t.example.com/?k=abc".into()),
+            local: Some("http://127.0.0.1:8765/#k=abc".into()),
+            public: Some("https://t.example.com/#k=abc".into()),
         }
     }
 
@@ -725,7 +783,7 @@ mod tests {
     #[test]
     fn share_popup_is_hidden_until_opened() {
         let a = app(Some(share()));
-        assert!(!text(&render(&a, 100, 40)).contains("https://t.example.com/?k=abc"));
+        assert!(!text(&render(&a, 100, 40)).contains("https://t.example.com/#k=abc"));
     }
 
     #[test]
@@ -734,11 +792,11 @@ mod tests {
         a.share_shown = true;
         let buf = render(&a, 100, 40);
         let all = text(&buf);
-        assert!(all.contains("https://t.example.com/?k=abc"));
+        assert!(all.contains("https://t.example.com/#k=abc"));
         assert!(all.contains("公開 URL"));
 
         // ▀ の前景 = 上のモジュール、背景 = 下のモジュール(黒 = 暗)。QR の左上隅を探して照合する
-        let m = qr_modules("https://t.example.com/?k=abc").unwrap();
+        let m = qr_modules("https://t.example.com/#k=abc").unwrap();
         let area = buf.area;
         let origin = (0..area.height)
             .flat_map(|y| (0..area.width).map(move |x| (x, y)))
@@ -755,7 +813,7 @@ mod tests {
 
         // l でローカル URL に切り替え
         a.share_local = true;
-        assert!(text(&render(&a, 100, 40)).contains("http://127.0.0.1:8765/?k=abc"));
+        assert!(text(&render(&a, 100, 40)).contains("http://127.0.0.1:8765/#k=abc"));
     }
 
     #[test]
@@ -764,4 +822,54 @@ mod tests {
         a.share_shown = true;
         assert!(text(&render(&a, 60, 15)).contains("端末が小さくて"));
     }
+    #[test]
+    fn regression_malformed_timestamps_do_not_panic() {
+        for value in ["", "短い", "あいうえおかきくけこ", "xxxxxxxxxxxxxxxxxxxx"] {
+            assert_eq!(TuiApp::extract_time_hhmmss(value), "--:--:--");
+        }
+        assert_eq!(TuiApp::extract_time_hhmmss("2026-10-17T12:34:56"), "12:34:56");
+    }
+
+    #[test]
+    fn device_error_flashes_screen_and_keeps_banner_between_flashes() {
+        let a = app(None);
+        a.tui_state.input_health.start();
+        a.tui_state.input_health.report_error();
+        for flash in [true, false] {
+            let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            terminal.draw(|f| a.draw_device_alert(f, flash)).unwrap();
+            let buf = terminal.backend().buffer();
+            assert!(text(buf).contains("入力: デバイスエラー"));
+            assert_eq!(buf[(99, 29)].bg == Color::Red, flash);
+        }
+        a.tui_state.input_health.start();
+        assert!(!text(&render(&a, 100, 30)).contains("音声・録音警告"));
+    }
+
+    #[test]
+    fn alerts_survive_small_terminal_and_do_not_hide_quit_confirmation() {
+        let mut a = app(None);
+        a.tui_state.output_health.start();
+        a.tui_state.output_health.report_error();
+        for (width, height) in [(0, 0), (1, 1), (10, 2)] { render(&a, width, height); }
+        a.exit_confirm_shown = true;
+        assert!(text(&render(&a, 100, 30)).contains("確認"));
+        a.tui_state.output_health.stop();
+        a.tui_state.update_channel(0, |ch| ch.recording_error = Some("録音停止".into()));
+        assert!(text(&render(&a, 100, 30)).contains("録音停止"));
+    }
+
+    #[test]
+    fn input_quality_warning_is_visible_and_clears_without_full_screen_alarm() {
+        let a = app(None);
+        a.tui_state.update_channel(0, |ch| ch.input_quality_warning = Some("ハム成分が継続。接続を確認".into()));
+        let content = text(&render(&a, 100, 30));
+        assert!(content.contains("ハム成分"));
+        assert!(content.contains("入力品質警告"));
+        assert!(!content.contains("音声・録音警告"));
+        for (w, h) in [(0, 0), (1, 1), (10, 2)] { render(&a, w, h); }
+        a.tui_state.update_channel(0, |ch| ch.input_quality_warning = None);
+        assert!(!text(&render(&a, 100, 30)).contains("入力品質警告"));
+    }
+
 }

@@ -9,588 +9,11 @@ ZOOMオーディオインターフェースなどのマルチチャンネル入�
 ### 主な特徴
 
 - **マルチチャンネル対応**: 1つの入力デバイスから複数チャンネルの音声を独立処理
-- **無音区間の最適化**: VAD（Voice Activity Detection）で無音区間を検出した場合も、Amazon Transcribeの仕様上、最低3分間は無音FLACデータを送り続ける。3分間完全無音が続いた場合はストリームを一旦切断し、音声再検出時に自動で再接続することでコスト削減。
 - **ネットワーク耐性**: 5G回線の不安定性に対応したリトライ機構とバッファリング
 - **完全な録音**: 無音区間を含めた全音声をチャンネル毎にWAVファイルとして保存
 - **タイムスタンプ付き出力**: 秒単位のタイムスタンプで発話タイミングを記録
 - **リアルタイムTUI**: ratatuiを使用したターミナルUIで各チャンネルの状態をリアルタイム表示
 - **音声出力機能**: 選択したチャンネルの音声を別の出力デバイスにリアルタイム送信
-
-## システム概要図
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    ZOOM Audio Interface                         │
-│                   (Multi-channel Input)                          │
-└────┬────────┬────────┬────────┬─────────────────────────────────┘
-     │        │        │        │
-     │Ch1     │Ch2     │Ch3     │Ch4 ...
-     │        │        │        │
-     v        v        v        v
-┌─────────────────────────────────────────────────────────────────┐
-│                      AudioInput Module                           │
-│  (cpal: デバイスからの音声ストリーム受信)                        │
-└────┬────────┬────────┬────────┬─────────────────────────────────┘
-     │        │        │        │
-     v        v        v        v
-┌─────────────────────────────────────────────────────────────────┐
-│              ChannelProcessor (独立スレッド × N)                 │
-│  ┌───────────────────────────────────────────────────┐          │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────────┐    │          │
-│  │  │   VAD    │─>│  Buffer  │─>│ WavWriter    │    │          │
-│  │  │ (無音検出)│  │(リトライ用)│  │(常時録音)    │    │          │
-│  │  └────┬─────┘  └──────────┘  └──────────────┘    │          │
-│  │       │音声区間のみ        ↓                      │          │
-│  │       v                 TuiState (共有状態)       │          │
-│  │  ┌──────────────────────────────┐                 │          │
-│  │  │   TranscribeClient           │                 │          │
-│  │  │ (リトライ機構・バッファ管理)  │                 │          │
-│  │  └──────────┬───────────────────┘                 │          │
-│  │             │文字起こし結果                        │          │
-│  │             v                                     │          │
-│  │  ┌──────────────────────────────┐                 │          │
-│  │  │   OutputFormatter            │                 │          │
-│  │  │ (タイムスタンプ付き出力)      │                 │          │
-│  │  └──────────────────────────────┘                 │          │
-│  │             │                                     │          │
-│  │             │全サンプル (選択時のみ)               │          │
-│  │             v                                     │          │
-│  │  ┌──────────────────────────────┐                 │          │
-│  │  │   AudioOutput (オプション)    │                 │          │
-│  │  │ (選択チャンネルの音声出力)    │                 │          │
-│  │  └──────────┬───────────────────┘                 │          │
-│  └─────────────┼───────────────────────────────────┘          │
-└────────────────┼────────────────────────────────────────────┘
-                 │
-        ┌────────┴─────────────┐
-        v                      v
-┌───────────────┐      ┌──────────────────┐
-│   TUI Module  │      │ ログ出力         │
-│   (ratatui)   │      │ WAVファイル      │
-│ リアルタイム  │      │ 音声出力デバイス │
-│ 状態表示      │      └──────────────────┘
-│ チャンネル選択│
-└───────────────┘
-```
-
-## データフロー
-
-### 1. 音声入力フェーズ
-
-```
-[オーディオインターフェース]
-    → [AudioInput: cpalストリームコールバック]
-    → チャンネル分離
-    → 各ChannelProcessorへ配信
-```
-
-- オーディオインターフェースからのサンプリングレート: 通常 44.1kHz または 48kHz
-- サンプルフォーマット: i16 (16-bit PCM)
-- 各チャンネルは独立したスレッドで処理
-
-### 2. チャンネル処理フェーズ
-
-各ChannelProcessorは以下の処理を並行実行：
-
-#### a) VAD（Voice Activity Detection）
-```
-[音声サンプル]
-    → パワー計算（RMS）
-    → 閾値判定
-    → 音声区間 / 無音区間の判定
-```
-
-**判定基準**:
-- RMS（Root Mean Square）による音声パワー計算
-- 設定可能な閾値（デフォルト: -40dB）
-- ハングオーバー時間: 音声終了後も一定時間（例: 500ms）は音声区間とみなす
-
-#### b) バッファリング
-```
-[音声サンプル]
-    → リングバッファに追加
-    → Transcribeへ送信
-    → 送信成功後も一定期間保持（リトライ用）
-```
-
-**バッファ戦略**:
-- 容量: 設定可能（デフォルト: 300秒分）
-- ドロップポリシー: 最古のデータから破棄（DropOldest）
-- リトライ時は保持済みバッファから再送
-
-#### c) WAV書き出し
-```
-[全音声サンプル（無音含む）]
-    → WavWriter
-    → チャンネル毎のWAVファイル出力
-```
-
-**ファイル命名規則**:
-- `channel_{channel_id}_{timestamp}.wav`
-- 例: `channel_0_20250102_143000.wav`
-
-### 3. Transcribe送信フェーズ
-
-```
-[音声区間]
-    → TranscribeClient
-    → AWS Transcribe Streaming API
-    → 文字起こし結果受信
-    → タイムスタンプ付きで出力
-```
-
-**送信仕様**:
-- プロトコル: WebSocket over HTTPS
-- エンコーディング: FLAC (Transcribe APIの仕様に準拠)
-- チャンク単位: 設定可能（デフォルト: 100ms相当 or 128KB）
-- 言語: ja-JP（設定ファイルで変更可能）
-- VADで無音判定時も、最低3分間は無音FLACデータ（エンコーダで生成した無音チャンク）を送り続ける。
-- 3分間完全無音が続いた場合はTranscribeストリームを一旦切断し、音声再検出時に自動で再接続する。
-- ストリーム切断・再接続は自動で行われ、ユーザー操作不要。
-
-### 4. 出力フェーズ
-
-```
-[Transcribe結果]
-    → タイムスタンプ追加
-    → チャンネル情報追加
-    → 標準出力
-```
-
-### 5. 音声出力フェーズ（オプション）
-
-```
-[TUIで選択されたチャンネルの音声サンプル]
-    → AudioOutput
-    → cpal出力ストリーム
-    → 出力デバイス（スピーカー等）
-```
-
-**音声出力仕様**:
-- TUIで数字キー（0-9）を押すことで対応するチャンネルを選択
-- 選択されたチャンネルの音声がリアルタイムで出力デバイスに送信
-- 1つのチャンネルのみ選択可能（トグル動作）
-- デフォルト出力デバイスを使用
-- サンプルレート: 入力と同じ（通常16kHz）
-- チャンネル数: モノラル（1ch）
-
-**出力フォーマット**:
-```json
-{
-  "channel": 0,
-  "timestamp": "2025-01-02T14:30:15.234Z",
-  "timestamp_seconds": 1704204615.234,
-  "text": "こちら本部、応答願います",
-  "is_partial": false
-}
-```
-
-## コンポーネント設計
-
-### AudioInput モジュール
-
-**責務**: オーディオデバイスからのマルチチャンネル音声入力
-
-**主要インターフェース**:
-```rust
-pub struct AudioInput {
-    device: cpal::Device,
-    config: cpal::StreamConfig,
-    channels: Vec<mpsc::Sender<AudioChunk>>,
-}
-
-impl AudioInput {
-    pub fn new(device_id: Option<String>) -> Result<Self>;
-    pub fn start(&mut self) -> Result<()>;
-    pub fn stop(&mut self);
-}
-```
-
-**内部動作**:
-- cpalを使用してデフォルトまたは指定されたデバイスを開く
-- インターリーブされたマルチチャンネルデータを各チャンネルに分離
-- 各チャンネル用のmpsc channelを通じてChannelProcessorに送信
-
-### ChannelProcessor モジュール
-
-**責務**: 1つのチャンネルの完全な処理パイプライン
-
-**主要インターフェース**:
-```rust
-pub struct ChannelProcessor {
-    channel_id: usize,
-    vad: VoiceActivityDetector,
-    buffer: AudioBuffer,
-    transcribe_client: TranscribeClient,
-    wav_writer: WavWriter,
-    config: ChannelConfig,
-}
-
-impl ChannelProcessor {
-    pub fn new(channel_id: usize, config: ChannelConfig) -> Self;
-    pub async fn process_chunk(&mut self, chunk: AudioChunk) -> Result<()>;
-}
-```
-
-**処理フロー**:
-1. 音声チャンクを受信
-2. WAVファイルに書き込み（無音含む全データ）
-3. VADで音声区間を判定
-4. 音声区間の場合、バッファに追加してTranscribeに送信
-5. Transcribe結果を受信して出力
-
-### VoiceActivityDetector (VAD) モジュール
-
-**責務**: 音声区間の検出
-
-**主要インターフェース**:
-```rust
-pub struct VoiceActivityDetector {
-    threshold_db: f32,
-    hangover_duration_ms: u32,
-    state: VadState,
-}
-
-enum VadState {
-    Silence,
-    Voice { hangover_remaining_ms: u32 },
-}
-
-impl VoiceActivityDetector {
-    pub fn new(threshold_db: f32, hangover_duration_ms: u32) -> Self;
-    pub fn process(&mut self, samples: &[i16]) -> bool; // true = 音声あり
-}
-```
-
-**アルゴリズム**:
-- RMS（Root Mean Square）でパワーを計算
-- デシベル変換: `20 * log10(rms / i16::MAX)`
-- 閾値を超えたら音声開始
-- 閾値を下回っても、ハングオーバー期間は音声継続とみなす
-
-### AudioBuffer モジュール
-
-**責務**: リトライ用の音声データバッファリング
-
-**主要インターフェース**:
-```rust
-pub struct AudioBuffer {
-    capacity_seconds: u32,
-    samples: VecDeque<BufferedChunk>,
-    drop_policy: DropPolicy,
-}
-
-struct BufferedChunk {
-    samples: Vec<i16>,
-    timestamp_ns: u128,
-}
-
-impl AudioBuffer {
-    pub fn new(capacity_seconds: u32, drop_policy: DropPolicy) -> Self;
-    pub fn push(&mut self, chunk: AudioChunk);
-    pub fn get_range(&self, from_ns: u128, to_ns: u128) -> Vec<i16>;
-    pub fn clear_before(&mut self, timestamp_ns: u128);
-}
-```
-
-**バッファ管理**:
-- リングバッファとして実装
-- 容量オーバー時は`DropPolicy`に従って古いデータを破棄
-- Transcribe送信成功後も一定期間保持（リトライに備える）
-
-### TranscribeClient モジュール
-
-**責務**: AWS Transcribe Streaming APIとの通信
-
-**無音時の動作仕様**:
-- VADで無音判定時も、最低3分間は無音FLACデータを送り続ける。
-- 3分間完全無音が続いた場合はTranscribeストリームを一旦切断。
-- その後、音声が再検出されたら自動でTranscribeストリームを再開する。
-- 無音FLACデータはエンコーダで生成した無音チャンクを送信する。
-- このロジックは`src/transcribe.rs`で実装。
-
-**主要インターフェース**:
-```rust
-pub struct TranscribeClient {
-    config: TranscribeConfig,
-    retry_policy: RetryPolicy,
-    buffer_ref: Arc<Mutex<AudioBuffer>>,
-}
-
-impl TranscribeClient {
-    pub async fn new(config: TranscribeConfig) -> Result<Self>;
-    pub async fn send_audio(&mut self, samples: &[i16]) -> Result<()>;
-    pub async fn receive_transcripts(&mut self) -> Result<Option<TranscriptResult>>;
-}
-```
-
-**リトライ戦略**:
-- 指数バックオフ: 1秒 → 2秒 → 4秒 → 8秒（最大）
-- 最大リトライ回数: 設定可能（デフォルト: 5回）
-- リトライ時はバッファから該当区間のデータを再送
-- 永続的な失敗の場合はエラーログ出力して継続
-
-### WavWriter モジュール
-
-**責務**: チャンネル毎のWAVファイル書き出し
-
-**主要インターフェース**:
-```rust
-pub struct WavWriter {
-    channel_id: usize,
-    output_dir: PathBuf,
-    current_file: Option<hound::WavWriter<BufWriter<File>>>,
-    spec: hound::WavSpec,
-}
-
-impl WavWriter {
-    pub fn new(channel_id: usize, output_dir: PathBuf, spec: hound::WavSpec) -> Self;
-    pub fn write_samples(&mut self, samples: &[i16]) -> Result<()>;
-    pub fn finalize(&mut self) -> Result<()>;
-}
-```
-
-**ファイル管理**:
-- チャンネル毎に独立したWAVファイル
-- 無音区間を含む全データを記録
-- ファイルサイズ/時間で分割可能（オプション）
-
-### AudioOutput モジュール
-
-**責務**: 選択されたチャンネルの音声を出力デバイスにリアルタイム送信
-
-**主要インターフェース**:
-```rust
-pub struct AudioOutput {
-    device: cpal::Device,
-    sample_rate: u32,
-    stream: Option<cpal::Stream>,
-    audio_tx: Option<mpsc::Sender<Vec<i16>>>,
-}
-
-impl AudioOutput {
-    pub fn new(device_name: Option<&str>, sample_rate: u32) -> Result<Self>;
-    pub fn start(&mut self) -> Result<mpsc::Sender<Vec<i16>>>;
-    pub fn stop(&mut self);
-    pub fn list_devices() -> Result<()>;
-}
-```
-
-**動作**:
-- TUIでチャンネルが選択されると、該当ChannelProcessorにSenderが設定される
-- 音声サンプルがリアルタイムでmpsc channelを通じて送信される
-- cpalの出力ストリームでデバイスに再生
-- バッファ不足時は無音で埋めて途切れを防止
-
-### OutputFormatter モジュール
-
-**責務**: タイムスタンプ付きJSON出力
-
-**主要インターフェース**:
-```rust
-pub struct OutputFormatter {
-    start_time: SystemTime,
-}
-
-impl OutputFormatter {
-    pub fn new() -> Self;
-    pub fn format(&self, channel_id: usize, result: TranscriptResult) -> String;
-}
-```
-
-**出力仕様**:
-- JSON Lines形式（1行1JSON）
-- ISO 8601形式のタイムスタンプ
-- Unixエポック秒も併記
-- チャンネルID、部分結果フラグを含む
-
-## エラーハンドリング戦略
-
-### ネットワークエラー
-
-**発生場所**: TranscribeClient
-
-**対策**:
-1. **接続タイムアウト**: 設定可能なタイムアウト（デフォルト: 10秒）
-2. **送信失敗時**:
-   - AudioBufferから該当区間を再取得
-   - 指数バックオフでリトライ（1秒 → 2秒 → 4秒 → 8秒）
-   - 最大リトライ回数に達したらエラーログ出力して継続
-3. **接続断**:
-   - 自動再接続（バックオフ付き）
-   - 再接続中もバッファリング継続
-   - バッファ溢れ時は最古データから破棄
-
-### バッファオーバーフロー
-
-**発生場所**: AudioBuffer
-
-**対策**:
-1. **DropPolicy.DropOldest**: 最古のチャンクから破棄
-2. ログに警告を出力
-3. 破棄されたデータの期間を記録（後でギャップとして報告可能）
-
-### デバイスエラー
-
-**発生場所**: AudioInput
-
-**対策**:
-1. **デバイス接続失敗**:
-   - エラーログを出力して終了
-   - または利用可能なデバイス一覧を表示
-2. **ストリームエラー**:
-   - エラーログ出力
-   - 可能であれば再初期化を試みる
-
-### WAVファイル書き込みエラー
-
-**発生場所**: WavWriter
-
-**対策**:
-1. **ディスク容量不足**:
-   - エラーログ出力
-   - 該当チャンネルの録音を停止（Transcribeは継続）
-2. **ファイルアクセスエラー**:
-   - エラーログ出力
-   - 代替パスで再試行
-
-### Transcribe APIエラー
-
-**発生場所**: TranscribeClient
-
-**対策**:
-1. **認証エラー**:
-   - エラーログ出力して終了（設定の見直しが必要）
-2. **レート制限**:
-   - 指数バックオフでリトライ
-   - リトライ中もバッファリング継続
-3. **その他APIエラー**:
-   - エラー内容をログ出力
-   - リトライ可能ならリトライ、不可能なら該当チャンクをスキップ
-
-## 設定ファイル仕様
-
-設定ファイル (`config.toml`) の構造:
-
-```toml
-[audio]
-device_id = "default"  # または具体的なデバイスID
-sample_rate = 16000    # Hz (16kHz - AWS Transcribeの推奨値、量子化ビット数は16bit固定)
-channels = 4           # チャンネル数
-
-[vad]
-threshold_db = -40.0           # dB
-hangover_duration_ms = 500     # ms
-
-[buffer]
-capacity_seconds = 300         # 秒
-drop_policy = "drop_oldest"    # drop_oldest | drop_newest | block
-
-[transcribe]
-region = "ap-northeast-1"      # 東京リージョン
-language_code = "ja-JP"        # 日本語
-sample_rate = 16000            # Transcribeに送信するサンプルレート (16kHz)
-max_retries = 5
-timeout_seconds = 10
-
-[output]
-wav_output_dir = "./recordings"
-log_level = "info"             # error | warn | info | debug
-
-[[channels]]
-id = 0
-name = "無線機1"
-enabled = true
-
-[[channels]]
-id = 1
-name = "無線機2"
-enabled = true
-
-# 以下、必要なチャンネル数分定義
-```
-
-## パフォーマンス考慮事項
-
-### CPU使用率
-- チャンネル毎に独立スレッド → CPU並列化が重要
-- VADは軽量（RMS計算のみ）
-- Transcribeへの送信は非同期I/O
-
-### メモリ使用量
-- バッファサイズ × チャンネル数が主要な消費源
-- 30秒バッファ × 4チャンネル × 16kHz × 2byte ≈ 3.84 MB
-- 非常に軽量
-
-### ネットワーク帯域
-- 音声データサイズ: 16kHz × 2byte = 32 KB/s per channel
-- 4チャンネル × 32 KB/s = 128 KB/s ≈ 1 Mbps
-- 5G回線では十分
-
-## TUI (Terminal User Interface) モジュール
-
-### 概要
-
-ratatuiとcrosstermを使用したリアルタイム監視インターフェース。
-各チャンネルの状態を1つのスクリーンに表示。
-
-### 表示内容
-
-各チャンネルごとに以下の情報を表示：
-
-1. **ボリュームバー（2行）**
-   - リアルタイム入力ボリューム（シアン、200msecごとに更新）
-   - 瞬間最大ボリューム（イエロー、3秒単位）
-   - 範囲: -60dB ~ 0dB
-
-2. **ステータス行（1行）**
-   - VAD状態: 灰色（無音） / 青色（音声あり）
-   - Transcribe接続状態: 緑色（正常） / 赤色（エラー） / 灰色（無通信）
-
-3. **文字起こし結果（残りスペース）**
-   - 最新10件の文字起こしテキスト
-   - HH:MM形式の時刻付き
-
-### TuiState モジュール
-
-**責務**: TUIとChannelProcessor間の状態共有
-
-```rust
-pub struct TuiState {
-    channels: Arc<Mutex<Vec<ChannelState>>>,
-}
-
-pub struct ChannelState {
-    pub channel_id: usize,
-    pub channel_name: String,
-    pub current_volume_db: f32,
-    pub peak_volume_db: f32,
-    pub vad_state: VadState,
-    pub transcribe_status: TranscribeStatus,
-    pub transcripts: VecDeque<TranscriptEntry>,
-}
-
-pub enum TranscribeStatus {
-    Connected,   // 正常
-    Error,       // エラー
-    Disconnected, // 無通信
-}
-```
-
-**更新タイミング**:
-- ボリューム: 各音声チャンク処理時（ChannelProcessor::process_chunk）
-- VAD状態: 各音声チャンク処理時
-- Transcribe状態: 送信成功/失敗時
-- 文字起こし結果: Transcribe結果受信時
-
-**スレッドセーフ**:
-- Arc<Mutex<>>で保護された共有状態
-- 各ChannelProcessorとTUIタスクから並行アクセス可能
-
-### 操作
-
-- `q` または `Esc`: アプリケーション終了
-- 自動更新: 200msecごと
 
 ## Remote Server モジュール
 
@@ -602,13 +25,12 @@ pub enum TranscribeStatus {
 - スマートフォンからの閲覧を主対象とする
 - 多クライアント / スロークライアント耐性
 - 細い回線 / 切断の頻発に耐える
-- 既存パイプラインから完全隔離
 
 **フロー**:
 
 ```
 [transcript task]
-    │ state.push_with_segment(&result, segment_id)  (同期、Mutex は µs レベル)
+    │ state.push_with_segment(&result, segment_id)
     │ state.push_segment(&segment)                  (区間録音が閉じたとき)
     v
 [RemoteState]
@@ -634,7 +56,7 @@ pub enum TranscribeStatus {
 - ログイン: `/?k=<キー>` で一定時間比較のうえセッションを作り、クッキーを発行してキーを消した `/` へ 303。キーは `login_key` か `login_key_file`(無ければ生成・600 で保存)
 - セッションは「確認待ち(Pending、ログインキーは通ったが Turnstile 未通過、10 分)」と「有効(Full)」の 2 段階。データ系は Full のみ
 - `/healthz` 以外は `CF-IPCountry` が `allowed_countries` に含まれるものだけ通す。ヘッダが無いのは Host が `localhost` / `127.0.0.1` のときだけ許可(トンネル経由なら Host は公開ホスト名)
-- Turnstile が有効なら、`/` はセッションが無いと確認画面(`static/gate.html`)を返す。`POST /verify` で siteverify に問い合わせ、通れば 32 バイト乱数のセッション ID をクッキー(HttpOnly / Secure / SameSite=Lax)で発行
+- Turnstile が有効なら、ログイン後に確認画面(`static/gate.html`)を返す。ログインキーが無効な構成では直接確認画面を返す。`POST /verify` で siteverify に問い合わせ、通れば 32 バイト乱数のセッション ID をクッキー(HttpOnly / Secure / SameSite=Lax)で発行
 - データ系(`/stream` `/history` `/segments` `/audio` `/live` `/session`)はセッション必須。閲覧画面は SSE が閉じたら `/session` を確かめ、403 なら再読み込みして確認画面へ戻る
 
 **多クライアント・スロークライアント対策**:
@@ -661,7 +83,7 @@ pub enum TranscribeStatus {
 - JSON キーを 1 文字に短縮: `c` (channel), `s` (timestamp_seconds), `x` (text), `p` (partial)
 - `p` が false なら省略 (`#[serde(skip_serializing_if)]`)
 - partial は default で送らない、有効時もチャンネル毎 throttle
-- HTML/JS は単一ファイル、外部依存なし、brotli で約 9.5KB(ETag で再取得は 304)
+- HTML/JS は単一ファイル、外部依存なし、brotli 圧縮と ETag に対応
 - SSE 圧縮は使わない(中継プロキシで stream バッファ事故を避けるため)
 - 再接続時 `Last-Event-ID` で欠損のみ転送(重複なし)
 
@@ -675,25 +97,25 @@ pub enum TranscribeStatus {
 - 新しい順(新着が上)。各行に時刻 `data-k` を持たせて降順に挿入するので、遅れて届いた結果も時刻の位置に入る
 - 見ている位置より上に行が入ったらその分スクロールして表示を保つ(`overflow-anchor: none` で自前補正)
 - 「最新へ」FAB(下へスクロール中に新着件数を表示)、過去分は下端で `/history` から読み込む
-- 録音の連続再生: 再生し終えたら録音時刻が次に新しい区間へ。最新まで来たら `seg` イベントを待って続ける
+- 録音の連続再生: 再生し終えたら録音時刻が次に新しい区間へ。最新まで来たらライブ再生に切り替える
 - 接続状態を可視化(接続中/再接続中…/切断 を色付きピルで表示)
 
 **発話ごとの録音** (`SegmentRecorder`、`[segments]`):
 
 - `ChannelProcessor::process_chunk` で VAD と同じ音量値を受け取り、`threshold_db` 超えで区間開始、`silence_split_ms` の無音で区間終了
-- VAD のハングオーバー(Transcribe 接続維持用で長い)とは独立に判定するので、発話の切れ目ごとに区切れる
+- VAD のハングオーバーとは独立に判定するので、発話の切れ目ごとに区切れる
 - 無音中のサンプルはメモリに保留し、発話が再開したら書き出す → 末尾の無音を `tail_ms` に切り詰めつつストリーミング書き込み
 - 区間 ID はプロセス内で単調増加。文字起こし結果は受信時点で録音中(または直前)の区間 ID `g` を持つ
   (Transcribe のタイムスタンプはストリームごとに 0 から始まるので、時刻での突き合わせはしない)
 - 区間は SSE `event: seg` (ID なし) で通知。再接続時はクライアントが `/segments?after=<既知の最大 ID>` で取りこぼしを回収
 - `/audio/{id}` は登録済み ID のみ受け付け(任意パスは読ませない)、iOS Safari のため Range に対応、`Cache-Control: private`
-- 保存形式は AAC-LC / ADTS (`src/aac.rs`、fdk-aac) が既定。ADTS はコンテナ不要で、書き込み途中でも先頭から再生できる
+- 保存形式は AAC / ADTS (`src/aac.rs`、fdk-aac) が既定。ADTS はコンテナ不要で、書き込み途中でも先頭から再生できる
 
 **ライブ再生** (`LiveHub`、`[live]`):
 
 ```
 [AudioInput callback] ── 聞いている人がいる間だけ ──> LiveFrame {全有効 ch のサンプル}
-        │ try_send (mpsc 64、詰まったら捨てる)
+        │ try_send (詰まったら捨てる)
         v
 [LiveHub::run] 各ミックス(ch の組み合わせ)ごとに 合算 → AacEncoder → broadcast<Bytes>
         v
@@ -708,10 +130,252 @@ pub enum TranscribeStatus {
 
 詳細なセットアップ手順は [README.md](README.md#リモート閲覧-httpsse--cloudflare-tunnel) を参照。
 
-## 今後の拡張性
+## Uplink / Relay モジュール(中継サーバ方式)
 
-- **複数の文字起こしバックエンド**: Google Speech-to-Text, Azure等への対応
-- **話者識別**: チャンネル内での複数話者の識別
-- **感情分析**: 音声の感情解析
-- **WebUIダッシュボード**: ブラウザベースの可視化（TUIの代替）
-- **クラウドストレージ連携**: WAVファイルの自動アップロード
+**責務**: 会場の細い上り回線を閲覧者の人数から切り離す。会場は QUIC(UDP)1 本で中継サーバへ送り、配信は中継サーバが行う
+
+**ファイル**: `src/uplink.rs`(会場側・プロトコル定義 `uplink::proto`)、`src/relay.rs`(中継サーバ側)、`src/pki.rs`(私設 CA・mTLS の設定)
+
+```
+[engine] ─ push_transcript / push_segment / push_status ─> [Uplink: Outbox]
+[AudioInput] ─ LiveFrame(聞かれている ch だけ)─> [Opus 20ms + FEC] ─┐   │
+                                                                 v   v
+                                     [QUIC 1 本(mTLS、cloudflared を通さない)]
+                                      ├─ 双方向ストリーム(制御・文字起こし・状態、優先度 10)
+                                      ├─ 単方向ストリーム × 区間録音 1 件ずつ(優先度 0)
+                                      └─ データグラム(ライブ音声、再送しない)
+                                                                 ║
+[Relay] ─ push_event / register_segment / push_wire_status / LiveHub.process ─> [RemoteState] ─> 閲覧者(cloudflared)
+```
+
+- 中継サーバは `remote_server::build` / `serve` で同じ RemoteState・router(認証・SSE・録音・ライブ)を使う。閲覧の HTTP には会場の口は無い
+- QUIC は quinn + rustls(aws-lc-rs)。TLS 1.3 だけ、ALPN `dcr-uplink/1`、0-RTT なし。
+  中継サーバは私設 CA が署名したクライアント証明書を必須にし(`WebPkiClientVerifier`)、会場は同じ CA が署名したサーバ証明書だけを信用する
+- 中継サーバは送信元をまだ確かめていない接続要求に retry を返す。ハンドシェイクの失敗は 1 分ごとに件数だけログに出す
+- keep-alive 5 秒・アイドル 20 秒で切断。接続の移行を許す(会場の IP が変わっても続く。中継サーバはアドレスの変化をログに残す)
+- 会場は同時に 1 つ(新しい接続が来たら古い接続を閉じる)
+
+**プロトコル** (制御ストリームは `[長さ u32 BE][JSON {"t":...}]`):
+
+| 向き | 経路 | メッセージ | 内容 |
+|---|---|---|---|
+| 会場→ | 制御 | `hello` | `run`(起動ごとの乱数)、`anchor_ms`、チャンネル一覧、ライブ可否 |
+| ←中継 | 制御 | `welcome` | 受け取り済みの `q` / `k`、閲覧画面のログインパス |
+| 会場→ | 制御 | `ev` | 文字起こし(連番 `q` + WireEvent) |
+| 会場→ | 制御 | `st` | チャンネルの状態(意味のある変化があったとき全チャンネル分) |
+| 会場→ | 単方向 | `seg` + 中身 | 区間録音の見出し(連番 `k`、`n` バイト)に続けて中身、ストリームを閉じて終わり |
+| ←中継 | 制御 | `ack` | 区間録音 `k` を保存・登録した |
+| ←中継 | 制御 | `want` | ライブ音声を送ってほしいチャンネル(LiveHub の聴取者から算出、変化時のみ) |
+| 会場→ | データグラム | `[0x02][連番 u32]` + `[ch u16][len u16][Opus]`… | ライブ音声 20ms 分(全チャンネル同じ時刻) |
+| ←中継 | 制御 | `tq` | 10 秒ごとの時刻の問い合わせ(中継の UNIX ms `a`) |
+| 会場→ | 制御 | `tr` | 返事。`a` と会場の UNIX ms `b`、未送信の文字起こし `pe`・区間録音 `ps` |
+| ←中継 | 制御 | `lk` | 測った結果(往復 `rtt`、会場の時計 − 中継の時計 `vo`、中継の時計のずれ `so`)。会場の TUI に出す |
+
+制御ストリームの読み出しは `select!` で途中キャンセルすると壊れるので、別タスク(`proto::spawn_reader`)で読んで channel に流す。
+
+**再送と重複排除**:
+
+- 会場は文字起こしを `retain_events` 件、区間録音を 1000 件まで手元に残す。接続のたびに `welcome` の `q` / `k` より後ろだけ送る
+- 中継サーバは `run` ごとに `last_q` / `last_k` を持ち、それ以下は捨てる。中継サーバが再起動すると `run` を知らないので 0 を返し、会場は残している分を全部送り直す
+- 区間録音は受け取り終えてから保存・登録・`ack`。保存に失敗したら `ack` を返さず、つなぎ直しで送り直させる。
+  受け取り済み・中身なし・大きすぎる区間はストリームを止めて(`STOP_SENDING`)`ack` だけ返す
+
+**時刻と ID の付け替え** (`relay::Run`):
+
+- 閲覧画面の anchor は中継サーバの起動時刻。会場の `s` には `(会場 anchor − 中継 anchor) / 1000` を足す → 会場を再起動しても閲覧画面の履歴は 1 本につながる
+- 区間 ID は会場の起動ごとに `seg_base`(それまでに振った最大 ID)を足す。文字起こしの `g` も同じだけずらすので、録音が後から届いても行とつながる
+
+**混雑時の振る舞い**:
+
+- パケットが落ちて待つのは、そのパケットのストリームだけ。区間録音のストリームは優先度が低いので、制御ストリームのデータが先に出る
+- 1 回の送信で、状態 → 文字起こし(最大 50 件)の順に制御ストリームへ書く。区間録音は 1 件ずつ、`ack` を待ってから次
+- ライブ音声は会場の送信待ち 10 フレーム(200ms)。あふれたら捨てる。連番は捨てた分も進めるので、中継サーバは欠けを知って
+  1 フレームなら FEC、5 フレームまでなら補間で埋め(`relay::LiveReceiver`)、それより長い欠けは埋めない。遅れて届いたものは捨てる
+- 会場は 1→2→4…15 秒で再接続。一度でも失敗した後の接続待ちは TUI で赤、最後の理由(タイムアウト・証明書など)も出す
+
+**閲覧画面への通知**: RemoteState が `upstream`(watch)を持つときだけ SSE で `event: up` を送る。
+`{"on":true,"rtt":85,"q":0,"k":0,"vo":-20}` / `{"on":false,"t":<最終受信 UNIX ms>}`。
+`rtt` / `q` / `k` / `vo` は `tq` / `tr` の測定ごとに更新する。画面は切断中「会場と切断」(赤)を出し、チャンネルの状態を薄く表示する。
+会場がつなぎ直したら状態の差分の基準を消し、次の状態を全チャンネル分配信させる。
+
+## 接続の状態表示と時計の監視
+
+**問題の切り分け**(`static/index.html` の `rows` / `diagnose`):
+
+```
+端末 ──(1)── Cloudflare エッジ ──(2)── cloudflared ── サーバ ──(3)── 会場 ──(4)── AWS
+(1) /cdn-cgi/trace   エッジ自身が返す(サーバまで行かない)。ts= でエッジの時刻も分かる
+(2) /healthz         サーバまで届くか。SSE の心拍 event: hb(10 秒ごと)が途絶えていないか
+(3) event: up        中継サーバが測った会場との往復・未送信数・接続状態
+(4) event: st        チャンネルごとの Transcribe 状態
+```
+
+(1) も (2) も届かない → 端末側、(1) は届き (2) が届かない → サーバ側、(3) が切断 → 会場側、(4) がエラー → 会場 ⇄ AWS。
+Cloudflare を通らない直結では (1) が 403/404 になるので「測定なし」とし、(2) が届かなくても端末側かサーバ側かは判別しない。
+
+**時計** (`src/clock.rs`): SNTP(RFC 4330)で `[clock] server` に問い合わせ、この機械の時計 − 正しい時刻 を `ClockMonitor` に持つ。
+応答の origin timestamp が送った時刻と一致するものだけ受け付け、往復 2 秒超の測定は捨てる。時計は直さない(chrony / OS の役目)。
+
+| 時計 | 誰が測るか | どこに出るか |
+|---|---|---|
+| サーバ | サーバ自身(SNTP) | `event: hb` の `so`、ログ |
+| 会場 | 会場自身(SNTP)/ 中継サーバ(`tq` / `tr`、往復の真ん中で答えたとみなす) | 会場の TUI / `event: up` の `vo`(画面は `vo + so` を出す)、中継サーバのログ |
+| 閲覧端末 | 画面(`/cdn-cgi/trace` の `ts` と往復時間。直結なら心拍の時刻で大まかに) | 状態ボタンの内訳 |
+
+**遅延の測り方**(どれも片道。時計のずれを補正するので、誤差は各時計の測定の往復の半分ほど):
+
+| 区間 | 測り方 |
+|---|---|
+| 文字起こし: AWS | `e`(Transcribe が返した発話の終わり、anchor からの秒)と `r`(会場が結果を受け取った UNIX ms)の差。どちらも会場の時計なので補正は要らない(音声の時刻はオーディオの時計で進むので、長時間ではそのずれだけ誤差になる) |
+| 文字起こし: 配信 | 画面に届いた時刻 −(端末の時計のずれ)−(`r` −会場の時計のずれ)。会場の時計のずれは中継なら `vo + so`、直結なら `so` |
+| ライブ: 会場→中継 | データグラムの「録った時刻」(会場の時計)を `vo` で中継サーバの時計に直し、届いた時刻との差を 1 秒ほどでならして `event: up` の `ld` に(2 秒ごと) |
+| ライブ: 中継→端末 | 心拍 `hb` の `ms −so` と、受け取った時刻 −端末の時計のずれ(Cloudflare のエッジで測れたときだけ)の差 |
+| ライブ: 再生待ち | 端末のバッファ(`liveLag`)+ AudioContext の `outputLatency` / `baseLatency`。符号化の遅れ(数十 ms)は含まない |
+
+**SSE の再接続**: 画面が自分で接続を作り直すとき(心拍の途絶・HTTP エラー)は `?last=<受信済みの最大 ID>` を付ける
+(`EventSource` は新しい接続に `Last-Event-ID` を付けないため)。受信済み以下の ID は画面側でも捨てる。
+hello の anchor が変わったらサーバが再起動して ID が振り直されたとみなし、表示を捨てて読み込み直す。
+
+## HTTP の守り(`src/security.rs`・`src/private_relay.rs`)
+
+- 応答ヘッダは `security::headers_middleware`(router のいちばん外側)が全部の応答に付ける。ページは `Page` が
+  自分の CSP(`security::page_csp`、インラインの script / style の sha256 を起動時に計算)を付け、middleware はそれを上書きしない。
+  ページ以外は `default-src 'none'; sandbox`
+- 閲覧画面は Trusted Types(`trusted-types 'none'`)を掛けるので、`innerHTML` を使わず `el()` で DOM を組み立てる
+- guard の順: メソッド → `/healthz` は素通し → Fetch Metadata(`security::check_fetch`、エンドポイントごとの読み方。
+  ヘッダが無ければ `require_fetch_metadata` で断る。報告と音声だけはヘッダ無しも通す)→ 国・Tor → プライベートリレー → セッション
+- `/` を開いたとき、`browser::too_old` で版を確かめる(UA Client Hints の Chromium の版、無ければ User-Agent。iOS は WebKit の版)
+- ログイン: `/#k=` → ログインの画面(`LOGIN_SCRIPT_PAGE`)が `history.replaceState` でキーを消してから `POST /login`。
+  ログアウト: `POST /logout` でセッションを消し、`Clear-Site-Data: "cache", "storage"` とクッキーの失効
+- 報告: `Reporting-Endpoints: default="/reports", csp="/reports"`、COOP / COEP は `report-to="default"`、
+  NEL は HTTPS のときだけ `Report-To`(絶対 URL)+ `NEL`。`security::summarize_reports` が種類ごとに要点を出す
+- 会場 ⇄ 中継の QUIC は鍵交換を X25519MLKEM768(耐量子のハイブリッド)だけにしている(`pki::provider`)
+- メモリアロケータは mimalloc の secure モード(`src/lib.rs` の `#[global_allocator]`。ガードページ・空きリストのポインタの暗号化・
+  割り当て位置のランダム化・二重解放の検出)。バイナリも cdylib も同じ。起動ログに `メモリアロケータ: mimalloc (...)` が出る。
+  flacenc の `mimalloc` 機能は使わない(依存クレートの中で暗黙に決まらないように)
+- クッキーは HTTPS(`X-Forwarded-Proto: https`)なら `__Host-dcr_session`、平文の HTTP なら `dcr_session`。読むのも同じ規則(HTTPS で接頭辞なしは信用しない)。
+  SameSite=Strict なので、ログイン直後と別サイトからの遷移の直後は `RELOAD_PAGE`(`location.replace("/")`)で同じオリジンから開き直させる
+- プライベートリレー: Apple の出口 IP の CSV を範囲にまとめて二分探索(IPv4 約 1,000・IPv6 約 6,000 範囲)。1 日ごとに取り直し、
+  写しをファイルに残す。一度も読めていないうちは止めない
+- 対応していないブラウザ: 案内(`#unsup`)を最初から出しておき、別の小さな script が必要な機能を確かめたら `html.ok` を付けて隠す。
+  本体の script は `window.__dcrOk` が無ければ何もしない
+
+**アクセスログ** (`remote_server::access_log`): 閲覧用の全ルートに掛ける middleware。target `access` に 1 行の JSON。
+クエリの `k`(ログインキー)・`u`(キーを含む共有 URL)は `***` にする。`/healthz` は記録しない。
+
+## SwiftUI 操作画面（初版実装と今後の設計）
+
+`macos/` に SwiftUI / AVFoundation による収録・文字起こし画面を実装した。
+現在は TUI と同じチャンネル横並び構成で、列内の大部分を 共有エンジンの文字起こしに割り当て、
+音量・入力状態・Transcribe状態を列の下部へ固定する。時計、コンパクトなチャンネル別タイムライン、
+スクロール・拡大縮小、保存ファイルのクリック再生、
+キーボード操作、正常再生終了時の最新表示への自動復帰に対応する。
+区間録音の確定時に Rust が `*.aac.json` / `*.wav.json` の索引を公開し、GUI が3秒ごとに更新する。
+既存 WAV と旧セッション配下の区間録音はファイル名から時刻を推定する。
+GUI の確定文字起こし・録音索引・走査フォルダは Application Support の `history.jsonl` に追記して保持する。
+起動時に復元し、エンジンの直近100件の窓から消えた交信も残す。旧ログの確定結果は一度だけ移行する。
+「履歴」メニューから文字起こし／プレイバックを個別にクリアし、クリア時刻より前の項目を再取り込みしない。
+クリア時には残った履歴に圧縮する。音声原本は削除しない。通常終了は履歴の保存タスク完了を待つ。
+
+録音・VAD・文字起こし・任意の公開用HTTPサーバーは `src/engine.rs` に集約する。
+TUI は CLI から、SwiftUI は `src/embedded.rs` の C ABI を通じて同じエンジンを呼ぶ。
+SwiftUI アプリは Rust cdylib を同一プロセスにロードする。GUI用のHTTP接続や収録子プロセスは使わない。
+Rust ワーカースレッドがランタイムを所有し、Swift 側は200msごとに TuiState のスナップショットを取得する。
+起動時の自動開始・終了時の停止、出力チャンネル選択、プレイバック中の一時ミュートを C ABI で操作する。
+アプリ終了時は非同期で停止・録音確定を待ってから終了する。二重開始は Rust 側でも拒否する。
+ライブラリは Rust の TLS のためプロセス終了まで保持し、エンジンハンドルは停止完了後に解放する。
+
+以下は目標仕様を含む。音声欠落の正確な位置対応、ファイル間の連続再生はまだ実装していない。
+初版の「最新」は読み込んだ録音の末尾を指す。
+
+### 画面と操作
+
+- 上部: 録音状態、入力・出力デバイス、保存エラー、現在時刻。入力停止は画面警告に加え
+  タイムライン上にも欠落表示を残す。無音と入力欠落を同じ色にしない。
+- 中央: 横軸は壁時計、縦軸は 1ch, 2ch, 3ch… の固定行。交信区間をバーで表示する。
+  直近 5 分・30 分・全収録の表示切替、拡大縮小、横スクロール、現在位置への復帰を用意する。
+  12 時間表示では画面幅に応じて時間バケットへ集約し、ズーム時に個別区間を読む。
+- バーのクリック: その区間を選択して再生。バー内のクリック位置からの再生も可能にする。
+  文字起こし行をクリックした場合も同じ選択・再生状態へ移る。
+- 下部または右側: 選択区間の文字起こし、時刻、再生・停止、シーク、再生速度。
+  過去再生中はライブモニターを一時ミュートし、再生完了時にライブへ自動復帰する。
+  収録・文字起こしは継続する。過去を操作している間は自動スクロールを止める。
+- キー操作: 既存の 1〜9 はライブモニターチャンネルの選択・解除として維持する。
+  追加で上下はタイムラインの行移動、左右は前後の交信、Space は選択区間の再生・一時停止、
+  Esc は再生を止めライブへ復帰。ライブモニター選択と履歴選択は別々に持つ。
+  TUI の q/Esc 終了は TUI に残し、GUI は通常のウィンドウ操作と明示的な収録停止を分ける。
+  テキスト入力中の数字・Space はショートカットとして奪わない。
+
+### スクロールによる過去音声の再生
+
+- タイムライン上のマウスホイールで時間を前後に移動し、トラックパッドの横スクロールにも
+  対応する。チャンネル名は左端に固定する。チャンネル一覧側の縦スクロールは行移動に使う。
+- 過去へスクロールすると現在時刻への自動追従を解除する。新しい交信が届いても表示範囲を
+  動かさず、「現在から何分前」を表示する。スクロール自体では音声を再生・シークしない。
+- 聞きたいバー、またはチャンネル行の録音済み位置をクリックすると、その位置から再生する。
+  過去音声を再生しながら別の時間帯をスクロールして探すこともできる。
+  再生カーソルと閲覧範囲は別の状態として持ち、次のクリックで再生位置を切り替える。
+- 同じチャンネルの保存音声をファイル分割境界を越えて連続再生する。通常の無音は保持する。
+  未録音・入力欠落は明示し、存在しない音声を無音として偽装しない。欠落に達したら再生を
+  止め、次の録音箇所への移動を提示する。録音中は安全に読み出せる確定済み範囲までを対象とする。
+- バーからのプレイバックは選択区間の末尾までを対象とする。時間位置からの連続再生は、
+  再生開始時点の確定済み録音末尾を終点として固定する。収録が進んでも終点を延ばし続けない。
+- 再生が正常に完了したら、タイムラインと文字起こしを最新位置へ戻し、自動追従を再開する。
+  プレイバック音声を終了してライブモニターの一時ミュートを解除する。モニターチャンネルの
+  選択・解除状態は保持し、未選択だった場合に勝手に音声を流さない。
+  再生中に別の時刻へスクロールしていても、再生完了時は最新表示へ復帰する。
+- 一時停止、音声の読み込み待ち、再生エラー、録音欠落による停止は正常完了と区別し、
+  現在の閲覧位置と再生位置を維持する。別区間への再生切替後に旧区間の完了通知が届いても、
+  新しい再生を中断してライブへ戻さない。
+- 「現在へ戻る」ボタンと Esc は過去再生を止め、最新位置の自動追従とライブモニターを復帰する。
+  閲覧・再生操作中も収録、文字起こし、現在時計の表示を継続する。
+- 表示範囲とその前後だけ区間索引を読み込み、音声は再生位置の周辺だけ先読みする。
+  高速スクロール時は不要になった取得を取り消し、古い応答で新しい表示範囲を上書きしない。
+  12 時間分の音声を一括でメモリへ読み込まない。
+- 検証項目: 収録中の遡り再生、分割ファイルをまたぐ連続再生、欠落箇所、保存範囲の両端、
+  高速スクロールと再生の同時操作、最新交信受信時の閲覧位置保持、再生完了時の自動復帰、
+  一時停止・欠落時の位置保持、再生切替後の古い完了通知、モニター未選択時の無音維持。
+
+### 時計表示
+
+- 秒針付きアナログ時計と、秒単位のデジタル時計（24 時間表記 `HH:mm:ss`）を用意する。
+  初期表示は両方とし、各時計の表示・非表示を切り替えられるようにする。
+- 両者は同じ PC の現在時刻を参照する。同一の描画更新で取得した時刻から文字と針の角度を
+  計算し、毎秒更新する。タイマーの呼び出し回数を数えて時刻を進めない。
+  復帰時や OS 時計の補正時にも現在時刻を取り直す。秒針は初期版では 1 秒刻みとする。
+- 日付とタイムゾーンも併記し、日付をまたぐ長時間運用に対応する。
+  時間軸も同じタイムゾーンで表示し、保存データは UNIX 時刻を維持する。
+- 過去音声の再生中もこれらの時計は現在時刻を表示し続ける。
+  プレイヤーには「録音時刻」と「再生位置」を別表示し、欠落区間や時刻対応が不明な箇所は
+  不明と示す。現在時刻を再生位置に合わせて巻き戻さない。
+- 時計の表示精度と UTC への同期精度は別である。同期が検証されていなければ、
+  「PC 時計」と明示し、時刻が保証されているような表示をしない。
+- 検証項目: 秒の繰り上がり、深夜 0 時の日付変更、タイムゾーン変更、スリープ復帰、
+  OS 時計の前進・後退、過去再生中に現在時計が継続すること。
+
+### 既存資産と不足部分
+
+`SegmentInfo` / `/segments` はチャンネル・開始時刻・長さを持ち、`/audio/{id}` は区間再生、
+`/stream` は区間確定・文字起こし・状態変化を配信する。これらは試作の土台として使える。
+ただし区間音声にはプリロール・末尾の無音・区間内の短い無音が含まれるため、バーの長さを
+そのまま発話時間・交信量として数えない。VAD の開始・終了を別の活動区間として保存する。
+音声入力だけでは送信/受信の方向を判定できないため、初期版は「交信あり」と表示する。
+方向を分けるには無線機の PTT 等の情報源が必要になる。
+
+現在の区間一覧はメモリ上の直近 1,000 件で、区間 ID はプロセス内だけで一意。
+12 時間以上・再起動後の閲覧に向け、セッション ID と区間索引を永続化し、チャンネルと
+時間範囲でページ取得する API を追加する。VAD 活動区間、録音欠落、文字起こし、音声ファイル
+内のサンプル範囲も同じセッションに紐付ける。録音中のバーは状態通知で伸ばし、確定時に
+保存区間へ置き換える。再開始時は保存済みデータから復元する。
+
+録音の `*.timing.jsonl` は音声位置と PC 時計の対応を持つが、これは WAV の索引であり、
+既存の区間録音 API にまだ接続されていない。特に入力欠落後は「開始時刻＋長さ」でバーを
+作らず、実際の対応区間で分割する。時計が戻る場合は同じ壁時計の範囲が重なり得るため、
+セッション内の単調時計・入力サンプル順を別に保持する。音声活動量は VAD による推定とする。
+
+### 実装順序
+
+1. 収録サービスの独立起動、共通操作コマンドと状態通知、セッション・区間索引の永続化。
+2. SwiftUI のチャンネル行、時間軸、クリック再生、数字キーと再生キーの試作。
+3. 活動時間の集計、範囲取得とズーム、12 時間データでの描画・メモリ検証。
+4. 入力抜去、録音停止、時計補正、GUI 停止・再開始時に、表示と音声位置の対応を検証する。

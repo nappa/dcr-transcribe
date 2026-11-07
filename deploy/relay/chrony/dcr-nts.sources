@@ -1,0 +1,8 @@
+# /etc/chrony/sources.d/dcr-nts.sources
+# NTS(認証つき NTP)で合わせる。応答の改ざん・なりすましで時計をずらされない
+# Ubuntu の既定のプール(/etc/chrony/chrony.conf の pool 行)はコメントアウトして、これだけにする
+# 確認: chronyc -N sources -v / chronyc -N authdata(NTS の鍵交換ができているか)/ chronyc tracking
+
+server time.cloudflare.com iburst nts
+server nts.netnod.se iburst nts
+server ptbtime1.ptb.de iburst nts

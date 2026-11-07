@@ -1,0 +1,13 @@
+[Unit]
+Description=QUIC port forwarding for dcr-relay with UFW
+After=ufw.service
+Before=dcr-relay.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/dcr-relay/ufw-relay.nft
+ExecStop=/usr/sbin/nft delete table inet dcr_relay
+
+[Install]
+WantedBy=multi-user.target

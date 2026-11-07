@@ -1,0 +1,49 @@
+# /etc/dcr-relay/relay.toml(root:dcr-relay 0640)
+# 中継サーバ: dcr-transcribe --relay /etc/dcr-relay/relay.toml
+# 書き込みが要るもの(秘密・録音)は /var/lib/dcr-relay に置く(systemd の StateDirectory)
+
+[remote]
+# cloudflared(別サービス)からだけ受ける
+listen = "127.0.0.1:8765"
+login_key_file = "/var/lib/dcr-relay/secrets/login_key"
+history_size = 1000
+# 日本からだけ。Tor(Cloudflare の T1)も拒否する(Cloudflare の WAF でも止めるので二重)
+allowed_countries = ["JP"]
+block_tor = true
+access_log = true
+# iCloud プライベートリレー経由も拒否する(Apple の出口 IP の一覧を 1 日ごとに取得。Cloudflare の無料プランでは止められないため)
+block_private_relay = true
+private_relay_cache = "/var/lib/dcr-relay/private-relay-egress.csv"
+# Turnstile を使うならサイトキーとシークレットを書く
+# turnstile_site_key = ""
+# turnstile_secret_key = ""
+session_hours = 12
+
+# ブラウザの版の下限。本番の前に、その時点の最新に近い版へ上げてよい(古いスマホを締め出すことになるので様子を見て)
+[remote.browser]
+min_chromium = 120
+min_safari = "16.4"
+min_firefox = 128
+
+[live]
+enabled = true
+profile = "he"
+bitrate = 16000
+
+# 会場からの QUIC(UDP)+ mTLS。cloudflared は通さない。外の 443/udp を nftables で 8443 へ転送する
+# 証明書と CA は /etc/dcr-relay/tls/(root:dcr-relay 0640)、鍵は systemd の資格情報として渡す
+[relay]
+listen = "[::]:8443"
+cert_file = "/etc/dcr-relay/tls/relay.pem"
+key_file = "/run/credentials/dcr-relay.service/relay.key"
+client_ca_file = "/etc/dcr-relay/tls/ca.pem"
+dir = "/var/lib/dcr-relay/relay-data"
+
+# cloudflared は別の systemd サービス(cloudflared.service)で動かすので、ここでは起動しない
+[tunnel]
+enabled = false
+
+[clock]
+enabled = true
+server = "time.cloudflare.com"
+warn_ms = 500

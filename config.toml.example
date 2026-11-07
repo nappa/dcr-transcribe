@@ -21,7 +21,7 @@ silence_disconnect_threshold_ms = 3000
 
 [buffer]
 # Buffer capacity in seconds
-capacity_seconds = 10.0
+capacity_seconds = 10
 # Drop policy when buffer is full: "drop_oldest", "drop_newest", or "block"
 drop_policy = "drop_oldest"
 
@@ -34,14 +34,20 @@ region = "ap-northeast-1"
 language_code = "ja-JP"
 # Sample rate for transcription (should match audio.sample_rate)
 sample_rate = 48000
-# Maximum retry attempts
-max_retries = 5
-# Timeout in seconds
-timeout_seconds = 10
 # Connect to transcription service on startup (false = wait for voice detection)
 connect_on_startup = false
 # Send buffered audio on reconnection
 send_buffered_on_reconnect = true
+
+# AWS 認証(未指定なら従来の環境変数・~/.aws 設定を使用)
+# プロファイルを選ぶ場合。aws login 利用時は期限切れ時に再認証が必要。
+# [transcribe.aws]
+# profile = "default"
+# またはアクセスキーを直接指定(profile と併用不可)
+# [transcribe.aws]
+# access_key_id = ""
+# secret_access_key = ""
+# session_token = "" # 一時認証情報の場合だけ必要
 
 # Whisper API configuration (only needed if backend = "whisper")
 # [whisper]
@@ -56,7 +62,7 @@ wav_output_dir = "./recordings"
 
 # Remote viewer (HTTP/SSE server, expose via Cloudflare Tunnel)
 # Tail-style live view of confirmed transcripts in any browser.
-# Run a named tunnel with `cloudflared` separately (see README). Quick Tunnels do not support SSE.
+# Use a named tunnel with `cloudflared` (see README). Quick Tunnels do not support SSE.
 # [remote]
 # enabled = true
 # listen = "127.0.0.1:8765"     # bind address (keep on loopback; cloudflared reaches localhost)
@@ -70,6 +76,15 @@ wav_output_dir = "./recordings"
 # turnstile_site_key = ""       # Cloudflare Turnstile site key; set both keys to require a bot check
 # turnstile_secret_key = ""     # Cloudflare Turnstile secret key
 # session_hours = 12            # how long a passed bot check stays valid
+# block_tor = true              # reject Tor (Cloudflare CF-IPCountry: T1), even when allowed_countries is empty
+# access_log = true             # one JSON line per request (log target "access"; login keys are masked)
+# block_private_relay = false   # reject iCloud Private Relay (Apple's egress list vs CF-Connecting-IP, refreshed daily)
+# private_relay_cache = "./private-relay-egress.csv"
+# require_fetch_metadata = true # refuse requests without Sec-Fetch-* (unsupported browsers); false only for debugging with curl
+# [remote.browser]              # minimum browser versions (older ones get "not supported")
+# min_chromium = 120
+# min_safari = "16.4"           # also used for every browser on iPhone / iPad (WebKit)
+# min_firefox = 128
 
 # Per-utterance recording (split on silence), playable from the remote viewer
 # [segments]
@@ -100,11 +115,29 @@ wav_output_dir = "./recordings"
 # profile = "he"                 # "he" (HE-AAC) or "lc"
 # bitrate = 16000                # AAC bitrate (bps) per listened mix (~2 KB/s)
 
-[flac]
-# Enable FLAC compression for AWS Transcribe
-enabled = true
-# Compression level (0-8, higher = better compression but slower)
-compression_level = 8
+# Send everything to a relay server (dcr-transcribe --relay on a VPS) over one QUIC (UDP) connection with mutual TLS.
+# Not via cloudflared. Viewers connect to the relay, so the venue uplink carries one copy regardless of the number of viewers.
+# Create the certificates with: dcr-transcribe --gen-uplink-pki ./secrets/uplink <relay IP or name>
+# Can be used together with [remote] (local viewer server).
+# [uplink]
+# enabled = true
+# server = "203.0.113.5:443"     # relay address (IP:port or name:port, UDP)
+# server_name = ""               # name/IP to match the relay certificate's SAN; host part of `server` if empty
+# ca_file = "./secrets/uplink/ca.pem"
+# cert_file = "./secrets/uplink/venue.pem"
+# key_file = "./secrets/uplink/venue.key"
+# public_url = "https://relay.example.com"  # viewer URL (via cloudflared), shown in the TUI (`u`)
+# live = true                    # send live audio (only channels someone is listening to on the relay)
+# live_bitrate = 16000           # Opus bitrate per channel (bps)
+# include_partials = false       # also send partial results (more bandwidth)
+# retain_events = 5000           # transcripts kept for resending after the relay restarts
+
+# Clock drift monitoring (SNTP; only measures, never adjusts the clock)
+# [clock]
+# enabled = true
+# server = "time.cloudflare.com"
+# interval_secs = 64
+# warn_ms = 500                  # log a warning (and show yellow) beyond this drift
 
 # Channel configuration
 [[channels]]

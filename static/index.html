@@ -39,6 +39,20 @@ body{
 .s.off{background:#4a1a1a;color:#f99}
 .s.reco{background:#4a3a1a;color:#fc6}
 .s.chain{background:#1a3a4a;color:#8cf;cursor:pointer}
+button.s{font:inherit;font-size:11px;border:none;cursor:pointer}
+/* 接続の状態: 緑=正常 黄=品質低下 赤=止まっている 灰=不明 */
+.hp{position:absolute;right:12px;top:calc(40px + var(--safe-top));z-index:20;width:min(92vw,360px);
+  background:#1b1e26;border:1px solid #2f3440;border-radius:12px;padding:10px 12px;box-shadow:0 8px 24px rgba(0,0,0,.5);font-size:12px}
+.hp[hidden]{display:none}
+.hp .dg{margin:0 0 8px;line-height:1.5}
+.hp .row{display:flex;align-items:baseline;gap:8px;padding:4px 0;border-top:1px solid #262a33}
+.hp .row b{flex-shrink:0;width:6.5em;font-weight:600}
+.hp .row span{color:var(--muted);font-variant-numeric:tabular-nums;word-break:break-word}
+.hp .note{margin:8px 0 0;color:var(--muted);font-size:11px}
+.hp .lo{margin-top:10px;width:100%;min-height:34px;border:1px solid #5a3a3a;border-radius:8px;background:transparent;color:#f99;font:inherit;font-size:12px;cursor:pointer}
+.d{display:inline-block;width:8px;height:8px;border-radius:50%;flex-shrink:0;background:#5a5f6a}
+.d.g{background:#3ecf6e}.d.y{background:#f2c14e}.d.r{background:#ff5a5a}
+@media(min-width:900px){.hp{position:fixed;left:16px;right:auto;top:52px}}
 .shb{
   font:inherit;font-size:11px;padding:3px 10px;border-radius:10px;border:1px solid #3a4150;
   background:transparent;color:var(--fg);cursor:pointer;white-space:nowrap;
@@ -200,17 +214,68 @@ body{
   .keys{display:block}
 }
 .keys{display:none;margin-top:14px;font-size:11px;color:var(--muted);line-height:1.7}
+/* 対応していないブラウザの案内。最初から出しておき、判定の script が対応を確かめたら隠す
+   (CSP や古い JavaScript で script が動かないブラウザでも案内が残るように) */
+.unsup{max-width:520px;margin:15vh auto 0;padding:24px 20px;background:var(--bg2);border-radius:14px;text-align:center}
+.unsup h1{font-size:16px;margin:0 0 10px}
+.unsup p{font-size:13px;color:var(--muted);line-height:1.7;margin:0 0 8px}
+html.ok .unsup{display:none}
+html:not(.ok) .app,html:not(.ok) .fab{display:none}
 .keys kbd{background:#2a2d34;border-radius:4px;padding:0 5px;font-family:inherit}
+/* チャンネル別の交信一覧。各列で過去を読める。 */
+main{min-width:0}
+.history-bar{display:flex;align-items:center;gap:10px;padding:12px;border-bottom:1px solid var(--border);background:var(--bg2)}
+.history-bar button{border:1px solid #404858;border-radius:8px;background:#252d3a;color:var(--fg);padding:8px 12px;cursor:pointer;font:inherit;font-size:12px}
+.history-bar button:disabled{opacity:.55;cursor:default}
+#history-note{flex:1;color:var(--muted);font-size:11px}
+#older,#older.show{display:block;margin:0;padding:8px 12px}
+#log{display:flex;gap:1px;overflow-x:auto;background:var(--border);height:calc(100dvh - 225px);min-height:300px}
+.channel{flex:1 0 280px;min-width:0;background:var(--bg);display:flex;flex-direction:column}
+.channel[hidden]{display:none}
+.channel h2{margin:0;padding:12px;font-size:14px;color:var(--ch-fg);background:var(--ch-bg);border-bottom:1px solid var(--border)}
+.channel-feed{overflow-y:auto;flex:1;min-height:0;overflow-anchor:none;scrollbar-gutter:stable}
+.channel-feed:empty:after{content:"このチャンネルの交信はまだありません";display:block;padding:24px 12px;color:var(--muted);font-size:12px}
+.r{animation:none}
+.tr{flex-wrap:wrap}.tr h1{flex-basis:100%}
+@media(min-width:900px){main{max-width:none}.app{grid-template-columns:240px minmax(0,1fr)}#log{height:calc(100dvh - 64px)}.fab{left:calc(240px + (100vw - 240px)/2)}}
+@media(max-width:899px){#log{overflow-x:hidden}.channel{flex:1 0 100%;width:100%}.channel.call h2{display:none}.r .x{overflow-wrap:anywhere}}
+@media(max-width:599px){#history-note{display:none}.history-bar{justify-content:space-between}}
 </style>
 </head>
 <body>
+<div class="unsup" id="unsup" role="alert">
+  <h1>このブラウザには対応していません</h1>
+  <p>最新の Safari・Chrome・Edge・Firefox で開いてください。</p>
+  <p>JavaScript が無効になっている場合は有効にしてください。</p>
+</div>
+<script>
+(function(){
+  // 閲覧画面が使う機能がそろっているか(足りなければ案内を出したまま、本体を動かさない)
+  var w=window,ok=false;
+  try{
+    ok=!!(w.EventSource&&w.fetch&&w.Promise&&w.URLSearchParams&&w.Set&&Array.from&&w.AbortController&&
+      w.Uint8Array&&w.Float32Array&&w.performance&&performance.now&&Element.prototype.closest&&
+      document.documentElement.classList&&("dataset" in document.documentElement)&&
+      w.CSS&&CSS.supports&&CSS.supports("display","grid")&&CSS.supports("position","sticky"));
+  }catch(_){ok=false}
+  if(ok)document.documentElement.className+=" ok";
+  w.__dcrOk=ok;
+})();
+</script>
 <div class="app">
 <aside id="side">
   <div class="tr">
     <h1>dcr-transcribe</h1>
     <span class="s chain" id="chain" hidden></span>
+    <button class="shb" id="reload" title="再読み込み" aria-label="再読み込み">↻</button>
     <button class="shb" id="share" title="閲覧画面のリンクを共有">共有</button>
-    <span class="s off" id="s">未接続</span>
+    <button class="s" id="s" aria-haspopup="dialog" aria-controls="hp">● 接続中…</button>
+  </div>
+  <div class="hp" id="hp" role="dialog" aria-label="接続の状態" hidden>
+    <p class="dg" id="hpdg"></p>
+    <div id="hprows"></div>
+    <p class="note">端末・サーバは 30 秒ごとに測っています。遅れは各機械の時計のずれを補正した値です。タップで閉じる</p>
+    <button class="lo" id="logout">この端末からログアウト</button>
   </div>
   <nav class="tabs" id="tabs"></nav>
   <div class="live" id="live" hidden>
@@ -221,12 +286,12 @@ body{
   <div class="keys"><kbd>0</kbd> すべて <kbd>1</kbd>〜<kbd>9</kbd> チャンネル <kbd>L</kbd> ライブ <kbd>Esc</kbd> 再生停止</div>
 </aside>
 <main>
+  <div class="history-bar"><button id="older" type="button">↑ 過去の交信を読み込む</button><span id="history-note">古い交信が上・新着が下</span><button id="latest" type="button">最新へ ↓</button></div>
   <div id="log"></div>
   <div id="empty" hidden>まだ受信していません</div>
-  <div id="older">↓ もっと前を読み込む</div>
 </main>
 </div>
-<button class="fab" id="fab">↑ 最新へ</button>
+<button class="fab" id="fab">↓ 最新へ</button>
 <div class="modal" id="shm" hidden>
   <div class="sheet" role="dialog" aria-modal="true" aria-label="閲覧画面を共有">
     <div class="hd"><span>閲覧画面を共有</span><button class="x" id="shx" aria-label="閉じる">✕</button></div>
@@ -239,22 +304,28 @@ body{
 </div>
 <script>
 (function(){
+if(!window.__dcrOk)return;
 var liveBar=document.getElementById("live"),lchips=document.getElementById("lchips"),lplay=document.getElementById("lplay");
 var log=document.getElementById("log"),stat=document.getElementById("s"),tabsBox=document.getElementById("tabs"),fab=document.getElementById("fab"),older=document.getElementById("older"),emptyEl=document.getElementById("empty");
 var p=new URLSearchParams(location.search);
 var wantP=p.get("p")==="1";
 var TAB="dcr-tab";
 // 表示するチャンネル("all" かチャンネル ID)
-var view=localStorage.getItem(TAB)||"all";
+// localStorage は使えない環境がある(保存を止めている・一部のプライベートブラウズ)。使えなくても動かす
+function lsGet(k){try{return localStorage.getItem(k)}catch(_){return null}}
+var view=lsGet(TAB)||"all";
 var LIVE="dcr-live";
-var liveSel=new Set(JSON.parse(localStorage.getItem(LIVE)||"[]"));
+var liveSel=new Set((function(){try{return JSON.parse(lsGet(LIVE)||"[]")}catch(_){return[]}})());
 
 // 状態
-// 行は新しいものが上。各行の data-k に時刻(ms)を持たせ、時刻の降順に挿入する
+// 行は古いものが上。チャンネルごとに時刻の昇順で挿入する
 var es=null;
 var anchorMs=0;
 var names={};
-var stick=true;            // 最上部(最新)を見ているか
+var feeds={},historyEnd=false,scrollQueued=false;
+var mobileLayout=window.matchMedia("(max-width: 899px)");
+var mixedLayout=mobileLayout.matches&&view==="all";
+var stick=true;            // 各列の最下部(最新)に追従するか
 var newCount=0;
 var firstShownId=0;        // DOM 上で最も古いイベント ID(0 = まだ何もない)
 var lastSeenId=0;          // 受信済みの最大 ID
@@ -263,6 +334,18 @@ var hiddenAt=0;
 var wasStickyOnHide=true;
 var FAST_THRESHOLD_MS=30000; // この時間以上 hidden だったらファストロード
 var FAST_HEAD=20;            // ファストロード時に取得する件数
+// 接続の状態(色分けと、どこに問題があるかの判定に使う)
+var H={
+  sse:"init",       // サーバとの SSE: init / open / reco(再接続中) / off(閉じた)
+  beatAt:0,         // 最後に心拍(event: hb)を受け取った時刻(この端末の時計)
+  beat:null,        // 最後の心拍 {ms: サーバの時刻, so: サーバの時計のずれ}
+  edge:null,        // Cloudflare エッジまで {ok, rtt} / {na:true}(Cloudflare を通っていない)
+  origin:null,      // サーバ(/healthz)まで {ok, rtt}
+  devOff:null,      // この端末の時計 − 正しい時刻(ms)
+  up:null,          // 中継サーバのとき: 会場との接続 {on, t, rtt, q, k, vo, ld}
+  down:null,        // サーバ → この端末の片道(ms、心拍から。時計のずれを補正、なめらかにした値)
+  lat:null          // 直近の文字起こしの遅れ {aws, del, at, exact}
+};
 var segs={};               // 録音区間 id -> {c,t,d}
 var maxSegId=0;
 var playingId=0;
@@ -271,38 +354,70 @@ var chainEl=document.getElementById("chain");
 function pad(n){return n<10?"0"+n:""+n}
 function msOf(s){return anchorMs+s*1000}
 function fmtMs(ms){if(!ms)return"";var d=new Date(ms);return pad(d.getHours())+":"+pad(d.getMinutes())+":"+pad(d.getSeconds())}
-function esc(s){return s.replace(/[&<>]/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;"}[c]})}
-function atTop(){return window.scrollY<80}
-function nearBottom(){return(window.innerHeight+window.scrollY)>=document.documentElement.scrollHeight-200}
-function scrollTop(){window.scrollTo(0,0)}
-
+// 要素を作る。文字は textContent で入れる(HTML として解釈させない。CSP の Trusted Types で innerHTML は使えない)
+function el(tag,cls,kids){
+  var e=document.createElement(tag);
+  if(cls)e.className=cls;
+  (kids||[]).forEach(function(k){e.appendChild(typeof k==="string"?document.createTextNode(k):k)});
+  return e;
+}
 function visible(c){return view==="all"||+view===c}
-
-// ── チャンネルタブ ──
-// 選んだチャンネル以外の行を CSS で隠す(DOM はそのまま)
+function channelFeed(c){
+  if(mixedLayout)c="all";
+  if(feeds[c])return feeds[c];
+  var label=c==="all"?"すべての交信":names[c]||("ch"+c);
+  var panel=el("section","channel c"+c),heading=el("h2","",[label]),feed=el("div","channel-feed");
+  panel.dataset.channel=c;feed.dataset.channel=c;feed.tabIndex=0;feed.setAttribute("aria-label",c==="all"?label:label+"の交信");
+  panel.appendChild(heading);panel.appendChild(feed);panel.hidden=c!=="all"&&!visible(c);log.appendChild(panel);feeds[c]=feed;
+  feed.addEventListener("wheel",function(e){if(e.deltaY<0)stick=false},{passive:true});
+  feed.addEventListener("touchstart",function(){stick=false},{passive:true});
+  feed.addEventListener("scroll",function(){
+    if(loadingOlder||scrollQueued)return;
+    stick=Object.keys(feeds).filter(function(id){return id==="all"||visible(+id)}).every(function(id){var f=feeds[id];return f.scrollHeight-f.scrollTop-f.clientHeight<50});
+    if(stick){newCount=0;fab.classList.remove("show")}
+    else{fab.textContent="↓ 最新へ";fab.classList.add("show")}
+  },{passive:true});
+  return feed;
+}
+function scrollLatest(){
+  stick=true;newCount=0;fab.classList.remove("show");
+  Object.keys(feeds).forEach(function(c){var f=feeds[c];f.scrollTop=f.scrollHeight});
+}
+function followLatest(){
+  if(!stick||scrollQueued)return;
+  scrollQueued=true;requestAnimationFrame(function(){if(stick)scrollLatest();scrollQueued=false});
+}
+function clearRows(){Object.keys(feeds).forEach(function(c){feeds[c].textContent=""});historyEnd=false}
+function rebuildLayout(){
+  var mixed=mobileLayout.matches&&view==="all";
+  if(mixed===mixedLayout)return;
+  mixedLayout=mixed;
+  var rows=Array.from(log.querySelectorAll(".r"));
+  log.textContent="";feeds={};
+  Object.keys(names).forEach(function(c){channelFeed(+c)});
+  rows.forEach(function(row){insertSorted(row,+row.dataset.k)});
+  rows.forEach(regroupAround);
+}
+mobileLayout.addEventListener("change",function(){rebuildLayout();applyView();followLatest()});
 function applyView(){
-  var st=document.getElementById("vs");
-  if(!st){st=document.createElement("style");st.id="vs";document.head.appendChild(st)}
-  st.textContent=view==="all"?"":"#log>*:not(.c"+(+view)+"){display:none}";
+  rebuildLayout();
+  Object.keys(feeds).forEach(function(c){feeds[c].parentNode.hidden=c!=="all"&&!visible(+c)});
   tabsBox.querySelectorAll(".tab").forEach(function(t){t.classList.toggle("sel",t.dataset.v===String(view))});
   updateEmpty();
 }
-function setView(v){
-  view=String(v);
-  try{localStorage.setItem(TAB,view)}catch(_){}
-  applyView();
-  scrollTop();
-}
-function updateEmpty(){
-  var any=view==="all"?log.firstChild:log.querySelector(".c"+(+view));
-  emptyEl.hidden=!!any;
-}
+function setView(v){view=String(v);try{localStorage.setItem(TAB,view)}catch(_){}applyView();scrollLatest()}
+function updateEmpty(){emptyEl.hidden=!!log.querySelector(".r")}
 function makeTab(v,name){
   var b=document.createElement("button");
   b.className="tab"+(v==="all"?"":" c"+v+" unknown");
   b.dataset.v=v;
-  b.innerHTML='<span class="tn">'+(v==="all"?"":'<span class="dot"></span>')+'<span>'+esc(name)+'</span>'+(v==="all"?"":'<span class="tx" title="Transcribe">T</span>')+'</span>'
-    +(v==="all"?'<span class="tst" data-all></span>':'<span class="meter"><i></i></span><span class="tst">—</span>');
+  var tn=el("span","tn");
+  if(v!=="all")tn.appendChild(el("span","dot"));
+  tn.appendChild(el("span","",[name]));
+  if(v!=="all"){var tx=el("span","tx",["T"]);tx.title="Transcribe";tn.appendChild(tx)}
+  b.appendChild(tn);
+  if(v==="all"){var all=el("span","tst");all.setAttribute("data-all","");b.appendChild(all)}
+  else{b.appendChild(el("span","meter",[el("i")]));b.appendChild(el("span","tst",["—"]))}
   b.onclick=function(){setView(v)};
   return b;
 }
@@ -351,33 +466,204 @@ function drawAllTab(){
 }
 // 経過秒の表示を進める(通信なし)
 setInterval(function(){for(var c in chs)drawTab(c)},1000);
+// ── 接続の状態 ──
+// 端末 ⇄ Cloudflare エッジ(/cdn-cgi/trace はエッジ自身が返す)と、端末 ⇄ サーバ(/healthz)を測り比べて、
+// 止まっているのが端末側か、サーバ側か、会場側かを判定する
+var BEAT_STALE_MS=35000;   // 心拍(10 秒ごと)がこれだけ来なければ配信が止まっている
+var PROBE_MS=30000;
+var CLOCK_WARN=500,CLOCK_BAD=2000;
+function fmtOff(ms){var s=(ms/1000).toFixed(1);return(ms>=0?"+":"")+s+"秒"}
+function fmtRtt(ms){return Math.round(ms)+"ms"}
+function fmtSec(ms){ms=Math.max(0,ms);return(ms/1000).toFixed(ms<10000?2:1)+"秒"}
+// 会場の時計 − 正しい時刻(ms)。中継サーバ経由なら 会場−中継 + 中継−正しい、直結ならサーバ = 会場
+function venueClockErr(){
+  var so=H.beat&&H.beat.so!=null?H.beat.so:null;
+  if(H.up)return H.up.vo!=null&&so!=null?H.up.vo+so:null;
+  return so;
+}
+// 文字起こしの遅れ: 話し終えて(e)→ 会場が AWS から受け取り(r)→ この端末に届くまで。
+// AWS の分は会場の時計どうしの差なので時計のずれに左右されない。配信の分は 会場・端末の時計のずれを補正する
+function noteTranscriptLatency(e){
+  if(!e.r||e.p)return;
+  var ve=venueClockErr(),exact=ve!=null&&H.devOff!=null&&!(H.edge&&H.edge.na);
+  var del=(Date.now()-(exact?H.devOff:0))-(e.r-(exact?ve:0));
+  // 接続した直後にまとめて届いた古いものは数えない
+  if(del>60000)return;
+  var aws=e.e!=null?e.r-(anchorMs+e.e*1000):null;
+  if(aws!=null&&(aws<-1000||aws>120000))aws=null;
+  H.lat={aws:aws,del:Math.max(0,del),at:Date.now(),exact:exact};
+}
+// ライブの遅れの内訳(ms)。聞いていなければ null
+function liveLatency(){
+  if(mode!=="live")return null;
+  var out=0;
+  if(liveEngine==="ll"&&LL.ctx)out=((LL.ctx.outputLatency||0)+(LL.ctx.baseLatency||0))*1000;
+  return{up:H.up&&H.up.ld!=null?H.up.ld:null,down:H.down,play:liveLag*1000+out};
+}
+function rows(){
+  var out=[],now=Date.now();
+  // 端末の回線
+  var e=H.edge,dev;
+  if(navigator.onLine===false)dev=["r","オフライン"];
+  else if(!e)dev=["u","測定中"];
+  else if(e.na)dev=["u","測定なし(Cloudflare を通っていない)"];
+  else if(!e.ok)dev=["r","Cloudflare に届きません"];
+  else dev=[e.rtt>1500?"y":"g",fmtRtt(e.rtt)+(e.rtt>1500?"(遅い)":"")];
+  out.push({k:"端末の回線",l:dev[0],t:dev[1]});
+  // サーバ
+  var o=H.origin,stale=H.sse==="open"&&H.beatAt&&now-H.beatAt>BEAT_STALE_MS,srv;
+  if(H.sse==="open"&&!stale){
+    if(o&&!o.ok)srv=["y","配信は届いていますが応答が遅れています"];
+    else if(o&&o.rtt>2000)srv=["y",fmtRtt(o.rtt)+"(遅い)"];
+    else srv=["g",o?fmtRtt(o.rtt):"接続中"];
+  }else if(H.sse==="init")srv=["u","接続中…"];
+  else if(o&&o.ok)srv=["y",stale?"配信が止まっています(つなぎ直します)":"再接続中…"];
+  else if(e&&e.ok)srv=["r","応答しません"];
+  else if(e&&e.na&&o&&!o.ok)srv=["r","届きません"];
+  else srv=["u",H.sse==="reco"?"再接続中…":"確認できません"];
+  out.push({k:"サーバ",l:srv[0],t:srv[1]});
+  // 会場(中継サーバのときだけ)
+  var u=H.up;
+  if(u){
+    var v;
+    if(!u.on)v=["r","切断"+(u.t?" "+fmtMs(u.t)+"〜":"")];
+    else{
+      var bad=[];
+      if(u.rtt>=800)bad.push("遅い");
+      if(u.q>3||u.k>3)bad.push("未送信 文字"+u.q+" 録音"+u.k);
+      v=[bad.length?"y":"g",(u.rtt!=null?fmtRtt(u.rtt):"接続中")+(bad.length?"("+bad.join("・")+")":"")];
+    }
+    out.push({k:"会場",l:v[0],t:v[1]});
+  }
+  // 文字起こし(会場 ⇄ AWS)。無音のあいだは切っているので「待機」は灰
+  var err=[],on=0;
+  for(var c in chs){if(chs[c].x===2)err.push(names[c]!==undefined?names[c]:"ch"+c);else if(chs[c].x===1)on++}
+  out.push({k:"文字起こし",l:err.length?"r":on?"g":"u",t:err.length?"エラー("+err.join("・")+")":on?"接続中 "+on+" ch":"待機中"});
+  // 時刻のずれ(端末・サーバ・会場)
+  var so=H.beat&&H.beat.so!=null?H.beat.so:null,parts=[],worst=null;
+  function add(name,ms){if(ms==null)return;parts.push(name+" "+fmtOff(ms));if(worst===null||Math.abs(ms)>worst)worst=Math.abs(ms)}
+  add("端末",H.devOff);
+  add("サーバ",so);
+  if(u&&u.on&&u.vo!=null)add("会場",u.vo+(so||0));
+  out.push({k:"時刻",l:worst===null?"u":worst>CLOCK_BAD?"r":worst>CLOCK_WARN?"y":"g",t:parts.length?parts.join(" / "):"測定中"});
+  // 遅れ(時計のずれを補正した値。誤差は各時計の測定の往復の半分ほど)
+  var L=H.lat;
+  if(L&&now-L.at<10*60000){
+    var tot=(L.aws||0)+L.del;
+    out.push({k:"文字起こしの遅れ",l:tot>8000?"r":tot>4000?"y":"g",
+      t:fmtSec(tot)+"("+(L.aws!=null?"AWS "+fmtSec(L.aws)+" + ":"")+"配信 "+fmtSec(L.del)+(L.exact?"":"、時計未補正")+")"});
+  }
+  var LV=liveLatency();
+  if(LV){
+    var known=LV.down!=null&&(LV.up!=null||!H.up);
+    var sum=(LV.up||0)+(LV.down||0)+LV.play,parts2=[];
+    if(H.up)parts2.push("会場→中継 "+(LV.up!=null?fmtSec(LV.up):"?"));
+    parts2.push((H.up?"中継":"会場")+"→端末 "+(LV.down!=null?fmtSec(LV.down):"?"));
+    parts2.push("再生待ち "+fmtSec(LV.play));
+    out.push({k:"ライブの遅れ",l:!known?"u":sum>3000?"r":sum>1500?"y":"g",t:(known?"":"約 ")+fmtSec(sum)+"("+parts2.join(" + ")+")"});
+  }
+  return out;
+}
+// 一番大事な問題を 1 つ選んで、短い表示と説明にする
+function diagnose(rs){
+  var by={};rs.forEach(function(r){by[r.k]=r});
+  var dev=by["端末の回線"],srv=by["サーバ"],ven=by["会場"],tr=by["文字起こし"],clk=by["時刻"];
+  if(dev.l==="r")return["r","端末の回線","この端末からインターネットに届いていません(端末・回線側の問題)。電波や Wi-Fi を確認してください。"];
+  if(srv.l==="r")return["r","サーバ停止",dev.l==="g"||dev.l==="y"
+    ?"Cloudflare までは届いていますが、サーバが応答しません(サーバ側の問題)。"
+    :"サーバに届きません(端末側かサーバ側かは判別できません)。"];
+  if(ven&&ven.l==="r")return["r","会場と切断","会場との接続が切れています(会場側の問題)。これまでの記録と録音は見られます。"];
+  if(tr.l==="r")return["r","文字起こし","会場から文字起こし(AWS)への接続でエラーが出ています。録音は続いています。"];
+  if(srv.l==="u"&&H.sse!=="open")return["u","接続中…","サーバにつないでいます。"];
+  var y=[dev,srv,ven,clk].filter(function(r){return r&&r.l==="y"})[0];
+  if(y){
+    var label={"端末の回線":"回線が遅い","サーバ":"再接続中","会場":"会場の回線","時刻":"時刻ずれ"}[y.k];
+    var why={"端末の回線":"この端末の回線が遅くなっています。","サーバ":"サーバとの接続が不安定です。自動でつなぎ直します。",
+      "会場":"会場の回線が遅いか、送信が溜まっています。届くまで少し遅れます。","時刻":"時計がずれています。表示される時刻がずれることがあります。"}[y.k];
+    return["y",label,why];
+  }
+  if(clk.l==="r")return["y","時刻ずれ","時計が大きくずれています。表示される時刻がずれることがあります。"];
+  return["g","正常","すべて正常です。"];
+}
+var hp=document.getElementById("hp"),hpdg=document.getElementById("hpdg"),hprows=document.getElementById("hprows");
+var CLS={g:"on",y:"reco",r:"off",u:""};
+function drawHealth(){
+  var rs=rows(),d=diagnose(rs);
+  stat.className="s "+CLS[d[0]];
+  stat.textContent="● "+d[1];
+  if(hp.hidden)return;
+  hpdg.textContent=d[2];
+  hprows.textContent="";
+  rs.forEach(function(r){hprows.appendChild(el("div","row",[el("i","d "+r.l),el("b","",[r.k]),el("span","",[r.t])]))});
+}
+stat.onclick=function(e){e.stopPropagation();hp.hidden=!hp.hidden;if(!hp.hidden){probe();drawHealth()}};
+hp.onclick=function(){hp.hidden=true};
+document.addEventListener("click",function(e){if(!hp.hidden&&!hp.contains(e.target)&&e.target!==stat)hp.hidden=true});
+// 一定時間で打ち切る fetch。所要時間(ms)も返す
+function timedFetch(url,ms){
+  var ctl=typeof AbortController!=="undefined"?new AbortController():null;
+  var t0=performance.now(),timer=setTimeout(function(){if(ctl)ctl.abort()},ms);
+  return fetch(url,{cache:"no-store",signal:ctl?ctl.signal:undefined}).then(function(r){
+    return r.text().then(function(body){clearTimeout(timer);return{r:r,body:body,rtt:performance.now()-t0}});
+  },function(err){clearTimeout(timer);throw err});
+}
+var probing=false;
+function probe(){
+  if(probing||document.hidden)return;
+  probing=true;
+  var sent=Date.now();
+  var edge=timedFetch("/cdn-cgi/trace",6000).then(function(x){
+    var ts=/^ts=([\d.]+)$/m.exec(x.body);
+    // Cloudflare を通っていなければ(直結・ローカル)このパスはサーバに届いて 403/404 になる
+    if(!x.r.ok||!ts||!/^fl=/m.test(x.body)){H.edge={na:true};return}
+    H.edge={ok:true,rtt:x.rtt};
+    // エッジの時刻は往復の真ん中とみなす
+    H.devOff=Math.round(sent+x.rtt/2-parseFloat(ts[1])*1000);
+  },function(){H.edge={ok:false}});
+  var origin=timedFetch("/healthz",8000).then(function(x){
+    H.origin={ok:x.r.ok&&x.body==="ok",rtt:x.rtt};
+  },function(){H.origin={ok:false}});
+  Promise.all([edge,origin]).then(function(){
+    probing=false;
+    // Cloudflare を通らないときは、心拍の時刻で端末の時計を大まかに比べる(配信の遅れぶん誤差がある)
+    if(H.edge&&H.edge.na&&H.beat&&H.beatAt)H.devOff=Math.round(H.beatAt-(H.beat.ms-(H.beat.so||0)));
+    drawHealth();
+  });
+}
+setInterval(function(){
+  // 心拍が途絶えたら、ブラウザが気付かないまま止まった接続とみなしてつなぎ直す
+  if(H.sse==="open"&&H.beatAt&&Date.now()-H.beatAt>BEAT_STALE_MS){markStatusUnknown();H.beatAt=Date.now();connect()}
+  drawHealth();
+},5000);
+setInterval(probe,PROBE_MS);
+addEventListener("online",function(){probe();drawHealth()});
+addEventListener("offline",drawHealth);
 // 切断中は状態が古いので薄く表示
 function markStatusUnknown(){tabsBox.querySelectorAll(".tab[data-v]:not([data-v=all])").forEach(function(t){t.classList.add("unknown")})}
 
 function makeRow(id,e){
   var d=document.createElement("div");
   d.className="r c"+e.c+(e.p?" p":"");
+  d.dataset.channel=e.c;
   if(id)d.dataset.id=id;
   if(e.g)d.dataset.g=e.g;
   var n=names[e.c]!==undefined?names[e.c]:"ch"+e.c;
-  d.innerHTML='<div class="meta"><span class="name">'+esc(n)+'</span><span class="ts">'+fmtMs(msOf(e.s))+'</span></div><div class="x">'+esc(e.x)+'</div>';
+  d.appendChild(el("div","meta",[el("span","name",[n]),el("span","ts",[fmtMs(msOf(e.s))])]));
+  d.appendChild(el("div","x",[e.x]));
   return d;
 }
 
-// 時刻の降順(新しいものが上)を保って挿入する。同時刻なら後から来たものを下に置く。
-// 見ている位置より上に入ったら、そのぶんスクロールして表示がずれないようにする。
+// 過去の行を挿入した分だけ位置を補正し、読んでいる交信を固定する。
 function insertSorted(d,k){
   d.dataset.k=k;
-  var before=null;
-  for(var c=log.firstChild;c;c=c.nextSibling){
-    if(+c.dataset.k<k){before=c;break}
-  }
-  var prevH=document.documentElement.scrollHeight;
-  log.insertBefore(d,before);
-  if(!stick&&d.getBoundingClientRect().top<0){
-    window.scrollBy(0,document.documentElement.scrollHeight-prevH);
-  }
-  return d;
+  if(d.dataset.id){var duplicate=log.querySelector('[data-id="'+d.dataset.id+'"]');if(duplicate)return duplicate}
+  var feed=channelFeed(+d.dataset.channel),before=null;
+  for(var c=feed.firstChild;c;c=c.nextSibling){if(+c.dataset.k>k){before=c;break}}
+  var previousHeight=feed.scrollHeight,previousTop=feed.scrollTop;
+  var above=before&&before.offsetTop-feed.offsetTop<previousTop;
+  feed.insertBefore(d,before);
+  if(!stick&&above)feed.scrollTop=previousTop+feed.scrollHeight-previousHeight;
+  followLatest();return d;
 }
 
 // ── 録音区間の再生 ──
@@ -810,13 +1096,14 @@ function addSeg(sg,live){
   segs[sg.i]={c:sg.c,t:sg.t,d:sg.d};
   if(sg.i>maxSegId)maxSegId=sg.i;
   if(log.querySelector('.r[data-g="'+sg.i+'"]'))refreshPlay(sg.i);
-  else if(live||(log.lastChild&&sg.t>=+log.lastChild.dataset.k)){
+  else if(live||(channelFeed(sg.c).firstChild&&sg.t>=+channelFeed(sg.c).firstChild.dataset.k)){
     // 文字起こしが(まだ)ない区間は録音だけの行として出す。後から文字起こしが来たら消す。
     // 接続時にまとめて取った区間は、表示中の範囲(一番古い行より新しいもの)だけ出す
     var d=document.createElement("div");
-    d.className="r sg c"+sg.c;d.dataset.sg=sg.i;d.dataset.g=sg.i;
+    d.className="r sg c"+sg.c;d.dataset.channel=sg.c;d.dataset.sg=sg.i;d.dataset.g=sg.i;
     var n=names[sg.c]!==undefined?names[sg.c]:"ch"+sg.c;
-    d.innerHTML='<div class="meta"><span class="name">'+esc(n)+'</span><span class="ts">'+fmtMs(sg.t)+'</span></div><div class="x">(文字起こしなし)</div>';
+    d.appendChild(el("div","meta",[el("span","name",[n]),el("span","ts",[fmtMs(sg.t)])]));
+    d.appendChild(el("div","x",["(文字起こしなし)"]));
     insertSorted(d,sg.t);
     regroupAround(d);
     updateEmpty();
@@ -833,29 +1120,26 @@ function loadSegs(){
   }).catch(function(){});
 }
 
-function makeGapNote(n){
-  var d=document.createElement("div");
-  d.className="gap";
-  d.textContent="… "+n+" 件スキップ(↓下端で読み込み)";
-  return d;
-}
-
-// 見ていない間に上へ新着が入ったら件数を出す
+// 過去を見ている間は新着件数だけを通知する
 function noteNew(){
   if(stick)return;
-  newCount++;fab.textContent="↑ 新着 "+newCount+" 件";fab.classList.add("show");
+  newCount++;fab.textContent="↓ 新着 "+newCount+" 件";fab.classList.add("show");
 }
 
 function append(id,e){
-  if(e.g){var only=log.querySelector('[data-sg="'+e.g+'"]');if(only)log.removeChild(only)}
+  if(e.g){var only=log.querySelector('[data-sg="'+e.g+'"]');if(only)only.remove()}
   regroupAround(insertSorted(makeRow(id,e),msOf(e.s)));
   if(id){
     if(id>lastSeenId)lastSeenId=id;
     if(firstShownId===0||id<firstShownId)firstShownId=id;
   }
-  // 古い(下端の)行から捨てる
-  while(log.children.length>500)log.removeChild(log.lastChild);
-  if(log.lastChild&&log.lastChild.dataset.g)groupSeg(+log.lastChild.dataset.g);
+  // 過去を読んでいる間は表示を削らない。最新追従中だけ各列の古い行を整理する。
+  if(stick){
+    var rows=Array.from(log.querySelectorAll(".r")).sort(function(a,b){return +a.dataset.k-+b.dataset.k});
+    while(rows.length>500){rows.shift().remove();historyEnd=false}
+  }
+  var ids=Array.from(log.querySelectorAll(".r[data-id]")).map(function(r){return +r.dataset.id});
+  firstShownId=ids.length?Math.min.apply(null,ids):0;
   updateOlderUI();
   updateEmpty();
   noteNew();
@@ -865,6 +1149,7 @@ function appendOlder(items){
   if(!items||!items.length)return;
   for(var i=0;i<items.length;i++){
     var it=items[i];
+    if(it.g){var only=log.querySelector('[data-sg="'+it.g+'"]');if(only)only.remove()}
     regroupAround(insertSorted(makeRow(it.id,it),msOf(it.s)));
     if(it.id<firstShownId||firstShownId===0)firstShownId=it.id;
   }
@@ -872,50 +1157,39 @@ function appendOlder(items){
 }
 
 function updateOlderUI(){
-  if(firstShownId>1)older.classList.add("show");
-  else older.classList.remove("show");
+  older.disabled=loadingOlder||historyEnd;
+  if(historyEnd)older.textContent="保存されている最初の交信です";
+  else if(!loadingOlder)older.textContent="↑ 過去の交信を読み込む";
 }
-
 function loadOlder(){
-  if(loadingOlder||firstShownId<=1)return;
-  loadingOlder=true;
-  older.textContent="読み込み中…";
-  var url="/history?before="+firstShownId+"&limit=50";
-  fetch(url).then(function(r){
-    if(!r.ok)throw new Error("HTTP "+r.status);
-    return r.json();
+  if(loadingOlder||historyEnd)return;
+  stick=false;loadingOlder=true;older.disabled=true;older.textContent="読み込み中…";
+  var epoch=anchorMs;
+  var positions=Object.keys(feeds).map(function(c){var f=feeds[c];return {f:f,top:f.scrollTop,height:f.scrollHeight}});
+  fetch("/history?before="+(firstShownId||"18446744073709551615")+"&limit=100").then(function(r){
+    if(!r.ok)throw new Error("HTTP "+r.status);return r.json();
   }).then(function(data){
+    if(epoch!==anchorMs){loadingOlder=false;updateOlderUI();return;}
     var items=(data&&data.items)||[];
-    if(items.length===0){
-      // それ以上古いものは server にも無い → ボタンを「これ以上ない」表示にして無効化
-      older.textContent="これより前の履歴はありません";
-      firstShownId=1; // 再 fetch を抑止
-      setTimeout(function(){older.classList.remove("show")},1500);
-    }else{
+    if(!items.length){historyEnd=true}else{
       appendOlder(items);
-      older.textContent="↓ もっと前を読み込む";
+      positions.forEach(function(p){p.f.scrollTop=p.top+p.f.scrollHeight-p.height});
+      document.getElementById("history-note").textContent=items.length+"件の過去の交信を追加しました";
     }
-    loadingOlder=false;
-  }).catch(function(){
-    older.textContent="↓ もっと前を読み込む(失敗・タップで再試行)";
-    loadingOlder=false;
-  });
+    fab.textContent="↓ 最新へ";fab.classList.add("show");
+    loadingOlder=false;updateOlderUI();
+  }).catch(function(){loadingOlder=false;older.disabled=false;older.textContent="再試行：過去の交信を読み込む"});
 }
 older.onclick=loadOlder;
-
-addEventListener("scroll",function(){
-  stick=atTop();
-  if(stick){newCount=0;fab.classList.remove("show")}
-  // 下端近くで自動的にさかのぼり
-  if(!loadingOlder&&nearBottom()&&firstShownId>1)loadOlder();
-},{passive:true});
-
-fab.onclick=function(){scrollTop();newCount=0;fab.classList.remove("show")};
+fab.onclick=scrollLatest;
+document.getElementById("latest").onclick=scrollLatest;
 
 function buildStreamUrl(opts){
   var qs=[];
   if(wantP)qs.push("p=1");
   if(opts&&opts.head)qs.push("head="+opts.head);
+  // 作り直した接続は Last-Event-ID を送らないので、受信済みの位置を URL で伝える
+  else if(lastSeenId)qs.push("last="+lastSeenId);
   return "/stream"+(qs.length?"?"+qs.join("&"):"");
 }
 
@@ -926,12 +1200,20 @@ function connect(opts){
     try{
       var d=JSON.parse(ev.data);
       var newAnchor=new Date(d.anchor).getTime();
+      // サーバが再起動した(ID が振り直されている)なら、表示を捨てて読み込み直す
+      if(anchorMs&&newAnchor!==anchorMs&&lastSeenId){
+        anchorMs=newAnchor;
+        clearRows();updateEmpty();firstShownId=0;lastSeenId=0;
+        connect();
+        return;
+      }
       anchorMs=newAnchor;
       // チャンネル一覧は初回のみ描画(再接続では更新しない)
       if(tabsBox.children.length===0){
         tabsBox.appendChild(makeTab("all","すべて"));
         d.channels.forEach(function(c){
           names[c.id]=c.name;
+          channelFeed(c.id);
           tabsBox.appendChild(makeTab(String(c.id),c.name));
           if(d.live)lchips.appendChild(makeLiveChip(c.id,c.name));
         });
@@ -949,32 +1231,53 @@ function connect(opts){
   es.addEventListener("st",function(ev){
     try{applyStatus(JSON.parse(ev.data))}catch(_){}
   });
+  es.addEventListener("up",function(ev){
+    try{
+      H.up=JSON.parse(ev.data);
+      if(!H.up.on)markStatusUnknown();
+      drawHealth();
+    }catch(_){}
+  });
+  es.addEventListener("hb",function(ev){
+    try{
+      H.beat=JSON.parse(ev.data);H.beatAt=Date.now();
+      // サーバ → 端末の片道 = 受け取った時刻 − サーバが送った時刻(どちらも正しい時刻に直して)。端末の時計は Cloudflare のエッジで測ったときだけ
+      if(H.devOff!=null&&H.edge&&H.edge.ok){
+        var ow=(H.beatAt-H.devOff)-(H.beat.ms-(H.beat.so||0));
+        if(ow>-1000&&ow<30000)H.down=Math.max(0,H.down==null?ow:H.down*0.7+ow*0.3);
+      }
+    }catch(_){}
+  });
   es.addEventListener("seg",function(ev){
     try{addSeg(JSON.parse(ev.data),true)}catch(_){}
   });
   es.addEventListener("msg",function(ev){
     try{
       var id=parseInt(ev.lastEventId,10)||0;
+      // つなぎ直しで同じものが届いても 2 回出さない
+      if(id&&id<=lastSeenId)return;
       var data=JSON.parse(ev.data);
       // ファストロード後の最初のイベントで、前回 lastSeenId と差があれば「N 件スキップ」表示。
       // 取得した最新分のすぐ下(それより古い位置)に置く
       if(opts&&opts.gapFrom&&id>opts.gapFrom+1){
         var skipped=id-opts.gapFrom-1;
-        insertSorted(makeGapNote(skipped),msOf(data.s)-0.001);
+        document.getElementById("history-note").textContent=skipped+"件の未表示の交信があります。過去の交信から読み込めます";
         opts.gapFrom=null; // 一度だけ
       }
       append(id,data);
+      noteTranscriptLatency(data);
     }catch(_){}
   });
-  es.onopen=function(){stat.className="s on";stat.textContent="接続中"};
+  es.onopen=function(){H.sse="open";H.beatAt=Date.now();drawHealth()};
   es.onerror=function(){
     markStatusUnknown();
+    probe();
     if(es.readyState===EventSource.CONNECTING){
-      stat.className="s reco";stat.textContent="再接続中…";
+      H.sse="reco";drawHealth();
     }else{
       // HTTP エラーで閉じた(ブラウザは自動で再接続しない)。
       // bot 確認の期限切れなら確認画面へ、それ以外(本体の再起動など)は少し待ってつなぎ直す
-      stat.className="s off";stat.textContent="切断";
+      H.sse="off";drawHealth();
       fetch("/session",{cache:"no-store"}).then(function(r){
         if(r.status===403){location.reload();return}
         setTimeout(function(){connect()},5000);
@@ -986,13 +1289,14 @@ function connect(opts){
 // ファストロード: DOM をクリアして最新だけ取得
 function fastReload(){
   var prevLast=lastSeenId;
-  log.innerHTML="";
+  lastSeenId=0;
+  clearRows();
   updateEmpty();
   firstShownId=0;
   newCount=0;
   fab.classList.remove("show");
   stick=true;
-  scrollTop();
+  scrollLatest();
   connect({head:FAST_HEAD,gapFrom:prevLast});
 }
 
@@ -1003,12 +1307,29 @@ document.addEventListener("visibilitychange",function(){
   }else{
     var elapsed=hiddenAt?Date.now()-hiddenAt:0;
     hiddenAt=0;
+    probe();
     // 最新を見ていた人だけファストロード(さかのぼって読んでいた人の位置は壊さない)
     if(elapsed>FAST_THRESHOLD_MS&&wasStickyOnHide){
       fastReload();
     }
   }
 });
+
+// ── ログアウト ──
+// セッションを消し、この端末のキャッシュ・保存データも消させる(共用の端末で見たあとに残さない)
+document.getElementById("logout").onclick=function(e){
+  e.stopPropagation();
+  this.disabled=true;this.textContent="ログアウトしています…";
+  try{if(es)es.close()}catch(_){}
+  fetch("/logout",{method:"POST",cache:"no-store"}).catch(function(){}).then(function(){location.replace("/")});
+};
+
+// ── 再読み込み ──
+// ホーム画面から開いたとき(スタンドアロン表示)や埋め込みのブラウザでは、ブラウザの再読み込みボタンが無いので画面に置く
+document.getElementById("reload").onclick=function(){
+  this.disabled=true;this.textContent="…";
+  location.reload();
+};
 
 // ── 閲覧画面の共有(ログイン URL を共有シート・コピー・QR で渡す) ──
 // 画面側はログインキーを持っていない(ログイン後に URL から消している)ので、ログイン済みの人だけが使える /share から受け取る
@@ -1063,7 +1384,9 @@ document.addEventListener("keydown",function(e){
   if(e.key==="Escape"){if(chainOn)stopChain();else if(liveWanted)stopLive()}
 });
 
-connect();
+connect({head:100});
+probe();
+drawHealth();
 })();
 </script>
 </body>

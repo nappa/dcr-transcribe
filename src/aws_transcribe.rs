@@ -9,7 +9,6 @@ use crate::types::{Stability, TranscriptResult};
 use anyhow::Result;
 use async_stream::stream;
 use async_trait::async_trait;
-use aws_config;
 use aws_sdk_transcribestreaming::types::{AudioEvent, AudioStream, LanguageCode, MediaEncoding};
 use aws_sdk_transcribestreaming::Client as AwsTranscribeClient;
 use aws_smithy_types::Blob;
@@ -71,7 +70,7 @@ pub struct AwsTranscribeBackend {
 
 impl AwsTranscribeBackend {
     pub async fn new(config: TranscribeConfig, channel_id: usize, start_time: SystemTime) -> Result<Self> {
-        let start_time_debug = start_time.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
+        let start_time_debug = start_time.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs();
         log::info!(
             "チャンネル {}: start_time = {} (UNIX timestamp)",
             channel_id,
@@ -101,7 +100,7 @@ impl TranscribeBackend for AwsTranscribeBackend {
         let (result_tx, result_rx) = mpsc::channel::<TranscriptResult>(32);
 
         // AWS SDKクライアント初期化（チャンネルごとに独立した設定で作成）
-        let sdk_config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+        let sdk_config = crate::aws_settings::load(&self.config).await?;
         let client = AwsTranscribeClient::new(&sdk_config);
 
         let audio_format = self.config.audio_format;
@@ -301,20 +300,20 @@ impl TranscribeBackend for AwsTranscribeBackend {
                         }
                     };
 
-                    let mut last_recv_time = SystemTime::now();
+                    let mut last_recv_time = std::time::Instant::now();
 
                     loop {
                         // 【切り分けポイント1】recv()呼び出し直前のタイムスタンプ
-                        let before_recv = SystemTime::now();
-                        let before_recv_elapsed = before_recv.duration_since(start_time).unwrap().as_secs_f64();
-                        let interval = before_recv.duration_since(last_recv_time).unwrap().as_secs_f64();
+                        let before_recv_elapsed = SystemTime::now().duration_since(start_time).unwrap_or_default().as_secs_f64();
+                        let recv_started = std::time::Instant::now();
+                        let interval = recv_started.duration_since(last_recv_time).as_secs_f64();
 
                         match resp.transcript_result_stream.recv().await {
                             Ok(Some(event)) => {
                                 // 【切り分けポイント2】recv()完了直後のタイムスタンプ
                                 let after_recv = SystemTime::now();
-                                let after_recv_elapsed = after_recv.duration_since(start_time).unwrap().as_secs_f64();
-                                let recv_block_time = after_recv_elapsed - before_recv_elapsed;
+                                let after_recv_elapsed = after_recv.duration_since(start_time).unwrap_or_default().as_secs_f64();
+                                let recv_block_time = recv_started.elapsed().as_secs_f64();
 
                                 match event {
                                 aws_sdk_transcribestreaming::types::TranscriptResultStream::TranscriptEvent(transcript_event) => {
@@ -391,9 +390,12 @@ impl TranscribeBackend for AwsTranscribeBackend {
                                                         text.chars().take(30).collect::<String>()
                                                     );
                                                 }
-                                                TranscriptResult::new_with_audio_time(
+                                                let mut t = TranscriptResult::new_with_audio_time(
                                                     channel_id, text, is_partial, stability, start_secs,
-                                                )
+                                                );
+                                                // 発話の終わり(閲覧画面で「話し終えてから表示まで」の遅延を出す)
+                                                t.audio_end_seconds = audio_end_time;
+                                                t
                                             } else {
                                                 // start_time が取得できない場合は従来の方法
                                                 if !is_partial && !text.is_empty() {
@@ -422,7 +424,7 @@ impl TranscribeBackend for AwsTranscribeBackend {
                                 }
                             }
                                 // recv()完了後、次のループのためにタイムスタンプを更新
-                                last_recv_time = after_recv;
+                                last_recv_time = std::time::Instant::now();
                             },
                             Ok(None) => {
                                 log::warn!("チャンネル {}: Amazon Transcribeストリームが予期せず終了（Ok(None)）", channel_id);
@@ -472,6 +474,7 @@ mod tests {
     #[tokio::test]
     async fn test_aws_transcribe_backend_creation() {
         let config = TranscribeConfig {
+            aws: Default::default(),
             backend: TranscribeBackendType::Aws,
             region: "ap-northeast-1".to_string(),
             language_code: "ja-JP".to_string(),
@@ -492,6 +495,7 @@ mod tests {
     #[tokio::test]
     async fn test_aws_transcribe_backend_creation_opus() {
         let config = TranscribeConfig {
+            aws: Default::default(),
             backend: TranscribeBackendType::Aws,
             region: "ap-northeast-1".to_string(),
             language_code: "ja-JP".to_string(),
@@ -540,4 +544,10 @@ mod tests {
             MediaEncoding::OggOpus
         ));
     }
+    #[tokio::test]
+    async fn regression_backend_accepts_pre_epoch_start() {
+        let origin = SystemTime::UNIX_EPOCH - std::time::Duration::from_secs(1);
+        assert!(AwsTranscribeBackend::new(TranscribeConfig::default(), 0, origin).await.is_ok());
+    }
+
 }

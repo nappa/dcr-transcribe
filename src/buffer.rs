@@ -19,7 +19,7 @@ pub struct AudioBuffer {
 
 impl AudioBuffer {
     pub fn new(config: &BufferConfig, sample_rate: u32) -> Self {
-        let capacity_samples = (config.capacity_seconds * sample_rate) as usize;
+        let capacity_samples = (config.capacity_seconds as usize).saturating_mul(sample_rate as usize);
         Self {
             capacity_samples,
             drop_policy: config.drop_policy,
@@ -32,6 +32,9 @@ impl AudioBuffer {
     /// チャンクを追加
     pub fn push(&mut self, chunk: BufferedChunk) {
         let chunk_len = chunk.samples.len();
+        if chunk_len == 0 {
+            return;
+        }
         self.total_samples += chunk_len;
         self.chunks.push_back(chunk);
 
@@ -69,12 +72,15 @@ impl AudioBuffer {
     /// 指定期間内のサンプル配列
     pub fn get_range(&self, from_ns: u128, to_ns: u128) -> Vec<SampleI16> {
         let mut result = Vec::new();
+        if from_ns > to_ns {
+            return result;
+        }
 
         for chunk in &self.chunks {
             // チャンクの終了タイムスタンプを計算
             let chunk_duration_ns =
                 (chunk.samples.len() as f64 / self.sample_rate as f64 * 1_000_000_000.0) as u128;
-            let chunk_end_ns = chunk.timestamp_ns + chunk_duration_ns;
+            let chunk_end_ns = chunk.timestamp_ns.saturating_add(chunk_duration_ns);
 
             // 範囲と重なるチャンクのみ処理
             if chunk_end_ns >= from_ns && chunk.timestamp_ns <= to_ns {
@@ -95,7 +101,9 @@ impl AudioBuffer {
 
                 if start_offset < chunk.samples.len() {
                     let end = end_offset.min(chunk.samples.len());
-                    result.extend_from_slice(&chunk.samples[start_offset..end]);
+                    if start_offset < end {
+                        result.extend_from_slice(&chunk.samples[start_offset..end]);
+                    }
                 }
             }
         }
@@ -111,7 +119,7 @@ impl AudioBuffer {
         while let Some(chunk) = self.chunks.front() {
             let chunk_duration_ns =
                 (chunk.samples.len() as f64 / self.sample_rate as f64 * 1_000_000_000.0) as u128;
-            let chunk_end_ns = chunk.timestamp_ns + chunk_duration_ns;
+            let chunk_end_ns = chunk.timestamp_ns.saturating_add(chunk_duration_ns);
 
             if chunk_end_ns < timestamp_ns {
                 if let Some(removed) = self.chunks.pop_front() {
@@ -385,4 +393,45 @@ mod tests {
         b.push(BufferedChunk { samples: vec![2i16; 8000], timestamp_ns: 1_000_000_000 }); // 0.5秒分
         assert!((b.duration_seconds() - 1.5).abs() < 0.01);
     }
+    #[test]
+    fn regression_reversed_range_is_empty() {
+        let mut b = AudioBuffer::new(&cfg(1, DropPolicy::DropOldest), 1000);
+        b.push(BufferedChunk { samples: vec![1; 1000], timestamp_ns: 0 });
+        assert!(b.get_range(900_000_000, 100_000_000).is_empty());
+    }
+
+    #[test]
+    fn regression_timestamp_overflow_is_safe() {
+        let mut b = AudioBuffer::new(&cfg(1, DropPolicy::DropOldest), 1000);
+        b.push(BufferedChunk { samples: vec![7; 10], timestamp_ns: u128::MAX - 5 });
+        assert_eq!(b.get_range(u128::MAX - 5, u128::MAX), vec![7; 10]);
+        b.clear_before(u128::MAX);
+        assert_eq!(b.len(), 10);
+    }
+
+    #[test]
+    fn regression_large_capacity_does_not_overflow() {
+        let mut b = AudioBuffer::new(&cfg(u32::MAX, DropPolicy::DropOldest), 48000);
+        b.push(BufferedChunk { samples: vec![1; 10], timestamp_ns: 0 });
+        assert_eq!(b.len(), 10);
+    }
+
+    #[test]
+    fn regression_empty_chunks_do_not_accumulate() {
+        let mut b = AudioBuffer::new(&cfg(1, DropPolicy::DropOldest), 1000);
+        for _ in 0..100 { b.push(BufferedChunk { samples: vec![], timestamp_ns: 0 }); }
+        assert!(b.chunks.is_empty());
+    }
+
+    #[test]
+    fn twelve_hour_timeline_keeps_only_configured_window() {
+        let mut buffer = AudioBuffer::new(&cfg(30, DropPolicy::DropOldest), 1);
+        for second in 0..43200_u128 {
+            buffer.push(BufferedChunk { samples: vec![(second % 30000) as i16], timestamp_ns: second * 1_000_000_000 });
+            assert!(buffer.len() <= 30);
+            assert!(buffer.chunks.len() <= 30);
+        }
+        assert_eq!(buffer.get_latest(30.0), (43170..43200).map(|s| (s % 30000) as i16).collect::<Vec<_>>());
+    }
+
 }

@@ -8,10 +8,19 @@ target
 
 # local config
 /config.toml
+/config.macbook.toml
+/config.zoom-h6essential.toml
+/config*.toml~
+/relay.toml
+# 中継サーバが受け取った区間録音
+/relay-data/
 # cloudflared のダウンロード先
 /bin/
 /secrets/*
 /.env
+/.env~
+.DS_Store
+/recordings/
 
 # Claude Code
 .claude/settings.local.json
@@ -30,3 +39,7 @@ tmp/*
 # Contains mutation testing data
 **/mutants.out*/
 
+
+# SwiftUI build output
+/macos/.build/
+/macos/.swiftpm/
